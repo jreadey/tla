@@ -1,0 +1,20 @@
+{
+  "map": {
+    "width": 20,
+    "height": 12,
+    "noise_scale": 6.0,
+    "seed": 42
+  },
+  "ports": {
+    "ports_per_player": 2,
+    "min_port_spacing": 2
+  },
+  "fleet": {
+    "battleship": 1,
+    "carrier": 1,
+    "cruiser": 1,
+    "destroyer": 1,
+    "submarine": 1,
+    "patrol_boat": 1
+  }
+}

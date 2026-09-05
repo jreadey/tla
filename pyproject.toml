@@ -1,0 +1,17 @@
+[project]
+name = "tla"
+version = "0.1.0"
+description = "Turn-based navy strategy game on a hex grid"
+requires-python = ">=3.12"
+dependencies = [
+    "arcade>=3.3,<4",
+    "noise>=1.2,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+]
+
+[tool.setuptools.packages.find]
+include = ["tla*"]
