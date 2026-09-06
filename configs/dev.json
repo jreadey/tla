@@ -3,7 +3,7 @@
     "width": 20,
     "height": 12,
     "noise_scale": 6.0,
-    "seed": 42
+    "sea_level": 0.15
   },
   "ports": {
     "ports_per_player": 2,

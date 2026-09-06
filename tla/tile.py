@@ -16,7 +16,6 @@ PLAYER_B: PlayerId = 2
 class TerrainType(Enum):
     LAND = "land"
     SEA = "sea"
-    SHORE = "shore"
 
 
 @dataclass
@@ -28,4 +27,8 @@ class Tile:
 
     @property
     def occupiable(self) -> bool:
-        return self.terrain in (TerrainType.SEA, TerrainType.SHORE)
+        """Ships may normally only be on sea. A port is the one exception:
+        it sits on land but ships can occupy it (see tla.movement, Phase 3,
+        for the rule that leaving a port must go straight to an adjacent
+        sea hex rather than another land hex)."""
+        return self.terrain == TerrainType.SEA or self.is_port

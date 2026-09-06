@@ -1,5 +1,5 @@
 from tla.config import MapConfig, PortConfig
-from tla.hexgrid import axial_to_offset
+from tla.hexgrid import axial_to_offset, neighbors
 from tla.mapgen import generate_map
 from tla.tile import PLAYER_A, PLAYER_B, TerrainType
 
@@ -40,7 +40,7 @@ def test_different_seeds_can_produce_different_maps():
     assert terrains1 != terrains2
 
 
-def test_ports_are_on_shore_and_split_evenly():
+def test_ports_are_on_coastal_land_and_split_evenly():
     map_config, port_config = _small_configs()
     board = generate_map(map_config, port_config, seed=7)
 
@@ -51,5 +51,22 @@ def test_ports_are_on_shore_and_split_evenly():
     assert set(ports_a).isdisjoint(ports_b)
 
     for coord in ports_a + ports_b:
-        assert board.tiles[coord].terrain == TerrainType.SHORE
-        assert board.tiles[coord].is_port
+        tile = board.tiles[coord]
+        assert tile.terrain == TerrainType.LAND
+        assert tile.is_port
+        assert any(
+            board.tiles[n].terrain == TerrainType.SEA
+            for n in neighbors(coord)
+            if n in board.tiles
+        )
+
+
+def test_port_tiles_are_occupiable_but_other_land_is_not():
+    map_config, port_config = _small_configs()
+    board = generate_map(map_config, port_config, seed=7)
+
+    for coord, tile in board.tiles.items():
+        if tile.terrain == TerrainType.LAND and not tile.is_port:
+            assert not tile.occupiable
+        if tile.is_port:
+            assert tile.occupiable

@@ -1,31 +1,41 @@
-"""Axial-to-pixel conversion and hex/board drawing (flat-top orientation)."""
+"""Hex/board drawing, plus the coastline contour overlay (flat-top orientation)."""
 
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import arcade
 
 from tla.board import Board
-from tla.hexgrid import AxialCoord
+from tla.elevation import Segment
+from tla.hexgrid import axial_to_pixel
 from tla.tile import PLAYER_A, PLAYER_B, TerrainType
 
 TERRAIN_COLORS = {
     TerrainType.LAND: (86, 125, 70),
     TerrainType.SEA: (43, 92, 138),
-    TerrainType.SHORE: (194, 178, 128),
 }
 OUTLINE_COLOR = (30, 30, 30, 140)
 PORT_COLORS = {
     PLAYER_A: (220, 60, 60),
     PLAYER_B: (60, 100, 230),
 }
+CONTOUR_COLOR = (20, 20, 20, 200)
+CONTOUR_WIDTH = 2.0
+
+# Anchor icon is stored white-on-transparent so it can be tinted per player
+# via draw_texture_rect's color multiplier, rather than keeping one texture
+# per player color.
+_ANCHOR_ICON_PATH = Path(__file__).parent / "assets" / "anchor.png"
+_anchor_texture: arcade.Texture | None = None
 
 
-def axial_to_pixel(coord: AxialCoord, hex_size: float) -> tuple[float, float]:
-    x = hex_size * 1.5 * coord.q
-    y = hex_size * math.sqrt(3) * (coord.r + coord.q / 2)
-    return x, y
+def _anchor_texture_cached() -> arcade.Texture:
+    global _anchor_texture
+    if _anchor_texture is None:
+        _anchor_texture = arcade.load_texture(_ANCHOR_ICON_PATH)
+    return _anchor_texture
 
 
 def hex_corners(center: tuple[float, float], hex_size: float) -> list[tuple[float, float]]:
@@ -48,6 +58,13 @@ def board_pixel_bounds(board: Board, hex_size: float) -> tuple[float, float, flo
     return min(xs) - pad, min(ys) - pad, max(xs) + pad, max(ys) + pad
 
 
+def draw_anchor(center: tuple[float, float], size: float, color: tuple[int, int, int]) -> None:
+    """Draw the anchor icon centered at `center`, tinted to `color`."""
+    cx, cy = center
+    rect = arcade.XYWH(cx, cy, size, size)
+    arcade.draw_texture_rect(_anchor_texture_cached(), rect, color=arcade.types.Color(*color))
+
+
 def draw_board(board: Board, hex_size: float, origin_x: float, origin_y: float) -> None:
     for coord, tile in board.tiles.items():
         x, y = axial_to_pixel(coord, hex_size)
@@ -56,6 +73,15 @@ def draw_board(board: Board, hex_size: float, origin_x: float, origin_y: float) 
         arcade.draw_polygon_filled(corners, TERRAIN_COLORS[tile.terrain])
         arcade.draw_polygon_outline(corners, OUTLINE_COLOR, 1)
         if tile.is_port:
-            arcade.draw_circle_filled(
-                center[0], center[1], hex_size * 0.35, PORT_COLORS[tile.port_owner]
-            )
+            draw_anchor(center, hex_size * 0.85, PORT_COLORS[tile.port_owner])
+
+
+def draw_contour(segments: list[Segment], origin_x: float, origin_y: float) -> None:
+    """Draw precomputed coastline segments (see tla.elevation.marching_squares_segments)."""
+    if not segments:
+        return
+    points: list[tuple[float, float]] = []
+    for (x0, y0), (x1, y1) in segments:
+        points.append((x0 + origin_x, y0 + origin_y))
+        points.append((x1 + origin_x, y1 + origin_y))
+    arcade.draw_lines(points, CONTOUR_COLOR, CONTOUR_WIDTH)

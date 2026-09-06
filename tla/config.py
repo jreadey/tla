@@ -41,12 +41,20 @@ class MapConfig:
     seed: int | None = None
     noise_scale: float = 12.0
     octaves: int = 4
-    # Perlin noise output (roughly -1..1) is bucketed by these two cutoffs:
-    # n > land_threshold          -> LAND
-    # shore_threshold < n <= land_threshold -> SHORE
-    # n <= shore_threshold        -> SEA
-    land_threshold: float = 0.15
-    shore_threshold: float = 0.0
+    # Perlin noise (roughly -1..1) minus sea_level defines a continuous
+    # elevation field; elevation > 0 is land, <= 0 is sea -- see tla.elevation.
+    sea_level: float = 0.15
+    # A hex is LAND if more than this fraction of its elevation-raster
+    # samples are above sea level; otherwise it's SEA. There is no separate
+    # "shore" terrain -- coastal land hexes (bordering a sea hex) are simply
+    # where ports may be placed, see tla.mapgen._place_ports.
+    land_area_threshold: float = 0.10
+    # Elevation raster resolution, as a multiple of hex_pixel_size -- higher
+    # means finer-grained shore detection and a smoother drawn coastline.
+    elevation_supersample: int = 4
+    # Pixel scale shared by map generation (elevation raster spacing) and
+    # rendering (hex drawing size), so both stay in sync.
+    hex_pixel_size: float = 18.0
 
 
 @dataclass

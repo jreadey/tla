@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from tla.elevation import ElevationGrid
 from tla.hexgrid import AxialCoord, axial_to_offset
 from tla.tile import PlayerId, Tile
 
@@ -12,6 +13,8 @@ from tla.tile import PlayerId, Tile
 class Board:
     width: int
     height: int
+    hex_pixel_size: float = 18.0
+    elevation: ElevationGrid | None = None
     tiles: dict[AxialCoord, Tile] = field(default_factory=dict)
 
     def get_tile(self, coord: AxialCoord) -> Tile | None:

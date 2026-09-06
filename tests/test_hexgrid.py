@@ -1,4 +1,13 @@
-from tla.hexgrid import AxialCoord, axial_to_offset, distance, hexes_in_range, neighbors, offset_to_axial
+from tla.hexgrid import (
+    AxialCoord,
+    axial_to_offset,
+    axial_to_pixel,
+    distance,
+    hexes_in_range,
+    neighbors,
+    offset_to_axial,
+    pixel_to_axial,
+)
 
 
 def test_neighbors_count_and_distance():
@@ -44,3 +53,20 @@ def test_offset_axial_roundtrip():
         for row in range(-5, 6):
             coord = offset_to_axial(col, row)
             assert axial_to_offset(coord) == (col, row)
+
+
+def test_pixel_round_trip_recovers_exact_hex_center():
+    hex_size = 18.0
+    for q in range(-6, 7):
+        for r in range(-6, 7):
+            coord = AxialCoord(q, r)
+            x, y = axial_to_pixel(coord, hex_size)
+            assert pixel_to_axial(x, y, hex_size) == coord
+
+
+def test_pixel_to_axial_nearby_point_still_resolves_to_same_hex():
+    hex_size = 18.0
+    coord = AxialCoord(3, -2)
+    x, y = axial_to_pixel(coord, hex_size)
+    # A small nudge (well inside the hex) should not cross into a neighbor.
+    assert pixel_to_axial(x + 2.0, y + 1.0, hex_size) == coord
