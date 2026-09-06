@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Iterable
 
 import arcade
 
 from tla.board import Board
 from tla.elevation import Segment
 from tla.hexgrid import axial_to_pixel
+from tla.rendering.ship_glyphs import draw_ship_glyph
+from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, TerrainType
 
 TERRAIN_COLORS = {
@@ -17,10 +20,24 @@ TERRAIN_COLORS = {
     TerrainType.SEA: (43, 92, 138),
 }
 OUTLINE_COLOR = (30, 30, 30, 140)
-PORT_COLORS = {
+PLAYER_COLORS = {
     PLAYER_A: (220, 60, 60),
     PLAYER_B: (60, 100, 230),
 }
+
+
+def _lighten(color: tuple[int, int, int], amount: float) -> tuple[int, int, int]:
+    r, g, b = color
+    return (
+        round(r + (255 - r) * amount),
+        round(g + (255 - g) * amount),
+        round(b + (255 - b) * amount),
+    )
+
+
+# Port hexes are tinted a lighter shade of their owner's color, so friendly
+# vs. enemy ports are distinguishable at a glance, not just by the anchor icon.
+PORT_COLORS = {player: _lighten(color, 0.55) for player, color in PLAYER_COLORS.items()}
 CONTOUR_COLOR = (20, 20, 20, 200)
 CONTOUR_WIDTH = 2.0
 
@@ -65,23 +82,35 @@ def draw_anchor(center: tuple[float, float], size: float, color: tuple[int, int,
     arcade.draw_texture_rect(_anchor_texture_cached(), rect, color=arcade.types.Color(*color))
 
 
-def draw_board(board: Board, hex_size: float, origin_x: float, origin_y: float) -> None:
+def draw_board(board: Board, hex_size: float) -> None:
+    """Draws in raw world space -- an active camera handles panning/viewport."""
     for coord, tile in board.tiles.items():
-        x, y = axial_to_pixel(coord, hex_size)
-        center = (x + origin_x, y + origin_y)
+        center = axial_to_pixel(coord, hex_size)
         corners = hex_corners(center, hex_size * 0.98)
-        arcade.draw_polygon_filled(corners, TERRAIN_COLORS[tile.terrain])
+        fill_color = PORT_COLORS[tile.port_owner] if tile.is_port else TERRAIN_COLORS[tile.terrain]
+        arcade.draw_polygon_filled(corners, fill_color)
         arcade.draw_polygon_outline(corners, OUTLINE_COLOR, 1)
         if tile.is_port:
-            draw_anchor(center, hex_size * 0.85, PORT_COLORS[tile.port_owner])
+            draw_anchor(center, hex_size * 0.85, PLAYER_COLORS[tile.port_owner])
 
 
-def draw_contour(segments: list[Segment], origin_x: float, origin_y: float) -> None:
-    """Draw precomputed coastline segments (see tla.elevation.marching_squares_segments)."""
+def draw_ships(ships: Iterable[Ship], hex_size: float) -> None:
+    """Draws in raw world space -- an active camera handles panning/viewport."""
+    for ship in ships:
+        center = axial_to_pixel(ship.position, hex_size)
+        submerged = ship.kind == ShipKind.SUBMARINE and not ship.surfaced
+        draw_ship_glyph(center, hex_size, ship.kind, PLAYER_COLORS[ship.owner], submerged=submerged)
+
+
+def draw_contour(segments: list[Segment]) -> None:
+    """Draw precomputed coastline segments (see tla.elevation.marching_squares_segments).
+
+    Draws in raw world space -- an active camera handles panning/viewport.
+    """
     if not segments:
         return
     points: list[tuple[float, float]] = []
     for (x0, y0), (x1, y1) in segments:
-        points.append((x0 + origin_x, y0 + origin_y))
-        points.append((x1 + origin_x, y1 + origin_y))
+        points.append((x0, y0))
+        points.append((x1, y1))
     arcade.draw_lines(points, CONTOUR_COLOR, CONTOUR_WIDTH)

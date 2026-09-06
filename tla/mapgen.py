@@ -89,50 +89,90 @@ def _classify(values: list[float], land_area_threshold: float) -> TerrainType:
     return TerrainType.LAND if land_fraction > land_area_threshold else TerrainType.SEA
 
 
+def _largest_sea_component(board: Board) -> set[AxialCoord]:
+    """The biggest connected body of SEA tiles (flood fill over sea-sea
+    adjacency). Small enclosed ponds end up as separate, smaller components,
+    so ports can be required to border this one instead -- otherwise a port
+    could open onto a landlocked puddle with no way for ships to reach the
+    open ocean, or for the enemy to ever besiege it."""
+    sea_tiles = {c for c, t in board.tiles.items() if t.terrain == TerrainType.SEA}
+    seen: set[AxialCoord] = set()
+    largest: set[AxialCoord] = set()
+    for start in sea_tiles:
+        if start in seen:
+            continue
+        component: set[AxialCoord] = set()
+        stack = [start]
+        while stack:
+            coord = stack.pop()
+            if coord in component:
+                continue
+            component.add(coord)
+            for n in neighbors(coord):
+                if n in sea_tiles and n not in component:
+                    stack.append(n)
+        seen |= component
+        if len(component) > len(largest):
+            largest = component
+    return largest
+
+
 def _place_ports(board: Board, port_config: PortConfig, seed: int) -> None:
     rng = random.Random(seed)
+    main_sea = _largest_sea_component(board)
 
     def is_coastal_land(coord: AxialCoord) -> bool:
         tile = board.tiles[coord]
         if tile.terrain != TerrainType.LAND:
             return False
-        return any(
-            (n_tile := board.tiles.get(n)) is not None and n_tile.terrain == TerrainType.SEA
-            for n in neighbors(coord)
-        )
+        return any(n in main_sea for n in neighbors(coord))
 
     coastal_coords = [c for c in board.tiles if is_coastal_land(c)]
-    rng.shuffle(coastal_coords)
+    needed_per_player = port_config.ports_per_player
 
-    needed = port_config.ports_per_player * 2
-
-    chosen: list[AxialCoord] = []
-    for coord in coastal_coords:
-        if len(chosen) >= needed:
-            break
-        if all(distance(coord, other) >= port_config.min_port_spacing for other in chosen):
-            chosen.append(coord)
-
-    if len(chosen) < needed:
-        remaining = [c for c in coastal_coords if c not in chosen]
-        chosen.extend(remaining[: needed - len(chosen)])
-
-    if len(chosen) < needed:
+    if len(coastal_coords) < needed_per_player * 2:
         raise RuntimeError(
-            f"Only {len(coastal_coords)} coastal land tiles available, need {needed} "
-            f"for {port_config.ports_per_player} ports/player. Adjust map size or "
-            "sea_level/land_area_threshold."
+            f"Only {len(coastal_coords)} coastal land tiles available, need "
+            f"{needed_per_player * 2} for {needed_per_player} ports/player. Adjust "
+            "map size or sea_level/land_area_threshold."
         )
 
-    # Split by longitude (q) so each player's ports cluster on one side of the
-    # map -- a simple fairness heuristic for opposite-side starts.
-    chosen.sort(key=lambda c: c.q)
-    half = port_config.ports_per_player
-    for coord in chosen[:half]:
+    # Two seed hexes as far apart as possible, so each player's ports cluster
+    # near their own seed and away from the other player's -- this is what
+    # keeps a port's average distance to friendly ports below its average
+    # distance to enemy ports.
+    shuffled = coastal_coords[:]
+    rng.shuffle(shuffled)
+    seed_a = shuffled[0]
+    seed_b = max(coastal_coords, key=lambda c: distance(c, seed_a))
+
+    ports_a = _cluster_near(seed_a, coastal_coords, needed_per_player, port_config.min_port_spacing)
+    remaining = [c for c in coastal_coords if c not in ports_a]
+    ports_b = _cluster_near(seed_b, remaining, needed_per_player, port_config.min_port_spacing)
+
+    for coord in ports_a:
         tile = board.tiles[coord]
         tile.is_port = True
         tile.port_owner = PLAYER_A
-    for coord in chosen[half:needed]:
+    for coord in ports_b:
         tile = board.tiles[coord]
         tile.is_port = True
         tile.port_owner = PLAYER_B
+
+
+def _cluster_near(
+    anchor: AxialCoord, pool: list[AxialCoord], count: int, spacing: int
+) -> list[AxialCoord]:
+    """Pick `count` hexes from `pool`, closest to `anchor` first, spread apart
+    by at least `spacing` where the pool allows it."""
+    by_distance = sorted(pool, key=lambda c: distance(c, anchor))
+    chosen: list[AxialCoord] = []
+    for coord in by_distance:
+        if len(chosen) >= count:
+            break
+        if all(distance(coord, other) >= spacing for other in chosen):
+            chosen.append(coord)
+    if len(chosen) < count:
+        remaining = [c for c in by_distance if c not in chosen]
+        chosen.extend(remaining[: count - len(chosen)])
+    return chosen

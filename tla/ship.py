@@ -1,14 +1,12 @@
-"""Ship kinds and their stat sheet.
-
-The mutable `Ship` instance class (position, current HP, submerged state,
-etc.) is added in Phase 2 once movement/fleet placement exist. This module
-starts with just the static data needed by `tla.config`'s defaults.
-"""
+"""Ship kinds, their stat sheet, and the mutable per-instance Ship state."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+
+from tla.hexgrid import AxialCoord
+from tla.tile import PlayerId
 
 
 class ShipKind(Enum):
@@ -36,3 +34,17 @@ class ShipStats:
     aws: int
     cost: int
     movement_submerged: int | None = None
+
+
+@dataclass
+class Ship:
+    """One ship on the board. `surfaced` is only meaningful for submarines --
+    every other kind stays `True` and is never toggled (see tla.movement,
+    Phase 3)."""
+
+    id: int
+    kind: ShipKind
+    owner: PlayerId
+    position: AxialCoord
+    current_hp: int
+    surfaced: bool = True

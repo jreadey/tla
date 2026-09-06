@@ -36,10 +36,13 @@ DEFAULT_FLEET: dict[ShipKind, int] = {
 
 @dataclass
 class MapConfig:
-    width: int = 80
-    height: int = 40
+    # Sized to fit on-screen without panning at the default hex_pixel_size on
+    # most laptop screens. For a bigger map that requires panning to see the
+    # whole thing, see configs/large.json.
+    width: int = 50
+    height: int = 25
     seed: int | None = None
-    noise_scale: float = 12.0
+    noise_scale: float = 7.5
     octaves: int = 4
     # Perlin noise (roughly -1..1) minus sea_level defines a continuous
     # elevation field; elevation > 0 is land, <= 0 is sea -- see tla.elevation.
