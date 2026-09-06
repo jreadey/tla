@@ -1,0 +1,8 @@
+{
+  "map": {
+    "width": 80,
+    "height": 40,
+    "noise_scale": 12.0,
+    "sea_level": 0.15
+  }
+}

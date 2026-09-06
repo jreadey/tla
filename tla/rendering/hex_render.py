@@ -10,10 +10,10 @@ import arcade
 
 from tla.board import Board
 from tla.elevation import Segment
-from tla.hexgrid import axial_to_pixel
+from tla.hexgrid import AxialCoord, axial_to_pixel
 from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import Ship, ShipKind
-from tla.tile import PLAYER_A, PLAYER_B, TerrainType
+from tla.tile import PLAYER_A, PLAYER_B, PlayerId, TerrainType
 
 TERRAIN_COLORS = {
     TerrainType.LAND: (86, 125, 70),
@@ -35,11 +35,29 @@ def _lighten(color: tuple[int, int, int], amount: float) -> tuple[int, int, int]
     )
 
 
+def _dim(color: tuple[int, int, int], amount: float = 0.55) -> tuple[int, int, int]:
+    """Blend `color` toward neutral gray -- used for a current-player ship
+    that has used up its movement this turn."""
+    gray = 120
+    r, g, b = color
+    return (
+        round(r + (gray - r) * amount),
+        round(g + (gray - g) * amount),
+        round(b + (gray - b) * amount),
+    )
+
+
 # Port hexes are tinted a lighter shade of their owner's color, so friendly
 # vs. enemy ports are distinguishable at a glance, not just by the anchor icon.
 PORT_COLORS = {player: _lighten(color, 0.55) for player, color in PLAYER_COLORS.items()}
 CONTOUR_COLOR = (20, 20, 20, 200)
 CONTOUR_WIDTH = 2.0
+# Background hint of a ship's total range while dragging out a move (subtle
+# -- the drawn path itself, not this, is what actually gets committed).
+RANGE_PREVIEW_COLOR = (255, 255, 255, 55)
+# The exact route drawn so far this drag.
+PATH_HIGHLIGHT_COLOR = (255, 165, 0, 140)
+PATH_LINE_COLOR = (255, 165, 0, 255)
 
 # Anchor icon is stored white-on-transparent so it can be tinted per player
 # via draw_texture_rect's color multiplier, rather than keeping one texture
@@ -94,12 +112,28 @@ def draw_board(board: Board, hex_size: float) -> None:
             draw_anchor(center, hex_size * 0.85, PLAYER_COLORS[tile.port_owner])
 
 
-def draw_ships(ships: Iterable[Ship], hex_size: float) -> None:
-    """Draws in raw world space -- an active camera handles panning/viewport."""
+def draw_ships(
+    ships: Iterable[Ship], hex_size: float, current_player: PlayerId | None = None
+) -> None:
+    """Draws in raw world space -- an active camera handles panning/viewport.
+
+    A `current_player` ship with no movement left this turn is dimmed, as a
+    visual indicator of which of the active player's ships can still move.
+    """
     for ship in ships:
         center = axial_to_pixel(ship.position, hex_size)
         submerged = ship.kind == ShipKind.SUBMARINE and not ship.surfaced
-        draw_ship_glyph(center, hex_size, ship.kind, PLAYER_COLORS[ship.owner], submerged=submerged)
+        color = PLAYER_COLORS[ship.owner]
+        if ship.owner == current_player and ship.movement_remaining <= 0:
+            color = _dim(color)
+        draw_ship_glyph(center, hex_size, ship.kind, color, submerged=submerged)
+
+
+def draw_hex_highlight(coord: AxialCoord, hex_size: float, color: tuple[int, int, int, int]) -> None:
+    """Draws in raw world space -- an active camera handles panning/viewport."""
+    center = axial_to_pixel(coord, hex_size)
+    corners = hex_corners(center, hex_size * 0.98)
+    arcade.draw_polygon_filled(corners, color)
 
 
 def draw_contour(segments: list[Segment]) -> None:

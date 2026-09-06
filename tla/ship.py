@@ -39,8 +39,13 @@ class ShipStats:
 @dataclass
 class Ship:
     """One ship on the board. `surfaced` is only meaningful for submarines --
-    every other kind stays `True` and is never toggled (see tla.movement,
-    Phase 3)."""
+    every other kind stays `True` and is never toggled.
+
+    A submarine may toggle surfaced/submerged at most twice per turn (once
+    before it moves, once after); `toggled_pre_move`/`toggled_post_move`
+    track whether each of those two opportunities has been used yet this
+    turn (see tla.movement.toggle_submarine_state).
+    """
 
     id: int
     kind: ShipKind
@@ -49,6 +54,8 @@ class Ship:
     current_hp: int
     surfaced: bool = True
     movement_remaining: int = 0
+    toggled_pre_move: bool = False
+    toggled_post_move: bool = False
 
     def max_movement(self, stats: ShipStats) -> int:
         """`stats` must be this ship's own ShipStats. Submerged submarines

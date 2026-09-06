@@ -6,9 +6,22 @@ import arcade
 
 from tla.elevation import marching_squares_segments
 from tla.game_state import GameState
-from tla.hexgrid import pixel_to_axial
-from tla.rendering.hex_render import PLAYER_COLORS, board_pixel_bounds, draw_board, draw_contour, draw_ships
+from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
+from tla.movement import move_ship_along_path, reachable_hexes, toggle_submarine_state, validate_path
+from tla.rendering.hex_render import (
+    PATH_HIGHLIGHT_COLOR,
+    PATH_LINE_COLOR,
+    PLAYER_COLORS,
+    RANGE_PREVIEW_COLOR,
+    board_pixel_bounds,
+    draw_board,
+    draw_contour,
+    draw_hex_highlight,
+    draw_ships,
+)
 from tla.ship import Ship, ShipKind
+from tla.tile import PLAYER_A
+from tla.turn_manager import TurnManager
 
 # Screen pixels/second for keyboard panning (divided by zoom so it always
 # feels like the same on-screen speed, not the same world-space speed).
@@ -36,6 +49,8 @@ TOOLTIP_PADDING = 10
 TOOLTIP_LINE_HEIGHT = 18
 TOOLTIP_WIDTH = 170
 TOOLTIP_OFFSET = 16
+# Title, Movement, HP, Damage, and one of (ASW | Surfaced/Submerged).
+TOOLTIP_MAX_LINES = 5
 
 
 class GameView(arcade.View):
@@ -55,10 +70,26 @@ class GameView(arcade.View):
         # pixels regardless of the world camera's pan/zoom.
         self.ui_camera = arcade.Camera2D()
 
+        self.turn_manager = TurnManager(game_state)
+        # An in-progress drag: the ship being moved, the exact route drawn
+        # so far (starting with its current hex), and a background "how far
+        # could I go" hint computed once at drag-start.
+        self.drag_ship: Ship | None = None
+        self.drag_path: list[AxialCoord] = []
+        self.range_preview: dict[AxialCoord, int] = {}
+
         self._held_pan_keys: set[int] = set()
         self._dragging = False
         self._mouse_screen_pos = (0.0, 0.0)
         self._hovered_ship: Ship | None = None
+
+        # arcade.Text objects are reused and repositioned every frame rather
+        # than calling arcade.draw_text() fresh each time, which rebuilds a
+        # full text layout from scratch and is too slow to do every frame.
+        self._hud_text = arcade.Text("", 10, 0, arcade.color.WHITE, 13)
+        self._tooltip_texts = [
+            arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(TOOLTIP_MAX_LINES)
+        ]
 
     def on_show_view(self) -> None:
         self.window.background_color = arcade.color.BLACK
@@ -74,23 +105,94 @@ class GameView(arcade.View):
             self._held_pan_keys.add(symbol)
         elif symbol == arcade.key.F11:
             self.window.set_fullscreen(not self.window.fullscreen)
-        elif symbol == arcade.key.ESCAPE and self.window.fullscreen:
-            self.window.set_fullscreen(False)
+        elif symbol == arcade.key.ESCAPE:
+            if self.window.fullscreen:
+                self.window.set_fullscreen(False)
+            elif self.drag_ship is not None:
+                self._abort_drag()
         elif symbol in (arcade.key.PLUS, arcade.key.EQUAL, arcade.key.NUM_ADD):
             self._zoom_toward_screen_point(self.window.width / 2, self.window.height / 2, ZOOM_STEP)
         elif symbol in (arcade.key.MINUS, arcade.key.NUM_SUBTRACT):
             self._zoom_toward_screen_point(self.window.width / 2, self.window.height / 2, 1 / ZOOM_STEP)
         elif symbol == arcade.key.KEY_0:
             self.camera.zoom = 1.0
+        elif symbol == arcade.key.ENTER:
+            self._abort_drag()
+            self.turn_manager.end_movement_phase()
+        elif symbol == arcade.key.T:
+            self._toggle_hovered_submarine()
 
     def on_key_release(self, symbol: int, modifiers: int) -> None:
         self._held_pan_keys.discard(symbol)
 
+    def _toggle_hovered_submarine(self) -> None:
+        """T toggles surfaced/submerged for whichever of your own submarines
+        is under the cursor -- independent of the drag-to-move gesture,
+        since there's no natural pause in a press-drag-release move to
+        squeeze a key press into otherwise."""
+        ship = self._hovered_ship
+        if ship is None or ship.kind != ShipKind.SUBMARINE or ship.owner != self.game_state.current_player:
+            return
+        stats = self.game_state.config.ship_stats.stats[ship.kind]
+        try:
+            toggle_submarine_state(ship, stats)
+        except ValueError:
+            return
+        if self.drag_ship is ship:
+            self._abort_drag()
+
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
         if button == arcade.MOUSE_BUTTON_RIGHT:
             self._dragging = True
+        elif button == arcade.MOUSE_BUTTON_LEFT:
+            self._start_drag(x, y)
+
+    def _start_drag(self, screen_x: float, screen_y: float) -> None:
+        world = self.camera.unproject((screen_x, screen_y))
+        hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
+        gs = self.game_state
+
+        ship = gs.ship_at(hex_coord)
+        if ship is not None and ship.owner == gs.current_player and ship.movement_remaining > 0:
+            self.drag_ship = ship
+            self.drag_path = [hex_coord]
+            self.range_preview = reachable_hexes(ship, gs)
+
+    def _extend_drag(self, screen_x: float, screen_y: float) -> None:
+        world = self.camera.unproject((screen_x, screen_y))
+        hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
+
+        if hex_coord == self.drag_path[-1]:
+            return
+        if hex_coord in self.drag_path:
+            # Dragging back over an already-drawn hex undoes the path back
+            # to that point, rather than requiring a precise one-step undo.
+            index = self.drag_path.index(hex_coord)
+            self.drag_path = self.drag_path[: index + 1]
+            return
+        trial_path = self.drag_path + [hex_coord]
+        try:
+            validate_path(self.drag_ship, trial_path, self.game_state)
+        except ValueError:
+            return
+        self.drag_path = trial_path
+
+    def _commit_drag(self) -> None:
+        if self.drag_ship is not None and len(self.drag_path) > 1:
+            try:
+                move_ship_along_path(self.drag_ship, self.drag_path, self.game_state)
+            except ValueError:
+                pass
+        self._abort_drag()
+
+    def _abort_drag(self) -> None:
+        self.drag_ship = None
+        self.drag_path = []
+        self.range_preview = {}
 
     def on_mouse_release(self, x: int, y: int, button: int, modifiers: int) -> None:
+        if button == arcade.MOUSE_BUTTON_LEFT:
+            self._commit_drag()
         if button == arcade.MOUSE_BUTTON_RIGHT:
             self._dragging = False
 
@@ -99,6 +201,8 @@ class GameView(arcade.View):
             cx, cy = self.camera.position
             zoom = self.camera.zoom
             self.camera.position = (cx - dx / zoom, cy - dy / zoom)
+        if self.drag_ship is not None:
+            self._extend_drag(x, y)
         self._update_hover(x, y)
 
     def on_mouse_motion(self, x: int, y: int, dx: int, dy: int) -> None:
@@ -150,12 +254,36 @@ class GameView(arcade.View):
         self.clear()
         self.camera.use()
         draw_board(self.game_state.board, self.hex_size)
+        for coord in self.range_preview:
+            draw_hex_highlight(coord, self.hex_size, RANGE_PREVIEW_COLOR)
+        for coord in self.drag_path:
+            draw_hex_highlight(coord, self.hex_size, PATH_HIGHLIGHT_COLOR)
+        self._draw_drag_path_line()
         draw_contour(self.contour_segments)
-        draw_ships(self.game_state.ships.values(), self.hex_size)
+        draw_ships(
+            self.game_state.ships.values(), self.hex_size, current_player=self.game_state.current_player
+        )
 
+        self.ui_camera.use()
+        self._draw_hud()
         if self._hovered_ship is not None:
-            self.ui_camera.use()
             self._draw_hover_tooltip(self._hovered_ship)
+
+    def _draw_drag_path_line(self) -> None:
+        if len(self.drag_path) < 2:
+            return
+        points = [axial_to_pixel(coord, self.hex_size) for coord in self.drag_path]
+        arcade.draw_line_strip(points, PATH_LINE_COLOR, 3)
+
+    def _draw_hud(self) -> None:
+        player_label = "Player A" if self.game_state.current_player == PLAYER_A else "Player B"
+        self._hud_text.text = (
+            f"Turn {self.game_state.turn_number} -- {player_label}'s move    "
+            "[Drag a ship] Move    [Esc] Cancel move    "
+            "[Enter] End Movement    [T] Toggle hovered submarine"
+        )
+        self._hud_text.y = self.window.height - 22
+        self._hud_text.draw()
 
     def _draw_hover_tooltip(self, ship: Ship) -> None:
         stats = self.game_state.config.ship_stats.stats[ship.kind]
@@ -186,10 +314,8 @@ class GameView(arcade.View):
         arcade.draw_lbwh_rectangle_filled(left, top - 4, TOOLTIP_WIDTH, 4, PLAYER_COLORS[ship.owner])
 
         for i, line in enumerate(lines):
-            arcade.draw_text(
-                line,
-                left + TOOLTIP_PADDING,
-                top - TOOLTIP_PADDING - (i + 1) * TOOLTIP_LINE_HEIGHT + 4,
-                TOOLTIP_TEXT_COLOR,
-                12,
-            )
+            text_obj = self._tooltip_texts[i]
+            text_obj.text = line
+            text_obj.x = left + TOOLTIP_PADDING
+            text_obj.y = top - TOOLTIP_PADDING - (i + 1) * TOOLTIP_LINE_HEIGHT + 4
+            text_obj.draw()

@@ -146,9 +146,17 @@ def _place_ports(board: Board, port_config: PortConfig, seed: int) -> None:
     seed_a = shuffled[0]
     seed_b = max(coastal_coords, key=lambda c: distance(c, seed_a))
 
-    ports_a = _cluster_near(seed_a, coastal_coords, needed_per_player, port_config.min_port_spacing)
-    remaining = [c for c in coastal_coords if c not in ports_a]
-    ports_b = _cluster_near(seed_b, remaining, needed_per_player, port_config.min_port_spacing)
+    cluster1 = _cluster_near(seed_a, coastal_coords, needed_per_player, port_config.min_port_spacing)
+    remaining = [c for c in coastal_coords if c not in cluster1]
+    cluster2 = _cluster_near(seed_b, remaining, needed_per_player, port_config.min_port_spacing)
+
+    # Player A is on the west (smaller q) side of the map, Player B on the
+    # east -- a stable, predictable left/right layout rather than whichever
+    # cluster happened to get the randomly-picked first seed.
+    if sum(c.q for c in cluster1) <= sum(c.q for c in cluster2):
+        ports_a, ports_b = cluster1, cluster2
+    else:
+        ports_a, ports_b = cluster2, cluster1
 
     for coord in ports_a:
         tile = board.tiles[coord]
