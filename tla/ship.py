@@ -63,3 +63,7 @@ class Ship:
         if self.kind == ShipKind.SUBMARINE and not self.surfaced:
             return stats.movement_submerged if stats.movement_submerged is not None else stats.movement
         return stats.movement
+
+    @property
+    def is_sunk(self) -> bool:
+        return self.current_hp <= 0

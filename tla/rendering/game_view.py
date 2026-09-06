@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import arcade
 
+from tla.battle import RoundResult, resolve_round
 from tla.elevation import marching_squares_segments
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
-from tla.movement import move_ship_along_path, reachable_hexes, toggle_submarine_state, validate_path
+from tla.movement import (
+    begin_engagement,
+    move_ship_along_path,
+    reachable_hexes,
+    toggle_submarine_state,
+    validate_path,
+)
 from tla.rendering.hex_render import (
     PATH_HIGHLIGHT_COLOR,
     PATH_LINE_COLOR,
@@ -22,6 +31,18 @@ from tla.rendering.hex_render import (
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A
 from tla.turn_manager import TurnManager
+
+
+@dataclass
+class ActiveBattle:
+    """A battle awaiting the human attacker's stay/retreat decision after
+    the round that just happened -- driven by key presses (Enter/Escape)
+    rather than a synchronous decision_fn, since the player needs to see
+    each round's outcome before choosing."""
+
+    attacker: Ship
+    defender: Ship
+    rounds: list[RoundResult] = field(default_factory=list)
 
 # Screen pixels/second for keyboard panning (divided by zoom so it always
 # feels like the same on-screen speed, not the same world-space speed).
@@ -52,6 +73,10 @@ TOOLTIP_OFFSET = 16
 # Title, Movement, HP, Damage, and one of (ASW | Surfaced/Submerged).
 TOOLTIP_MAX_LINES = 5
 
+SUNK_BG_COLOR = (40, 10, 10, 235)
+SUNK_BORDER_COLOR = (220, 60, 60)
+SUNK_TEXT_COLOR = arcade.color.WHITE
+
 
 class GameView(arcade.View):
     def __init__(self, game_state: GameState, hex_size: float | None = None) -> None:
@@ -77,6 +102,10 @@ class GameView(arcade.View):
         self.drag_ship: Ship | None = None
         self.drag_path: list[AxialCoord] = []
         self.range_preview: dict[AxialCoord, int] = {}
+        self.active_battle: ActiveBattle | None = None
+        # Set when a battle just concluded with a sink, dismissed by any
+        # key press or click.
+        self.sunk_message: str | None = None
 
         self._held_pan_keys: set[int] = set()
         self._dragging = False
@@ -90,6 +119,8 @@ class GameView(arcade.View):
         self._tooltip_texts = [
             arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(TOOLTIP_MAX_LINES)
         ]
+        self._battle_texts = [arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(3)]
+        self._sunk_text = arcade.Text("", 0, 0, SUNK_TEXT_COLOR, 16, anchor_x="center")
 
     def on_show_view(self) -> None:
         self.window.background_color = arcade.color.BLACK
@@ -101,6 +132,16 @@ class GameView(arcade.View):
         self.ui_camera.match_window(position=True)
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
+        if self.sunk_message is not None:
+            self.sunk_message = None
+            return
+        if self.active_battle is not None:
+            if symbol == arcade.key.ENTER:
+                self._resolve_battle_round()
+            elif symbol == arcade.key.ESCAPE:
+                self._conclude_battle(retreated=True)
+            return
+
         if symbol in _PAN_KEYS:
             self._held_pan_keys.add(symbol)
         elif symbol == arcade.key.F11:
@@ -142,9 +183,12 @@ class GameView(arcade.View):
             self._abort_drag()
 
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
+        if self.sunk_message is not None:
+            self.sunk_message = None
+            return
         if button == arcade.MOUSE_BUTTON_RIGHT:
             self._dragging = True
-        elif button == arcade.MOUSE_BUTTON_LEFT:
+        elif button == arcade.MOUSE_BUTTON_LEFT and self.active_battle is None:
             self._start_drag(x, y)
 
     def _start_drag(self, screen_x: float, screen_y: float) -> None:
@@ -178,17 +222,71 @@ class GameView(arcade.View):
         self.drag_path = trial_path
 
     def _commit_drag(self) -> None:
-        if self.drag_ship is not None and len(self.drag_path) > 1:
+        ship = self.drag_ship
+        path = self.drag_path
+        self._abort_drag()
+        if ship is None or len(path) < 2:
+            return
+
+        if self.game_state.ship_at(path[-1]) is not None:
             try:
-                move_ship_along_path(self.drag_ship, self.drag_path, self.game_state)
+                defender = begin_engagement(ship, path, self.game_state)
+            except ValueError:
+                return
+            self._start_battle(ship, defender)
+        else:
+            try:
+                move_ship_along_path(ship, path, self.game_state)
             except ValueError:
                 pass
-        self._abort_drag()
 
     def _abort_drag(self) -> None:
         self.drag_ship = None
         self.drag_path = []
         self.range_preview = {}
+
+    def _start_battle(self, attacker: Ship, defender: Ship) -> None:
+        self.active_battle = ActiveBattle(attacker=attacker, defender=defender)
+        self._resolve_battle_round()
+
+    def _resolve_battle_round(self) -> None:
+        battle = self.active_battle
+        round_result = resolve_round(battle.attacker, battle.defender, self.game_state)
+        battle.rounds.append(round_result)
+        if round_result.attacker_sunk or round_result.defender_sunk:
+            self._conclude_battle(retreated=False)
+
+    def _conclude_battle(self, retreated: bool) -> None:
+        battle = self.active_battle
+        attacker, defender = battle.attacker, battle.defender
+        self.sunk_message = self._sunk_message(attacker, defender)
+        if defender.is_sunk:
+            del self.game_state.ships[defender.id]
+            if self._hovered_ship is defender:
+                self._hovered_ship = None
+            if not attacker.is_sunk:
+                attacker.position = defender.position
+        if attacker.is_sunk:
+            del self.game_state.ships[attacker.id]
+            if self._hovered_ship is attacker:
+                self._hovered_ship = None
+        # A retreat (both survive) needs no position change -- the attacker
+        # is already sitting at the approach hex from begin_engagement.
+        self.active_battle = None
+
+    def _sunk_message(self, attacker: Ship, defender: Ship) -> str | None:
+        def label(ship: Ship) -> str:
+            owner_label = "Player A" if ship.owner == PLAYER_A else "Player B"
+            kind_label = ship.kind.value.replace("_", " ").title()
+            return f"{owner_label} {kind_label}"
+
+        if attacker.is_sunk and defender.is_sunk:
+            return f"{label(attacker)} and {label(defender)} both sunk!"
+        if attacker.is_sunk:
+            return f"{label(attacker)} sunk!"
+        if defender.is_sunk:
+            return f"{label(defender)} sunk!"
+        return None
 
     def on_mouse_release(self, x: int, y: int, button: int, modifiers: int) -> None:
         if button == arcade.MOUSE_BUTTON_LEFT:
@@ -266,7 +364,11 @@ class GameView(arcade.View):
 
         self.ui_camera.use()
         self._draw_hud()
-        if self._hovered_ship is not None:
+        if self.sunk_message is not None:
+            self._draw_sunk_overlay()
+        elif self.active_battle is not None:
+            self._draw_battle_banner(self.active_battle)
+        elif self._hovered_ship is not None:
             self._draw_hover_tooltip(self._hovered_ship)
 
     def _draw_drag_path_line(self) -> None:
@@ -284,6 +386,55 @@ class GameView(arcade.View):
         )
         self._hud_text.y = self.window.height - 22
         self._hud_text.draw()
+
+    def _draw_battle_banner(self, battle: ActiveBattle) -> None:
+        attacker, defender = battle.attacker, battle.defender
+        last_round = battle.rounds[-1]
+        stats = self.game_state.config.ship_stats.stats
+        a_label = "Player A" if attacker.owner == PLAYER_A else "Player B"
+        d_label = "Player A" if defender.owner == PLAYER_A else "Player B"
+
+        def kind_name(ship: Ship) -> str:
+            return ship.kind.value.replace("_", " ").title()
+
+        lines = [
+            f"BATTLE -- {a_label} {kind_name(attacker)} ({attacker.current_hp}/{stats[attacker.kind].hp} HP)"
+            f"  vs  {d_label} {kind_name(defender)} ({defender.current_hp}/{stats[defender.kind].hp} HP)",
+            f"Round {len(battle.rounds)}: dealt {last_round.damage_to_defender}, "
+            f"took {last_round.damage_to_attacker} damage",
+            "[Enter] Stay and Fight        [Esc] Retreat",
+        ]
+
+        width = 560
+        line_height = 24
+        height = 16 + line_height * len(lines)
+        left = (self.window.width - width) / 2
+        top = self.window.height - 40
+
+        arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, (20, 20, 20, 235))
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, (200, 60, 60))
+
+        for i, line in enumerate(lines):
+            text_obj = self._battle_texts[i]
+            text_obj.text = line
+            text_obj.x = left + 12
+            text_obj.y = top - 12 - (i + 1) * line_height + 6
+            text_obj.draw()
+
+    def _draw_sunk_overlay(self) -> None:
+        display_text = f"{self.sunk_message}   (press any key to continue)"
+        width = min(self.window.width - 40, max(360, len(display_text) * 9 + 40))
+        height = 60
+        left = (self.window.width - width) / 2
+        top = self.window.height - 40
+
+        arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, SUNK_BG_COLOR)
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, SUNK_BORDER_COLOR)
+
+        self._sunk_text.text = display_text
+        self._sunk_text.x = self.window.width / 2
+        self._sunk_text.y = top - height / 2 - 6
+        self._sunk_text.draw()
 
     def _draw_hover_tooltip(self, ship: Ship) -> None:
         stats = self.game_state.config.ship_stats.stats[ship.kind]

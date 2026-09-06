@@ -5,6 +5,7 @@ from tla.config import Config
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, hexes_in_range
 from tla.movement import (
+    begin_engagement,
     move_ship,
     move_ship_along_path,
     reachable_hexes,
@@ -76,9 +77,9 @@ def test_land_hex_is_impassable():
     assert AxialCoord(1, 0) not in reachable
 
 
-def test_any_occupied_hex_is_impassable_for_now():
+def test_friendly_occupied_hex_is_fully_impassable():
     board = _sea_board()
-    blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_A, ship_id=2)
     # Budget of 2 is exactly enough for the direct path through (1, 0) but
     # not enough for any detour around it (hex grids have alternate routes,
     # so a blocked hex isn't a full blockade -- just too far to detour
@@ -88,6 +89,21 @@ def test_any_occupied_hex_is_impassable_for_now():
 
     reachable = reachable_hexes(mover, gs)
     assert AxialCoord(1, 0) not in reachable
+    assert AxialCoord(2, 0) not in reachable
+
+
+def test_enemy_occupied_hex_is_reachable_only_as_a_terminal():
+    board = _sea_board()
+    enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    mover = _make_ship(AxialCoord(0, 0), movement_remaining=2, ship_id=1)
+    gs = _game_state(board, [mover, enemy])
+
+    reachable = reachable_hexes(mover, gs)
+    # Reachable (triggers a battle on arrival)...
+    assert AxialCoord(1, 0) in reachable
+    assert reachable[AxialCoord(1, 0)] == 1
+    # ...but not passable through to reach further hexes in a straight line
+    # (a detour around it is a separate matter, not what this checks).
     assert AxialCoord(2, 0) not in reachable
 
 
@@ -145,6 +161,61 @@ def test_move_ship_rejects_unreachable_destination():
 
     with pytest.raises(ValueError):
         move_ship(ship, AxialCoord(3, 0), gs)
+
+
+def test_move_ship_rejects_enemy_occupied_destination():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=2)
+    enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    with pytest.raises(ValueError):
+        move_ship(ship, AxialCoord(1, 0), gs)
+
+
+def test_move_ship_along_path_rejects_enemy_occupied_final_hex():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=2)
+    enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    with pytest.raises(ValueError):
+        move_ship_along_path(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
+
+
+def test_begin_engagement_applies_approach_and_zeroes_movement():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    enemy = _make_ship(AxialCoord(2, -1), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    path = [AxialCoord(0, 0), AxialCoord(1, -1), AxialCoord(2, -1)]
+    defender = begin_engagement(ship, path, gs)
+
+    assert defender is enemy
+    assert ship.position == AxialCoord(1, -1)  # stopped at the approach hex
+    assert ship.movement_remaining == 0  # movement ends here regardless of outcome
+
+
+def test_begin_engagement_with_adjacent_enemy_does_not_move_the_attacker():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    begin_engagement(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
+
+    assert ship.position == AxialCoord(0, 0)
+    assert ship.movement_remaining == 0
+
+
+def test_begin_engagement_rejects_a_path_not_ending_on_an_enemy():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=2)
+    gs = _game_state(board, [ship])
+
+    with pytest.raises(ValueError):
+        begin_engagement(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
 
 
 def test_move_ship_along_path_takes_the_exact_drawn_route():
