@@ -40,17 +40,17 @@ There are a number of different ship types that have different characteristics:
   * movement: maximum number of hexagons a ship move move in a turn
   * hit points: amount of damage a ship can take before it is sunk
   * damage: amount of damage the ship can inflict on a enemy ship (other than submerged submarines) during a battle
-  * aws: amount of damage a ship can inflict on submerged enemy submarines
+  * asw: amount of damage a ship can inflict on submerged enemy submarines
   * cost: number pf production points needed to create a new ship of this type
 
 The ship types are:
 
-  * Battleships: movement: 4, hit points: 12,  damage: 4, aws: 0, cost: 10
-  * Aircraft Carrier: movement: 4, hit points: 7, damage 2, aws: 0, cost: 10
-  * Cruisers: movement: 4,  hit points: 8, damage: 4, aws: 2, cost: 7
-  * Destroyer: movement: 4, hit points: 6, damage: 2, aws: 2, cost: 4
-  * Submarine: movement (surfaced): 3 movement (submerged): 1, hit points: 4, damage: 4, aws: 0, cost: 4
-  * Patrol boat: movement 6, hit points: 2, damage 1: aws: 1: cost 1
+  * Battleships: movement: 4, hit points: 12,  damage: 4, asw: 0, cost: 10
+  * Aircraft Carrier: movement: 4, hit points: 7, damage 2, asw: 0, cost: 10
+  * Cruisers: movement: 4,  hit points: 8, damage: 4, asw: 2, cost: 7
+  * Destroyer: movement: 4, hit points: 6, damage: 2, asw: 2, cost: 4
+  * Submarine: movement (surfaced): 3 movement (submerged): 1, hit points: 4, damage: 4, asw: 0, cost: 4
+  * Patrol boat: movement 6, hit points: 2, damage 1: asw: 1: cost 1
 
 ## Battle
 

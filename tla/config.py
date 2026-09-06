@@ -14,14 +14,14 @@ from pathlib import Path
 from tla.ship import ShipKind, ShipStats
 
 DEFAULT_SHIP_STATS: dict[ShipKind, ShipStats] = {
-    ShipKind.BATTLESHIP: ShipStats(movement=4, hp=12, damage=4, aws=0, cost=10),
-    ShipKind.CARRIER: ShipStats(movement=4, hp=7, damage=2, aws=0, cost=10),
-    ShipKind.CRUISER: ShipStats(movement=4, hp=8, damage=4, aws=2, cost=7),
-    ShipKind.DESTROYER: ShipStats(movement=4, hp=6, damage=2, aws=2, cost=4),
+    ShipKind.BATTLESHIP: ShipStats(movement=4, hp=12, damage=4, asw=0, cost=10),
+    ShipKind.CARRIER: ShipStats(movement=4, hp=7, damage=2, asw=0, cost=10),
+    ShipKind.CRUISER: ShipStats(movement=4, hp=8, damage=4, asw=2, cost=7),
+    ShipKind.DESTROYER: ShipStats(movement=4, hp=6, damage=2, asw=2, cost=4),
     ShipKind.SUBMARINE: ShipStats(
-        movement=3, movement_submerged=1, hp=4, damage=4, aws=0, cost=4
+        movement=3, movement_submerged=1, hp=4, damage=4, asw=0, cost=4
     ),
-    ShipKind.PATROL_BOAT: ShipStats(movement=6, hp=2, damage=1, aws=1, cost=1),
+    ShipKind.PATROL_BOAT: ShipStats(movement=6, hp=2, damage=1, asw=1, cost=1),
 }
 
 DEFAULT_FLEET: dict[ShipKind, int] = {

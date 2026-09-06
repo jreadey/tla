@@ -25,13 +25,13 @@ class ShipStats:
     `movement` is the normal move budget; for submarines it is the surfaced
     budget, and `movement_submerged` gives the (lower) submerged budget.
     `damage` applies to any enemy ship except a submerged submarine, which
-    can only be damaged by `aws`.
+    can only be damaged by `asw` (anti-submarine warfare).
     """
 
     movement: int
     hp: int
     damage: int
-    aws: int
+    asw: int
     cost: int
     movement_submerged: int | None = None
 
@@ -48,3 +48,11 @@ class Ship:
     position: AxialCoord
     current_hp: int
     surfaced: bool = True
+    movement_remaining: int = 0
+
+    def max_movement(self, stats: ShipStats) -> int:
+        """`stats` must be this ship's own ShipStats. Submerged submarines
+        use the lower movement_submerged budget."""
+        if self.kind == ShipKind.SUBMARINE and not self.surfaced:
+            return stats.movement_submerged if stats.movement_submerged is not None else stats.movement
+        return stats.movement
