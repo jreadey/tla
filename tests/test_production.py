@@ -64,39 +64,48 @@ def test_run_production_carries_leftover_points_to_the_next_order_in_that_ports_
     assert progress.points == 2
 
 
-def test_run_production_splits_budget_evenly_across_ports_with_something_queued():
+def test_run_production_gives_each_controlled_port_the_full_points_per_turn_independently():
+    # points_per_turn=10 with a cost-7 order at each of two ports: if this
+    # were still a shared budget split two ways (5 each), neither would
+    # complete. Each port earning the full 10 independently means both do.
     port1, port2 = AxialCoord(0, 0), AxialCoord(2, 0)
-    gs = _game_state(_board_with_ports(port1, port2), points_per_turn=20)
+    gs = _game_state(_board_with_ports(port1, port2), points_per_turn=10)
     order(gs, PLAYER_A, port1, ShipKind.CRUISER)  # cost 7
     order(gs, PLAYER_A, port2, ShipKind.CRUISER)  # cost 7
 
-    run_production(gs, PLAYER_A)  # 10 pts/port -> both cruisers complete this turn
+    run_production(gs, PLAYER_A)
 
     assert len(gs.ships) == 2
     positions = {s.position for s in gs.ships.values()}
     assert positions == {port1, port2}
 
 
-def test_run_production_ignores_a_port_with_an_empty_queue_when_splitting_budget():
-    port1, port2 = AxialCoord(0, 0), AxialCoord(2, 0)
-    gs = _game_state(_board_with_ports(port1, port2), points_per_turn=20)
-    order(gs, PLAYER_A, port1, ShipKind.CRUISER)  # cost 7; port2 has nothing queued
+def test_run_production_banks_points_on_an_idle_port_with_no_orders():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=5)
 
-    run_production(gs, PLAYER_A)  # port1 alone gets the full 20, not 10
+    run_production(gs, PLAYER_A)
+    run_production(gs, PLAYER_A)
 
-    spawned = [s for s in gs.ships.values() if s.owner == PLAYER_A]
-    assert len(spawned) == 1
-    assert spawned[0].position == port1
-    assert gs.players[PLAYER_A].port_production[port1].points == 13
+    assert gs.ships == {}
+    assert gs.players[PLAYER_A].port_production[port].points == 10
+
+    # Now queue something cheap enough to be covered by what's already
+    # banked -- it should complete immediately, using the accumulated total.
+    order(gs, PLAYER_A, port, ShipKind.DESTROYER)  # cost 4
+    run_production(gs, PLAYER_A)
+
+    assert len(gs.ships) == 1
+    assert gs.players[PLAYER_A].port_production[port].points == 11  # 10 + 5 - 4
 
 
-def test_run_production_skips_occupied_ports_and_redistributes_their_share():
+def test_run_production_gives_nothing_to_an_occupied_port():
     port1, port2 = AxialCoord(0, 0), AxialCoord(2, 0)
     gs = _game_state(_board_with_ports(port1, port2), points_per_turn=20)
     blocker = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port1, current_hp=6)
     gs.ships[1] = blocker
     order(gs, PLAYER_A, port1, ShipKind.CRUISER)
-    order(gs, PLAYER_A, port2, ShipKind.CRUISER)  # cost 7, only port2 is free -> gets the full 20
+    order(gs, PLAYER_A, port2, ShipKind.CRUISER)  # cost 7, only port2 is free
 
     run_production(gs, PLAYER_A)
 
@@ -152,6 +161,46 @@ def test_handle_port_capture_does_nothing_for_a_non_port_hex():
     handle_port_capture(gs, coord)  # should not raise
 
 
+def test_handle_port_capture_flips_the_displayed_controller_on_enemy_occupation():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port))
+    assert gs.board.tiles[port].port_display_owner == PLAYER_A
+    enemy = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port, current_hp=6)
+    gs.ships[1] = enemy
+
+    handle_port_capture(gs, port)
+
+    assert gs.board.tiles[port].port_display_owner == PLAYER_B
+
+
+def test_port_controller_stays_flipped_after_the_capturing_ship_leaves():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port))
+    enemy = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port, current_hp=6)
+    gs.ships[1] = enemy
+    handle_port_capture(gs, port)
+    assert gs.board.tiles[port].port_display_owner == PLAYER_B
+
+    del gs.ships[1]  # the enemy ship sails away; port is empty again
+
+    assert gs.board.tiles[port].port_display_owner == PLAYER_B  # still reads captured
+
+
+def test_port_controller_flips_back_when_the_owner_recaptures():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port))
+    enemy = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port, current_hp=6)
+    gs.ships[1] = enemy
+    handle_port_capture(gs, port)
+    del gs.ships[1]
+
+    friendly = Ship(id=2, kind=ShipKind.DESTROYER, owner=PLAYER_A, position=port, current_hp=6)
+    gs.ships[2] = friendly
+    handle_port_capture(gs, port)
+
+    assert gs.board.tiles[port].port_display_owner == PLAYER_A
+
+
 def test_a_captured_port_resumes_from_empty_once_recaptured():
     port = AxialCoord(0, 0)
     gs = _game_state(_board_with_ports(port), points_per_turn=20)
@@ -164,3 +213,57 @@ def test_a_captured_port_resumes_from_empty_once_recaptured():
     run_production(gs, PLAYER_A)  # nothing queued anymore -> no spawn
 
     assert gs.ships == {}
+
+
+def test_controlled_ports_for_includes_a_captured_enemy_port():
+    port = AxialCoord(0, 0)
+    board = _board_with_ports(port)  # owned by PLAYER_A
+    gs = _game_state(board)
+
+    assert board.controlled_ports_for(PLAYER_A) == [port]
+    assert board.controlled_ports_for(PLAYER_B) == []
+
+    enemy = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port, current_hp=6)
+    gs.ships[1] = enemy
+    handle_port_capture(gs, port)
+
+    assert board.controlled_ports_for(PLAYER_A) == []
+    assert board.controlled_ports_for(PLAYER_B) == [port]
+
+
+def test_capturing_side_can_produce_from_a_flipped_port():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=20)  # A's port
+    enemy = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port, current_hp=6)
+    gs.ships[1] = enemy
+    handle_port_capture(gs, port)  # flips control to B, wipes A's queue there
+    del gs.ships[1]  # B's ship moves off so the port is free to build on
+
+    order(gs, PLAYER_B, port, ShipKind.PATROL_BOAT)  # cost 1 -- B builds from A's old port
+    run_production(gs, PLAYER_B)
+
+    assert len(gs.ships) == 1
+    spawned = next(iter(gs.ships.values()))
+    assert spawned.owner == PLAYER_B
+    assert spawned.position == port
+    # The original owner no longer controls it, so their own production
+    # run does nothing here even though nothing has changed on their side.
+    order(gs, PLAYER_A, port, ShipKind.PATROL_BOAT)
+    run_production(gs, PLAYER_A)
+    assert len(gs.ships) == 1  # unchanged -- A doesn't control this port anymore
+
+
+def test_handle_port_capture_wipes_the_previous_capturers_queue_on_recapture():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port))
+    enemy = Ship(id=1, kind=ShipKind.DESTROYER, owner=PLAYER_B, position=port, current_hp=6)
+    gs.ships[1] = enemy
+    handle_port_capture(gs, port)  # B captures
+    del gs.ships[1]
+    order(gs, PLAYER_B, port, ShipKind.CRUISER)  # B queues something at their new port
+
+    friendly = Ship(id=2, kind=ShipKind.DESTROYER, owner=PLAYER_A, position=port, current_hp=6)
+    gs.ships[2] = friendly
+    handle_port_capture(gs, port)  # A retakes it
+
+    assert port not in gs.players[PLAYER_B].port_production

@@ -20,6 +20,7 @@ from typing import Callable, Literal
 from tla.config import CombatConfig
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, distance
+from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
 from tla.tile import PlayerId
 
@@ -108,13 +109,40 @@ class BattleResult:
 def run_battle(attacker: Ship, defender: Ship, game_state: GameState, decision_fn: DecisionFn) -> BattleResult:
     """Resolve rounds until a sink or a retreat. `decision_fn` is asked
     after each round where both ships survive; it is never asked before the
-    first round -- contact always causes at least one exchange."""
+    first round -- contact always causes at least one exchange. Applies the
+    outcome to `game_state` before returning -- see `apply_battle_outcome`."""
     result = BattleResult(attacker=attacker, defender=defender)
     while True:
         round_result = resolve_round(attacker, defender, game_state)
         result.rounds.append(round_result)
         if round_result.attacker_sunk or round_result.defender_sunk:
-            return result
+            break
         if decision_fn(attacker, defender, game_state) == "retreat":
             result.retreated = True
-            return result
+            break
+    apply_battle_outcome(game_state, attacker, defender)
+    return result
+
+
+def apply_battle_outcome(game_state: GameState, attacker: Ship, defender: Ship) -> None:
+    """Apply a concluded battle's consequences to `game_state`: remove any
+    sunk ship(s), move a surviving attacker onto a defeated defender's hex
+    (which may capture a port there -- see
+    `tla.production.handle_port_capture`), and refresh the winner. A pure
+    retreat (both survive) needs no changes here -- the attacker never
+    advanced past its approach hex in the first place, per
+    `tla.movement.begin_engagement`.
+
+    Called automatically by `run_battle` for a synchronous decision_fn (an
+    AI, say); a UI driving rounds one at a time via `resolve_round` directly
+    -- to let the player see each round before choosing -- must call this
+    itself once the battle actually concludes.
+    """
+    if defender.is_sunk:
+        del game_state.ships[defender.id]
+        if not attacker.is_sunk:
+            attacker.position = defender.position
+            handle_port_capture(game_state, attacker.position)
+    if attacker.is_sunk:
+        del game_state.ships[attacker.id]
+    game_state.refresh_winner()

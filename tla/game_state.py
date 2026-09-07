@@ -13,6 +13,7 @@ from tla.hexgrid import AxialCoord
 from tla.mapgen import generate_map
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, PlayerId
+from tla.win_condition import check_elimination, check_port_control
 
 
 class TurnPhase(Enum):
@@ -38,9 +39,6 @@ class PlayerState:
     # and tla.production. A port with no entry here has never had anything
     # queued (equivalent to an empty queue).
     port_production: dict[AxialCoord, PortProduction] = field(default_factory=dict)
-    # Consecutive turn-ends this player's ports have all been enemy-held;
-    # see tla.win_condition.
-    siege_streak: int = 0
 
 
 @dataclass
@@ -65,6 +63,18 @@ class GameState:
 
     def ships_for(self, player: PlayerId) -> list[Ship]:
         return [ship for ship in self.ships.values() if ship.owner == player]
+
+    def refresh_winner(self) -> None:
+        """Re-evaluate both win conditions and set `winner` if either is now
+        met. Never un-sets an already-decided winner, so this is safe to
+        call speculatively -- it's meant to be called by the rules layer
+        itself (movement, battle, production) right after any mutation that
+        could end the game: a ship sunk, or a port's controller changing --
+        rather than left to whatever's driving the game (a human UI or an
+        AI) to remember to check afterward."""
+        if self.winner is not None:
+            return
+        self.winner = check_elimination(self) or check_port_control(self)
 
 
 def new_game(config: Config, seed: int) -> GameState:

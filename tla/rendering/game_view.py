@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 
 import arcade
 
-from tla.battle import RoundResult, resolve_round
+from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
@@ -17,7 +17,7 @@ from tla.movement import (
     toggle_submarine_state,
     validate_path,
 )
-from tla.production import handle_port_capture, order
+from tla.production import order
 from tla.rendering.hex_render import (
     PATH_HIGHLIGHT_COLOR,
     PATH_LINE_COLOR,
@@ -33,7 +33,6 @@ from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A
 from tla.turn_manager import TurnManager
-from tla.win_condition import check_elimination
 
 # The six ship kinds shown, in this fixed order, as clickable glyph buttons
 # in a port's production panel.
@@ -289,7 +288,7 @@ class GameView(arcade.View):
             return
 
         tile = gs.board.get_tile(hex_coord)
-        if ship is None and tile is not None and tile.is_port and tile.port_owner == gs.current_player:
+        if ship is None and tile is not None and tile.is_port and tile.port_display_owner == gs.current_player:
             if self.selected_port == hex_coord:
                 self._close_port_panel()
             else:
@@ -332,10 +331,11 @@ class GameView(arcade.View):
             self._start_battle(ship, defender)
         else:
             try:
+                # Captures a port and ends the game on the spot if that
+                # completes total port control -- see move_ship_along_path.
                 move_ship_along_path(ship, path, self.game_state)
             except ValueError:
                 return
-            handle_port_capture(self.game_state, path[-1])
 
     def _abort_drag(self) -> None:
         self.drag_ship = None
@@ -357,25 +357,15 @@ class GameView(arcade.View):
         battle = self.active_battle
         attacker, defender = battle.attacker, battle.defender
         self.sunk_message = self._sunk_message(attacker, defender)
-        if defender.is_sunk:
-            del self.game_state.ships[defender.id]
-            if self._hovered_ship is defender:
-                self._hovered_ship = None
-            if not attacker.is_sunk:
-                attacker.position = defender.position
-                handle_port_capture(self.game_state, attacker.position)
-        if attacker.is_sunk:
-            del self.game_state.ships[attacker.id]
-            if self._hovered_ship is attacker:
-                self._hovered_ship = None
-        # A retreat (both survive) needs no position change -- the attacker
-        # is already sitting at the approach hex from begin_engagement.
+        if defender.is_sunk and self._hovered_ship is defender:
+            self._hovered_ship = None
+        if attacker.is_sunk and self._hovered_ship is attacker:
+            self._hovered_ship = None
+        # Removes sunk ship(s), repositions a surviving attacker (which may
+        # capture a port), and refreshes game_state.winner -- see
+        # tla.battle.apply_battle_outcome. A pure retreat is a no-op here.
+        apply_battle_outcome(self.game_state, attacker, defender)
         self.active_battle = None
-        # Check immediately rather than waiting for the next turn boundary
-        # -- otherwise a wiped-out player could still spend accumulated
-        # production points to build new ships in their own phase this
-        # very turn, dodging the loss.
-        self.game_state.winner = check_elimination(self.game_state)
 
     def _sunk_message(self, attacker: Ship, defender: Ship) -> str | None:
         def label(ship: Ship) -> str:

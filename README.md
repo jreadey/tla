@@ -13,7 +13,7 @@ players ships are placed near one of their ports.
 
 ## Winning
 
-A player wins the game if all his ships are sunk or the opposing player occupies all his ports for a complete turn.
+A player wins the game the instant their opponent's entire fleet is sunk, or the instant one player controls every port on the map -- their own plus every one they've captured from the other side (see Production above: a captured port stays captured, and can be built from, until the other side takes it back).
 
 ## Turn
 
@@ -61,7 +61,9 @@ where the battle is taking place, one damage point is added to the attack for th
 
 ## Production
 
-Production is automatic and organized per port. Clicking an empty friendly port opens that port's own production panel, showing its current queue as a row of ship glyphs plus an "Order" button; hovering a queued glyph shows its ship type and build state (e.g. "8/10"), and pressing Order opens a picker of the six ship types (with costs) to add to that port's queue, in any quantity. Each turn's production budget (20 points by default) is split evenly across the ports that currently have something queued and aren't occupied by a ship (of either side); a port banks its share and, once it has enough to cover the cost of the order at the front of its queue, the new ship appears there and any leftover points carry over toward the port's next order. A port occupied by either side's ship gets no share that turn -- its points are simply redistributed to the player's other eligible ports instead of being wasted -- and if the occupant is an enemy ship, that port's entire queue and banked points are lost outright, resuming from empty once the port is free again.
+Production is automatic and organized per port. Clicking an empty friendly port opens that port's own production panel, showing its current queue as a row of ship glyphs plus an "Order" button; hovering a queued glyph shows its ship type and build state (e.g. "8/10"), and pressing Order opens a picker of the six ship types (with costs) to add to that port's queue, in any quantity. Every turn, each port a player currently controls (their own plus any of the opponent's they've captured) and that isn't occupied by a ship independently earns 5 production points (configurable) -- not a shared budget split across ports, so controlling more ports means more total production, not a thinner split of a fixed amount. A port banks its points and, once they cover the cost of the order at the front of its queue, the new ship appears there and any leftover carries toward the port's next order; a port occupied by either side's ship simply earns nothing that turn. If the occupant is an enemy ship, that port's entire queue and banked points are also lost outright, resuming from empty once the port is free again.
+
+A port an enemy has captured can be built from by whoever currently holds it -- production follows the flip. Losing control of a port, whether to the original owner retaking it or a second capture by the other side, wipes whatever the previous controller had queued there, the same as an initial capture does.
 
 ## Development
 

@@ -101,15 +101,26 @@ def draw_anchor(center: tuple[float, float], size: float, color: tuple[int, int,
 
 
 def draw_board(board: Board, hex_size: float) -> None:
-    """Draws in raw world space -- an active camera handles panning/viewport."""
+    """Draws in raw world space -- an active camera handles panning/viewport.
+
+    A port is tinted its *displayed* owner's color (`Tile.port_display_owner`)
+    rather than its permanent owner's -- once an enemy occupation flips it,
+    it keeps reading as captured even after that ship moves on, until the
+    other side takes it back. See tla.production.handle_port_capture, which
+    updates this as ships move.
+    """
     for coord, tile in board.tiles.items():
         center = axial_to_pixel(coord, hex_size)
         corners = hex_corners(center, hex_size * 0.98)
-        fill_color = PORT_COLORS[tile.port_owner] if tile.is_port else TERRAIN_COLORS[tile.terrain]
+        if tile.is_port:
+            color_owner = tile.port_display_owner
+            fill_color = PORT_COLORS[color_owner]
+        else:
+            fill_color = TERRAIN_COLORS[tile.terrain]
         arcade.draw_polygon_filled(corners, fill_color)
         arcade.draw_polygon_outline(corners, OUTLINE_COLOR, 1)
         if tile.is_port:
-            draw_anchor(center, hex_size * 0.85, PLAYER_COLORS[tile.port_owner])
+            draw_anchor(center, hex_size * 0.85, PLAYER_COLORS[color_owner])
 
 
 def draw_ships(

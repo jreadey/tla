@@ -23,8 +23,6 @@ def _ship(owner, ship_id, kind=ShipKind.DESTROYER, movement_remaining=0, surface
 
 
 def _game_state() -> GameState:
-    # No ports on this board -- check_port_siege trivially never fires
-    # (bool([]) is False), so these tests only exercise phase cycling.
     board = Board(width=5, height=5)
     ships = [
         _ship(PLAYER_A, 1, movement_remaining=1),
@@ -89,23 +87,3 @@ def test_end_movement_phase_runs_production_for_both_players():
 
     assert any(s.owner == PLAYER_A and s.position == port_a for s in gs.ships.values())
     assert any(s.owner == PLAYER_B and s.position == port_b for s in gs.ships.values())
-
-
-def test_full_turn_boundary_declares_a_winner_on_completed_siege():
-    board = Board(width=5, height=5)
-    port_a = AxialCoord(0, 0)
-    board.tiles[port_a] = Tile(coord=port_a, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
-    besieger = _ship(PLAYER_B, 1)
-    besieger.position = port_a
-    a_ship = _ship(PLAYER_A, 2, movement_remaining=0)
-    gs = GameState(config=Config(), board=board, ships={1: besieger, 2: a_ship})
-    gs.players[PLAYER_A].siege_streak = 1  # already besieged as of last turn-end
-    gs.phase = TurnPhase.MOVE_B
-    gs.current_player = PLAYER_B
-    manager = TurnManager(gs)
-
-    manager.end_movement_phase()
-
-    assert gs.winner == PLAYER_B
-    # The game stops advancing once there's a winner.
-    assert gs.phase == TurnPhase.MOVE_B

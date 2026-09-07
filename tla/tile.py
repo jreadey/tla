@@ -24,6 +24,23 @@ class Tile:
     terrain: TerrainType
     is_port: bool = False
     port_owner: PlayerId | None = None
+    # Which side the port currently *displays* as held by -- distinct from
+    # the permanent `port_owner`. It only changes when a ship belonging to
+    # someone other than the current controller occupies the port, and
+    # stays put (doesn't revert) once that ship leaves again; see
+    # tla.production.handle_port_capture. None (the common case: never yet
+    # occupied by anyone) means "same as port_owner" -- see
+    # tla.tile.Tile.port_display_owner.
+    port_controller: PlayerId | None = None
+
+    @property
+    def port_display_owner(self) -> PlayerId | None:
+        """The side a port should currently be rendered as belonging to:
+        `port_controller` once it's been set by an occupation, else
+        `port_owner`. None for a non-port tile."""
+        if not self.is_port:
+            return None
+        return self.port_controller if self.port_controller is not None else self.port_owner
 
     @property
     def occupiable(self) -> bool:

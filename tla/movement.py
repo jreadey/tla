@@ -12,6 +12,7 @@ from typing import Literal
 
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, neighbors
+from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
 from tla.tile import PlayerId, TerrainType
 
@@ -135,7 +136,15 @@ def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameSta
     its length in movement points -- not necessarily the shortest possible
     cost to the final hex, since the whole point is an explicit route.
     Raises if the final hex is enemy-occupied; use `begin_engagement` for a
-    combat-triggering move instead."""
+    combat-triggering move instead.
+
+    If the destination is a port, this may capture it (see
+    `tla.production.handle_port_capture`) and, if that completes total port
+    control, end the game -- callers don't need to check for that
+    separately. This applies even to an approach path fed in from
+    `begin_engagement`: stopping at an enemy port on the way to attacking
+    someone adjacent still counts as occupying it.
+    """
     validate_path(ship, path, game_state)
     if game_state.ship_at(path[-1]) is not None:
         raise ValueError(f"{path[-1]} is enemy-occupied; use begin_engagement to attack it")
@@ -143,6 +152,7 @@ def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameSta
     origin = ship.position
     ship.position = path[-1]
     ship.movement_remaining -= cost
+    handle_port_capture(game_state, path[-1])
     return MoveResult(ship=ship, origin=origin, destination=path[-1], cost=cost)
 
 

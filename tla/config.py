@@ -80,7 +80,10 @@ class FleetConfig:
 
 @dataclass
 class ProductionConfig:
-    points_per_turn: int = 20
+    # Added to *each* controlled, unoccupied port every turn -- not a
+    # shared budget split across ports, so a player's total production
+    # scales with how many ports they control.
+    points_per_turn: int = 5
 
 
 @dataclass
