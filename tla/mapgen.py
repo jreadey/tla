@@ -89,12 +89,14 @@ def _classify(values: list[float], land_area_threshold: float) -> TerrainType:
     return TerrainType.LAND if land_fraction > land_area_threshold else TerrainType.SEA
 
 
-def _largest_sea_component(board: Board) -> set[AxialCoord]:
+def largest_sea_component(board: Board) -> set[AxialCoord]:
     """The biggest connected body of SEA tiles (flood fill over sea-sea
     adjacency). Small enclosed ponds end up as separate, smaller components,
     so ports can be required to border this one instead -- otherwise a port
     could open onto a landlocked puddle with no way for ships to reach the
-    open ocean, or for the enemy to ever besiege it."""
+    open ocean, or for the enemy to ever besiege it. Also used by
+    tla.fleet_setup so starting ships never land in one of those ponds
+    either (see _pick_start_hex)."""
     sea_tiles = {c for c, t in board.tiles.items() if t.terrain == TerrainType.SEA}
     seen: set[AxialCoord] = set()
     largest: set[AxialCoord] = set()
@@ -119,7 +121,7 @@ def _largest_sea_component(board: Board) -> set[AxialCoord]:
 
 def _place_ports(board: Board, port_config: PortConfig, seed: int) -> None:
     rng = random.Random(seed)
-    main_sea = _largest_sea_component(board)
+    main_sea = largest_sea_component(board)
 
     def is_coastal_land(coord: AxialCoord) -> bool:
         tile = board.tiles[coord]

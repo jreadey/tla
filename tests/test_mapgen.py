@@ -1,6 +1,6 @@
 from tla.config import Config, MapConfig, PortConfig
 from tla.hexgrid import axial_to_offset, distance, neighbors
-from tla.mapgen import _largest_sea_component, generate_map
+from tla.mapgen import largest_sea_component, generate_map
 from tla.tile import PLAYER_A, PLAYER_B, TerrainType
 
 
@@ -88,7 +88,7 @@ def test_ports_border_the_main_sea_not_an_isolated_pond():
     config = Config()
     for seed in (533501, 1, 2, 3, 4, 5):
         board = generate_map(config.map, config.ports, seed=seed)
-        main_sea = _largest_sea_component(board)
+        main_sea = largest_sea_component(board)
         for player in (PLAYER_A, PLAYER_B):
             for port in board.ports_for(player):
                 assert any(n in main_sea for n in neighbors(port)), (

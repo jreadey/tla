@@ -17,6 +17,7 @@ from tla.movement import (
     toggle_submarine_state,
     validate_path,
 )
+from tla.production import handle_port_capture, order
 from tla.rendering.hex_render import (
     PATH_HIGHLIGHT_COLOR,
     PATH_LINE_COLOR,
@@ -28,9 +29,28 @@ from tla.rendering.hex_render import (
     draw_hex_highlight,
     draw_ships,
 )
+from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A
 from tla.turn_manager import TurnManager
+from tla.win_condition import check_elimination
+
+# The six ship kinds shown, in this fixed order, as clickable glyph buttons
+# in a port's production panel.
+_PORT_PANEL_KINDS = [
+    ShipKind.BATTLESHIP,
+    ShipKind.CARRIER,
+    ShipKind.CRUISER,
+    ShipKind.DESTROYER,
+    ShipKind.SUBMARINE,
+    ShipKind.PATROL_BOAT,
+]
+PORT_PANEL_BG_COLOR = (25, 25, 25, 235)
+PORT_PANEL_ICON_BOX = 56.0
+PORT_PANEL_ICON_HEX_SIZE = 12.0
+PORT_PANEL_MARGIN = 14.0
+PORT_PANEL_ICON_ROW_HEIGHT = 60.0
+PORT_PANEL_HEADER_HEIGHT = 44.0
 
 
 @dataclass
@@ -77,6 +97,9 @@ SUNK_BG_COLOR = (40, 10, 10, 235)
 SUNK_BORDER_COLOR = (220, 60, 60)
 SUNK_TEXT_COLOR = arcade.color.WHITE
 
+GAME_OVER_BG_COLOR = (10, 10, 10, 245)
+GAME_OVER_TEXT_COLOR = arcade.color.WHITE
+
 
 class GameView(arcade.View):
     def __init__(self, game_state: GameState, hex_size: float | None = None) -> None:
@@ -106,6 +129,13 @@ class GameView(arcade.View):
         # Set when a battle just concluded with a sink, dismissed by any
         # key press or click.
         self.sunk_message: str | None = None
+        # The empty friendly port currently showing its production panel,
+        # if any -- opened by clicking it, closed by clicking elsewhere,
+        # Escape, or ending movement.
+        self.selected_port: AxialCoord | None = None
+        # Within an open port panel: False shows the queue + an "Order"
+        # button, True shows the six ship-kind glyphs to pick from.
+        self._port_panel_picking = False
 
         self._held_pan_keys: set[int] = set()
         self._dragging = False
@@ -115,12 +145,25 @@ class GameView(arcade.View):
         # arcade.Text objects are reused and repositioned every frame rather
         # than calling arcade.draw_text() fresh each time, which rebuilds a
         # full text layout from scratch and is too slow to do every frame.
-        self._hud_text = arcade.Text("", 10, 0, arcade.color.WHITE, 13)
+        self._hud_texts = [arcade.Text("", 10, 0, arcade.color.WHITE, 13) for _ in range(2)]
         self._tooltip_texts = [
             arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(TOOLTIP_MAX_LINES)
         ]
         self._battle_texts = [arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(3)]
         self._sunk_text = arcade.Text("", 0, 0, SUNK_TEXT_COLOR, 16, anchor_x="center")
+        self._game_over_text = arcade.Text(
+            "", 0, 0, GAME_OVER_TEXT_COLOR, 36, anchor_x="center", bold=True
+        )
+        self._port_panel_title_text = arcade.Text("", 0, 0, arcade.color.WHITE, 13)
+        self._port_panel_cost_texts = [
+            arcade.Text("", 0, 0, arcade.color.WHITE, 11, anchor_x="center") for _ in range(6)
+        ]
+        self._port_panel_order_text = arcade.Text(
+            "+", 0, 0, arcade.color.WHITE, 20, anchor_x="center", anchor_y="center"
+        )
+        self._port_panel_hover_text = arcade.Text(
+            "", 0, 0, arcade.color.WHITE, 12, anchor_x="center"
+        )
 
     def on_show_view(self) -> None:
         self.window.background_color = arcade.color.BLACK
@@ -132,6 +175,8 @@ class GameView(arcade.View):
         self.ui_camera.match_window(position=True)
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
+        if self.game_state.winner is not None:
+            return
         if self.sunk_message is not None:
             self.sunk_message = None
             return
@@ -151,6 +196,10 @@ class GameView(arcade.View):
                 self.window.set_fullscreen(False)
             elif self.drag_ship is not None:
                 self._abort_drag()
+            elif self._port_panel_picking:
+                self._port_panel_picking = False
+            elif self.selected_port is not None:
+                self._close_port_panel()
         elif symbol in (arcade.key.PLUS, arcade.key.EQUAL, arcade.key.NUM_ADD):
             self._zoom_toward_screen_point(self.window.width / 2, self.window.height / 2, ZOOM_STEP)
         elif symbol in (arcade.key.MINUS, arcade.key.NUM_SUBTRACT):
@@ -159,6 +208,7 @@ class GameView(arcade.View):
             self.camera.zoom = 1.0
         elif symbol == arcade.key.ENTER:
             self._abort_drag()
+            self._close_port_panel()
             self.turn_manager.end_movement_phase()
         elif symbol == arcade.key.T:
             self._toggle_hovered_submarine()
@@ -183,24 +233,70 @@ class GameView(arcade.View):
             self._abort_drag()
 
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
+        if self.game_state.winner is not None:
+            return
         if self.sunk_message is not None:
             self.sunk_message = None
             return
         if button == arcade.MOUSE_BUTTON_RIGHT:
             self._dragging = True
-        elif button == arcade.MOUSE_BUTTON_LEFT and self.active_battle is None:
-            self._start_drag(x, y)
+            return
+        if button != arcade.MOUSE_BUTTON_LEFT or self.active_battle is not None:
+            return
+        if self.selected_port is not None:
+            if self._port_panel_picking:
+                clicked_kind = self._picker_glyph_at(x, y)
+                if clicked_kind is not None:
+                    order(self.game_state, self.game_state.current_player, self.selected_port, clicked_kind)
+                    self._port_panel_picking = False
+                    # Return immediately rather than falling into the bounds
+                    # check below: adding to the queue changes its length,
+                    # which resizes/re-centers the panel, so re-checking
+                    # against the now-different geometry could wrongly
+                    # decide this same click landed outside it.
+                    return
+            elif self._order_button_at(x, y):
+                self._port_panel_picking = True
+                return
+            # Any click within the panel's (still-current, since neither
+            # branch above matched) bounds is consumed here even though it
+            # missed every button -- it must never fall through to
+            # _start_drag, which would reinterpret it as a click on
+            # whatever map hex happens to be underneath the panel.
+            if self._point_in_port_panel(x, y):
+                return
+        self._start_drag(x, y)
+
+    def _open_port_panel(self, coord: AxialCoord) -> None:
+        self.selected_port = coord
+        self._port_panel_picking = False
+
+    def _close_port_panel(self) -> None:
+        self.selected_port = None
+        self._port_panel_picking = False
 
     def _start_drag(self, screen_x: float, screen_y: float) -> None:
+        gs = self.game_state
         world = self.camera.unproject((screen_x, screen_y))
         hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
-        gs = self.game_state
 
         ship = gs.ship_at(hex_coord)
         if ship is not None and ship.owner == gs.current_player and ship.movement_remaining > 0:
+            self._close_port_panel()
             self.drag_ship = ship
             self.drag_path = [hex_coord]
             self.range_preview = reachable_hexes(ship, gs)
+            return
+
+        tile = gs.board.get_tile(hex_coord)
+        if ship is None and tile is not None and tile.is_port and tile.port_owner == gs.current_player:
+            if self.selected_port == hex_coord:
+                self._close_port_panel()
+            else:
+                self._open_port_panel(hex_coord)
+            return
+
+        self._close_port_panel()
 
     def _extend_drag(self, screen_x: float, screen_y: float) -> None:
         world = self.camera.unproject((screen_x, screen_y))
@@ -238,7 +334,8 @@ class GameView(arcade.View):
             try:
                 move_ship_along_path(ship, path, self.game_state)
             except ValueError:
-                pass
+                return
+            handle_port_capture(self.game_state, path[-1])
 
     def _abort_drag(self) -> None:
         self.drag_ship = None
@@ -266,6 +363,7 @@ class GameView(arcade.View):
                 self._hovered_ship = None
             if not attacker.is_sunk:
                 attacker.position = defender.position
+                handle_port_capture(self.game_state, attacker.position)
         if attacker.is_sunk:
             del self.game_state.ships[attacker.id]
             if self._hovered_ship is attacker:
@@ -273,6 +371,11 @@ class GameView(arcade.View):
         # A retreat (both survive) needs no position change -- the attacker
         # is already sitting at the approach hex from begin_engagement.
         self.active_battle = None
+        # Check immediately rather than waiting for the next turn boundary
+        # -- otherwise a wiped-out player could still spend accumulated
+        # production points to build new ships in their own phase this
+        # very turn, dodging the loss.
+        self.game_state.winner = check_elimination(self.game_state)
 
     def _sunk_message(self, attacker: Ship, defender: Ship) -> str | None:
         def label(ship: Ship) -> str:
@@ -363,7 +466,12 @@ class GameView(arcade.View):
         )
 
         self.ui_camera.use()
+        if self.game_state.winner is not None:
+            self._draw_game_over_overlay()
+            return
         self._draw_hud()
+        if self.selected_port is not None:
+            self._draw_port_panel()
         if self.sunk_message is not None:
             self._draw_sunk_overlay()
         elif self.active_battle is not None:
@@ -378,14 +486,130 @@ class GameView(arcade.View):
         arcade.draw_line_strip(points, PATH_LINE_COLOR, 3)
 
     def _draw_hud(self) -> None:
-        player_label = "Player A" if self.game_state.current_player == PLAYER_A else "Player B"
-        self._hud_text.text = (
-            f"Turn {self.game_state.turn_number} -- {player_label}'s move    "
+        gs = self.game_state
+        player_label = "Player A" if gs.current_player == PLAYER_A else "Player B"
+        lines = [
+            f"Turn {gs.turn_number} -- {player_label}'s move    "
             "[Drag a ship] Move    [Esc] Cancel move    "
-            "[Enter] End Movement    [T] Toggle hovered submarine"
+            "[Enter] End Movement    [T] Toggle hovered submarine",
+            "[Click an empty friendly port] Manage its production queue",
+        ]
+        for i, line in enumerate(lines):
+            text_obj = self._hud_texts[i]
+            text_obj.text = line
+            text_obj.y = self.window.height - 22 - i * 20
+            text_obj.draw()
+
+    def _selected_port_queue(self) -> list[ShipKind]:
+        if self.selected_port is None:
+            return []
+        gs = self.game_state
+        progress = gs.players[gs.current_player].port_production.get(self.selected_port)
+        return progress.orders if progress else []
+
+    def _port_panel_slot_count(self) -> int:
+        return len(_PORT_PANEL_KINDS) if self._port_panel_picking else len(self._selected_port_queue()) + 1
+
+    def _port_panel_geometry(self) -> tuple[float, float, float, float]:
+        """(left, bottom, width, height) of the port panel in screen space."""
+        width = PORT_PANEL_MARGIN * 2 + PORT_PANEL_ICON_BOX * self._port_panel_slot_count()
+        height = PORT_PANEL_MARGIN + PORT_PANEL_HEADER_HEIGHT + PORT_PANEL_ICON_ROW_HEIGHT
+        left = (self.window.width - width) / 2
+        return left, PORT_PANEL_MARGIN, width, height
+
+    def _port_panel_slot_centers(self) -> list[tuple[float, float]]:
+        left, bottom, _width, _height = self._port_panel_geometry()
+        icon_cy = bottom + PORT_PANEL_ICON_ROW_HEIGHT / 2
+        return [
+            (left + PORT_PANEL_MARGIN + PORT_PANEL_ICON_BOX * (i + 0.5), icon_cy)
+            for i in range(self._port_panel_slot_count())
+        ]
+
+    def _point_in_port_panel(self, screen_x: float, screen_y: float) -> bool:
+        if self.selected_port is None:
+            return False
+        left, bottom, width, height = self._port_panel_geometry()
+        return left <= screen_x <= left + width and bottom <= screen_y <= bottom + height
+
+    def _picker_glyph_at(self, screen_x: float, screen_y: float) -> ShipKind | None:
+        half = PORT_PANEL_ICON_BOX / 2
+        for kind, (cx, cy) in zip(_PORT_PANEL_KINDS, self._port_panel_slot_centers()):
+            if abs(screen_x - cx) <= half and abs(screen_y - cy) <= half:
+                return kind
+        return None
+
+    def _order_button_at(self, screen_x: float, screen_y: float) -> bool:
+        half = PORT_PANEL_ICON_BOX / 2
+        cx, cy = self._port_panel_slot_centers()[-1]  # the button is always the last slot
+        return abs(screen_x - cx) <= half and abs(screen_y - cy) <= half
+
+    def _draw_port_panel(self) -> None:
+        gs = self.game_state
+        player = gs.current_player
+        progress = gs.players[player].port_production.get(self.selected_port)
+        queue = progress.orders if progress else []
+        banked_points = progress.points if progress else 0
+        stats = gs.config.ship_stats.stats
+
+        left, bottom, width, height = self._port_panel_geometry()
+        top = bottom + height
+        arcade.draw_lbwh_rectangle_filled(left, bottom, width, height, PORT_PANEL_BG_COLOR)
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, PLAYER_COLORS[player])
+
+        self._port_panel_title_text.text = (
+            "Choose a ship to order" if self._port_panel_picking else "Port Production"
         )
-        self._hud_text.y = self.window.height - 22
-        self._hud_text.draw()
+        self._port_panel_title_text.x = left + PORT_PANEL_MARGIN
+        self._port_panel_title_text.y = top - 20
+        self._port_panel_title_text.draw()
+
+        half = PORT_PANEL_ICON_BOX / 2
+        slot_centers = self._port_panel_slot_centers()
+
+        if self._port_panel_picking:
+            for i, (kind, (cx, cy)) in enumerate(zip(_PORT_PANEL_KINDS, slot_centers)):
+                arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
+                draw_ship_glyph((cx, cy + 6), PORT_PANEL_ICON_HEX_SIZE, kind, PLAYER_COLORS[player])
+                cost_text = self._port_panel_cost_texts[i]
+                cost_text.text = str(stats[kind].cost)
+                cost_text.x = cx
+                cost_text.y = cy - half + 5
+                cost_text.draw()
+            return
+
+        mouse_x, mouse_y = self._mouse_screen_pos
+        hovered_index: int | None = None
+        for i, (cx, cy) in enumerate(slot_centers):
+            arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
+            if i == len(queue):  # the trailing "Order" slot
+                self._port_panel_order_text.x = cx
+                self._port_panel_order_text.y = cy
+                self._port_panel_order_text.draw()
+                continue
+            draw_ship_glyph((cx, cy + 6), PORT_PANEL_ICON_HEX_SIZE, queue[i], PLAYER_COLORS[player])
+            if abs(mouse_x - cx) <= half and abs(mouse_y - cy) <= half:
+                hovered_index = i
+
+        if hovered_index is not None:
+            kind = queue[hovered_index]
+            cx, _cy = slot_centers[hovered_index]
+            points = banked_points if hovered_index == 0 else 0
+            self._port_panel_hover_text.text = (
+                f"{kind.value.replace('_', ' ').title()}  {points}/{stats[kind].cost}"
+            )
+            self._port_panel_hover_text.x = cx
+            self._port_panel_hover_text.y = top + 6
+            self._port_panel_hover_text.draw()
+
+    def _draw_game_over_overlay(self) -> None:
+        winner_label = "Player A" if self.game_state.winner == PLAYER_A else "Player B"
+        arcade.draw_lbwh_rectangle_filled(
+            0, 0, self.window.width, self.window.height, GAME_OVER_BG_COLOR
+        )
+        self._game_over_text.text = f"{winner_label} wins!"
+        self._game_over_text.x = self.window.width / 2
+        self._game_over_text.y = self.window.height / 2
+        self._game_over_text.draw()
 
     def _draw_battle_banner(self, battle: ActiveBattle) -> None:
         attacker, defender = battle.attacker, battle.defender

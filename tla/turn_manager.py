@@ -1,15 +1,13 @@
-"""Turn/phase orchestration.
-
-Phase 3 scope: cycling between the two movement phases and resetting each
-player's ships (movement budget, submarine toggle flags) at the start of
-their phase. After-action reporting and production are added in later
-phases.
-"""
+"""Turn/phase orchestration: movement for both players, then -- automatically,
+no player input needed -- one turn of production for each, then (if the game
+isn't already won) a new turn's movement."""
 
 from __future__ import annotations
 
 from tla.game_state import GameState, TurnPhase
+from tla.production import run_production
 from tla.tile import PLAYER_A, PLAYER_B, PlayerId
+from tla.win_condition import check_port_siege
 
 
 def start_movement_phase(game_state: GameState, player: PlayerId) -> None:
@@ -29,14 +27,23 @@ class TurnManager:
 
     def end_movement_phase(self) -> None:
         """Called when the current player is done moving. Advances to the
-        other player's movement phase, or starts a new turn if both players
-        have now moved."""
+        other player's movement phase, or -- once both players have moved --
+        runs one turn of automatic production for both, checks the
+        port-siege win condition, and starts a new turn's movement if
+        nobody has just won."""
         gs = self.game_state
         if gs.phase == TurnPhase.MOVE_A:
             gs.phase = TurnPhase.MOVE_B
             gs.current_player = PLAYER_B
-        else:
+            start_movement_phase(gs, PLAYER_B)
+        elif gs.phase == TurnPhase.MOVE_B:
+            run_production(gs, PLAYER_A)
+            run_production(gs, PLAYER_B)
+            winner = check_port_siege(gs)
+            if winner is not None:
+                gs.winner = winner
+                return
             gs.phase = TurnPhase.MOVE_A
             gs.current_player = PLAYER_A
             gs.turn_number += 1
-        start_movement_phase(gs, gs.current_player)
+            start_movement_phase(gs, PLAYER_A)

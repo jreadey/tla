@@ -61,7 +61,7 @@ where the battle is taking place, one damage point is added to the attack for th
 
 ## Production
 
-Each side earns 20 production points per turn.  Each player can optionally use any or all of it's production points to create new ships, the cost of each ship deducted from the player's production point.  The new ship's initial location will be at one of the (non-occupied) ports of the player.
+Production is automatic and organized per port. Clicking an empty friendly port opens that port's own production panel, showing its current queue as a row of ship glyphs plus an "Order" button; hovering a queued glyph shows its ship type and build state (e.g. "8/10"), and pressing Order opens a picker of the six ship types (with costs) to add to that port's queue, in any quantity. Each turn's production budget (20 points by default) is split evenly across the ports that currently have something queued and aren't occupied by a ship (of either side); a port banks its share and, once it has enough to cover the cost of the order at the front of its queue, the new ship appears there and any leftover points carry over toward the port's next order. A port occupied by either side's ship gets no share that turn -- its points are simply redistributed to the player's other eligible ports instead of being wasted -- and if the occupant is an enemy ship, that port's entire queue and banked points are lost outright, resuming from empty once the port is free again.
 
 ## Development
 
