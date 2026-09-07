@@ -26,7 +26,7 @@ A turn consists of the following steps:
 
 ## Movement
 
- At most one ship for each player can ge placed in a hexagon at any time.  During a turn, each ship may move a number of sea or shore grid hexagon based on the ship type (see ship types).  
+ At most one ship for each player can be placed in a hexagon at the end of a turn. During a turn, each ship may move a number of sea or shore grid hexagons based on the ship type (see ship types). A ship may pass *through* a hexagon occupied by a friendly ship without stopping there, as long as it still has at least 2 movement points left when it enters that hexagon (so it always has enough left to continue on to a legal hexagon beyond it, rather than being stranded there).
 
 If a ship moves into a hexagon occupied by an enemy ship, the ship's movement for this turn immediately stops and it engages in battle with the opposing ship (see battle).
 

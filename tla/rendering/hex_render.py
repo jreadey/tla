@@ -128,14 +128,25 @@ def draw_ships(
 ) -> None:
     """Draws in raw world space -- an active camera handles panning/viewport.
 
-    A `current_player` ship with no movement left this turn is dimmed, as a
-    visual indicator of which of the active player's ships can still move.
+    Every ship belonging to whoever *isn't* `current_player` is dimmed --
+    a whole-fleet color swap at the moment a turn changes hands, since that
+    side can't move any of them right now, making the turn change far more
+    visible than the HUD text alone. A `current_player` ship is dimmed too
+    once it has no movement left this turn, same as before -- so within
+    your own turn, dimming still tracks which of your ships can still act.
+    If `current_player` is None (no side selected), nothing is dimmed.
     """
     for ship in ships:
         center = axial_to_pixel(ship.position, hex_size)
         submerged = ship.kind == ShipKind.SUBMARINE and not ship.surfaced
         color = PLAYER_COLORS[ship.owner]
-        if ship.owner == current_player and ship.movement_remaining <= 0:
+        if current_player is None:
+            dim = False
+        elif ship.owner != current_player:
+            dim = True
+        else:
+            dim = ship.movement_remaining <= 0
+        if dim:
             color = _dim(color)
         draw_ship_glyph(center, hex_size, ship.kind, color, submerged=submerged)
 

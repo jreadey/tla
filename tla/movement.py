@@ -2,7 +2,12 @@
 
 An enemy-occupied hex is reachable only as the very last hex of a move --
 entering it triggers a battle (see tla.battle) instead of just occupying
-the hex, so it can't be passed through on the way to somewhere else.
+the hex, so it can't be passed through on the way to somewhere else. A
+friendly-occupied hex is the mirror image: never a legal place to *stop*
+(at most one ship per hex at the end of a turn), but passable in transit
+if the mover still has at least 2 movement points left when it gets there
+-- 1 to enter, and at least 1 more left over so it's never left stranded
+mid-hex on someone else's ship.
 """
 
 from __future__ import annotations
@@ -16,17 +21,25 @@ from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
 from tla.tile import PlayerId, TerrainType
 
-StepKind = Literal["blocked", "open", "enemy"]
+StepKind = Literal["blocked", "open", "enemy", "passthrough"]
 
 
 def _classify_step(
-    game_state: GameState, mover_owner: PlayerId, to_coord: AxialCoord, leaving_origin_port: bool
+    game_state: GameState,
+    mover_owner: PlayerId,
+    to_coord: AxialCoord,
+    leaving_origin_port: bool,
+    remaining_before_step: int,
 ) -> StepKind:
     """"blocked": can't go there at all. "open": empty, can continue past.
     "enemy": occupied by the other side -- legal only as the final step of a
     move, since arriving there triggers a battle rather than occupying it.
-    A friendly-occupied hex is always "blocked" -- no stacking, and (for now)
-    no passing through either."""
+    "passthrough": occupied by a friendly ship -- legal only as a
+    non-final step, and only with `remaining_before_step` (the mover's
+    movement budget before spending a point on this step) of at least 2, so
+    it always has movement left to continue past rather than getting stuck
+    stopped on a hex it can't legally occupy.
+    """
     tile = game_state.board.get_tile(to_coord)
     if tile is None or not tile.occupiable:
         return "blocked"
@@ -36,16 +49,18 @@ def _classify_step(
     if occupant is None:
         return "open"
     if occupant.owner == mover_owner:
-        return "blocked"
+        return "passthrough" if remaining_before_step >= 2 else "blocked"
     return "enemy"
 
 
 def reachable_hexes(ship: Ship, game_state: GameState) -> dict[AxialCoord, int]:
-    """Every hex `ship` could move to this turn, mapped to the number of
-    steps (movement points) it costs to get there. Does not include the
-    ship's own current hex. See `_classify_step` for per-step legality --
-    an enemy-occupied hex is included as a terminal but not expanded
-    further."""
+    """Every hex `ship` could move to (i.e. legally stop at) this turn,
+    mapped to the number of steps (movement points) it costs to get there.
+    Does not include the ship's own current hex. See `_classify_step` for
+    per-step legality -- an enemy-occupied hex is included as a terminal
+    but not expanded further; a friendly-occupied hex is never included
+    (can't stop there) but is expanded past if reached with enough budget
+    left, so hexes beyond it can still be reachable stopping points."""
     budget = ship.movement_remaining
     origin = ship.position
     origin_tile = game_state.board.get_tile(origin)
@@ -58,14 +73,20 @@ def reachable_hexes(ship: Ship, game_state: GameState) -> dict[AxialCoord, int]:
         coord, cost = frontier.pop(0)
         if cost >= budget:
             continue
+        remaining_before_step = budget - cost
         for n in neighbors(coord):
             if n in visited:
                 continue
-            step = _classify_step(game_state, ship.owner, n, coord == origin and leaving_port)
+            step = _classify_step(
+                game_state, ship.owner, n, coord == origin and leaving_port, remaining_before_step
+            )
             if step == "blocked":
                 continue
             visited.add(n)
             new_cost = cost + 1
+            if step == "passthrough":
+                frontier.append((n, new_cost))
+                continue
             reachable[n] = new_cost
             if step == "open":
                 frontier.append((n, new_cost))
@@ -100,15 +121,26 @@ def move_ship(ship: Ship, destination: AxialCoord, game_state: GameState) -> Mov
     return MoveResult(ship=ship, origin=origin, destination=destination, cost=cost)
 
 
-def validate_path(ship: Ship, path: list[AxialCoord], game_state: GameState) -> None:
+def validate_path(
+    ship: Ship, path: list[AxialCoord], game_state: GameState, *, allow_passthrough_final: bool = False
+) -> None:
     """Raise ValueError if `path` isn't a legal move for `ship` this turn.
 
     `path[0]` must be the ship's current position, each consecutive pair
     must be hex neighbors, each step must satisfy `_classify_step` (an
-    enemy-occupied hex is legal only as the very last step), and the number
-    of steps must fit within movement_remaining. Unlike `reachable_hexes`,
-    this validates the exact route given -- an explicit, possibly
-    non-shortest path is exactly the point (see `move_ship`).
+    enemy-occupied hex is legal only as the very last step; a
+    friendly-occupied hex is legal only as a non-final step, and only with
+    enough movement left to clear it), and the number of steps must fit
+    within movement_remaining. Unlike `reachable_hexes`, this validates the
+    exact route given -- an explicit, possibly non-shortest path is exactly
+    the point (see `move_ship`).
+
+    `allow_passthrough_final` relaxes just the friendly-occupied-hex rule so
+    a path is accepted even if it currently *ends* on one -- meant for a
+    UI validating an in-progress drag one hex at a time, where the newest
+    hex is only provisionally the end and the player may well drag further;
+    the actual move (`move_ship_along_path`/`begin_engagement`) always
+    validates with the default `False` and still rejects stopping there.
     """
     if not path or path[0] != ship.position:
         raise ValueError("path must start at the ship's current position")
@@ -124,11 +156,15 @@ def validate_path(ship: Ship, path: list[AxialCoord], game_state: GameState) -> 
         a, b = path[i], path[i + 1]
         if b not in neighbors(a):
             raise ValueError(f"{b} is not adjacent to {a}")
-        step = _classify_step(game_state, ship.owner, b, i == 0 and leaving_port)
+        remaining_before_step = ship.movement_remaining - i
+        step = _classify_step(game_state, ship.owner, b, i == 0 and leaving_port, remaining_before_step)
         if step == "blocked":
             raise ValueError(f"{b} is not a legal step from {a}")
         if step == "enemy" and i != steps - 1:
             raise ValueError(f"{b} is enemy-occupied and can only be the final step of a move")
+        is_final = i == steps - 1
+        if step == "passthrough" and is_final and not allow_passthrough_final:
+            raise ValueError(f"{b} is occupied by a friendly ship and can't be the final step of a move")
 
 
 def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameState) -> MoveResult:

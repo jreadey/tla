@@ -88,7 +88,7 @@ class ProductionConfig:
 
 @dataclass
 class CombatConfig:
-    ac_bonus_radius: int = 1
+    ac_bonus_radius: int = 2
     ac_bonus_amount: int = 1
 
 

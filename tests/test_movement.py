@@ -77,19 +77,62 @@ def test_land_hex_is_impassable():
     assert AxialCoord(1, 0) not in reachable
 
 
-def test_friendly_occupied_hex_is_fully_impassable():
+def test_friendly_occupied_hex_is_never_a_valid_stop():
     board = _sea_board()
     blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_A, ship_id=2)
-    # Budget of 2 is exactly enough for the direct path through (1, 0) but
-    # not enough for any detour around it (hex grids have alternate routes,
-    # so a blocked hex isn't a full blockade -- just too far to detour
-    # around within this budget).
-    mover = _make_ship(AxialCoord(0, 0), movement_remaining=2, ship_id=1)
+    # Plenty of budget -- even so, the blocker's own hex can never be a
+    # legal stop (at most one ship per hex at the end of a turn).
+    mover = _make_ship(AxialCoord(0, 0), movement_remaining=5, ship_id=1)
     gs = _game_state(board, [mover, blocker])
 
     reachable = reachable_hexes(mover, gs)
     assert AxialCoord(1, 0) not in reachable
+
+
+def test_friendly_occupied_hex_is_passable_with_enough_movement_left():
+    board = _sea_board()
+    blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_A, ship_id=2)
+    # Exactly 2 remaining when reaching the blocker's hex -- just enough to
+    # pass through (1 to enter, 1 more to clear it) and stop just beyond.
+    mover = _make_ship(AxialCoord(0, 0), movement_remaining=2, ship_id=1)
+    gs = _game_state(board, [mover, blocker])
+
+    reachable = reachable_hexes(mover, gs)
+    assert AxialCoord(1, 0) not in reachable  # still never a valid stop
+    assert reachable[AxialCoord(2, 0)] == 2  # but reachable by passing through it
+
+
+def test_friendly_occupied_hex_blocks_passage_with_only_one_movement_left():
+    board = _sea_board()
+    blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_A, ship_id=2)
+    # Only 1 remaining when reaching the blocker's hex (after using 1 of 2
+    # on a detour step first) -- not enough to pass through, so nothing
+    # past it via this route is reachable either.
+    detour_ship = _make_ship(AxialCoord(0, -1), movement_remaining=2, ship_id=1)
+    gs = _game_state(board, [detour_ship, blocker])
+
+    reachable = reachable_hexes(detour_ship, gs)
+    assert AxialCoord(1, 0) not in reachable
     assert AxialCoord(2, 0) not in reachable
+
+
+def test_validate_path_allows_passing_through_a_friendly_ship_with_movement_to_spare():
+    board = _sea_board()
+    blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_A, ship_id=2)
+    mover = _make_ship(AxialCoord(0, 0), movement_remaining=2, ship_id=1)
+    gs = _game_state(board, [mover, blocker])
+
+    validate_path(mover, [AxialCoord(0, 0), AxialCoord(1, 0), AxialCoord(2, 0)], gs)  # no raise
+
+
+def test_validate_path_rejects_stopping_on_a_friendly_occupied_hex():
+    board = _sea_board()
+    blocker = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_A, ship_id=2)
+    mover = _make_ship(AxialCoord(0, 0), movement_remaining=5, ship_id=1)
+    gs = _game_state(board, [mover, blocker])
+
+    with pytest.raises(ValueError):
+        validate_path(mover, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
 
 
 def test_enemy_occupied_hex_is_reachable_only_as_a_terminal():

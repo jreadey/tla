@@ -45,11 +45,15 @@ _PORT_PANEL_KINDS = [
     ShipKind.PATROL_BOAT,
 ]
 PORT_PANEL_BG_COLOR = (25, 25, 25, 235)
-PORT_PANEL_ICON_BOX = 56.0
-PORT_PANEL_ICON_HEX_SIZE = 12.0
+PORT_PANEL_ICON_BOX = 84.0
+PORT_PANEL_ICON_HEX_SIZE = 32.0
 PORT_PANEL_MARGIN = 14.0
-PORT_PANEL_ICON_ROW_HEIGHT = 60.0
+PORT_PANEL_ICON_ROW_HEIGHT = 92.0
 PORT_PANEL_HEADER_HEIGHT = 44.0
+# Wide enough for the longest title ("Choose a ship to order" at this font
+# size measures ~182px) plus margins, so the title never overflows the
+# panel when there's only 1-2 icon slots (an empty or near-empty queue).
+PORT_PANEL_MIN_WIDTH = 230.0
 
 
 @dataclass
@@ -311,7 +315,11 @@ class GameView(arcade.View):
             return
         trial_path = self.drag_path + [hex_coord]
         try:
-            validate_path(self.drag_ship, trial_path, self.game_state)
+            # The newest hex is only provisionally the end of the drag --
+            # the player may keep going -- so a friendly-occupied hex is
+            # tolerated here even though it could never actually be the
+            # final stop; _commit_drag's move call enforces that for real.
+            validate_path(self.drag_ship, trial_path, self.game_state, allow_passthrough_final=True)
         except ValueError:
             return
         self.drag_path = trial_path
@@ -501,18 +509,26 @@ class GameView(arcade.View):
         return len(_PORT_PANEL_KINDS) if self._port_panel_picking else len(self._selected_port_queue()) + 1
 
     def _port_panel_geometry(self) -> tuple[float, float, float, float]:
-        """(left, bottom, width, height) of the port panel in screen space."""
-        width = PORT_PANEL_MARGIN * 2 + PORT_PANEL_ICON_BOX * self._port_panel_slot_count()
+        """(left, bottom, width, height) of the port panel in screen space.
+        Width is at least PORT_PANEL_MIN_WIDTH so the title text (measured
+        for the longer of the two possible titles) never overflows the
+        panel when there are only 1-2 icon slots -- see
+        `_port_panel_slot_centers` for how the icon row stays centered
+        within whatever width this ends up being."""
+        content_width = PORT_PANEL_MARGIN * 2 + PORT_PANEL_ICON_BOX * self._port_panel_slot_count()
+        width = max(content_width, PORT_PANEL_MIN_WIDTH)
         height = PORT_PANEL_MARGIN + PORT_PANEL_HEADER_HEIGHT + PORT_PANEL_ICON_ROW_HEIGHT
         left = (self.window.width - width) / 2
         return left, PORT_PANEL_MARGIN, width, height
 
     def _port_panel_slot_centers(self) -> list[tuple[float, float]]:
-        left, bottom, _width, _height = self._port_panel_geometry()
+        left, bottom, width, _height = self._port_panel_geometry()
+        slot_count = self._port_panel_slot_count()
+        icons_left = left + (width - PORT_PANEL_ICON_BOX * slot_count) / 2
         icon_cy = bottom + PORT_PANEL_ICON_ROW_HEIGHT / 2
         return [
-            (left + PORT_PANEL_MARGIN + PORT_PANEL_ICON_BOX * (i + 0.5), icon_cy)
-            for i in range(self._port_panel_slot_count())
+            (icons_left + PORT_PANEL_ICON_BOX * (i + 0.5), icon_cy)
+            for i in range(slot_count)
         ]
 
     def _point_in_port_panel(self, screen_x: float, screen_y: float) -> bool:
@@ -556,18 +572,29 @@ class GameView(arcade.View):
         half = PORT_PANEL_ICON_BOX / 2
         slot_centers = self._port_panel_slot_centers()
 
+        mouse_x, mouse_y = self._mouse_screen_pos
+
         if self._port_panel_picking:
+            hovered_kind: ShipKind | None = None
+            hovered_cx = 0.0
             for i, (kind, (cx, cy)) in enumerate(zip(_PORT_PANEL_KINDS, slot_centers)):
                 arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
-                draw_ship_glyph((cx, cy + 6), PORT_PANEL_ICON_HEX_SIZE, kind, PLAYER_COLORS[player])
+                draw_ship_glyph((cx, cy + 9), PORT_PANEL_ICON_HEX_SIZE, kind, PLAYER_COLORS[player])
                 cost_text = self._port_panel_cost_texts[i]
                 cost_text.text = str(stats[kind].cost)
                 cost_text.x = cx
                 cost_text.y = cy - half + 5
                 cost_text.draw()
+                if abs(mouse_x - cx) <= half and abs(mouse_y - cy) <= half:
+                    hovered_kind, hovered_cx = kind, cx
+
+            if hovered_kind is not None:
+                self._port_panel_hover_text.text = hovered_kind.value.replace("_", " ").title()
+                self._port_panel_hover_text.x = hovered_cx
+                self._port_panel_hover_text.y = top + 6
+                self._port_panel_hover_text.draw()
             return
 
-        mouse_x, mouse_y = self._mouse_screen_pos
         hovered_index: int | None = None
         for i, (cx, cy) in enumerate(slot_centers):
             arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
@@ -576,7 +603,7 @@ class GameView(arcade.View):
                 self._port_panel_order_text.y = cy
                 self._port_panel_order_text.draw()
                 continue
-            draw_ship_glyph((cx, cy + 6), PORT_PANEL_ICON_HEX_SIZE, queue[i], PLAYER_COLORS[player])
+            draw_ship_glyph((cx, cy + 9), PORT_PANEL_ICON_HEX_SIZE, queue[i], PLAYER_COLORS[player])
             if abs(mouse_x - cx) <= half and abs(mouse_y - cy) <= half:
                 hovered_index = i
 
