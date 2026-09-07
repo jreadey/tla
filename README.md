@@ -54,7 +54,7 @@ The ship types are:
 
 ## Battle
 
-During movement if a ship enters a grid occupied by an enemy ship they engage in mutual attacks.  Each ships hit points will decrease (with a minimum of zero) based on the damage number of the opposing ship.  If the number of hit points is zero, the ship is "sunk" and removed from the game.  After the exchange of damage, the ship that moved into the occupied hexagon can stay or retreat (return to the hexagon it entered from).  If the ship stays, another exchange of damage will begin (continuing until either one or both of the ships are sunk, or the player's ship withdraws).  In either case, this ends the movement phase for that ship.
+During movement if a ship enters a grid occupied by an enemy ship they engage in mutual attacks.  Each ships hit points will decrease (with a minimum of zero) based on the damage number of the opposing ship.  If the number of hit points is zero, the ship is "sunk" and removed from the game.  After the exchange of damage, the ship that moved into the occupied hexagon can stay or retreat (return to the hexagon it entered from).  If the ship stays, another exchange of damage will begin (continuing until either one or both of the ships are sunk, or the player's ship withdraws).  Engaging costs one movement point, the same as moving into an empty hex -- a retreat is free, so an attack followed by a retreat still only costs that one point. If the ship has movement left afterward (win and continue, or retreat), it can keep moving that turn.
 
 One special rule, for each aircraft carrier that is within one hexagon of the hexagon 
 where the battle is taking place, one damage point is added to the attack for the ship that is on the same side as the carrier.

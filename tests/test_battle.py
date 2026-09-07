@@ -39,16 +39,18 @@ def _game_state(board: Board, ships: list[Ship]) -> GameState:
 
 def test_resolve_round_applies_simultaneous_damage():
     board = _sea_board()
-    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # damage 2
-    defender = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_B, 2)  # damage 4
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_B, 2)
     gs = _game_state(board, [attacker, defender])
+    destroyer_damage = Config().ship_stats.stats[ShipKind.DESTROYER].damage
+    cruiser_damage = Config().ship_stats.stats[ShipKind.CRUISER].damage
 
     result = resolve_round(attacker, defender, gs)
 
-    assert result.damage_to_defender == 2
-    assert result.damage_to_attacker == 4
-    assert defender.current_hp == Config().ship_stats.stats[ShipKind.CRUISER].hp - 2
-    assert attacker.current_hp == Config().ship_stats.stats[ShipKind.DESTROYER].hp - 4
+    assert result.damage_to_defender == destroyer_damage
+    assert result.damage_to_attacker == cruiser_damage
+    assert defender.current_hp == Config().ship_stats.stats[ShipKind.CRUISER].hp - destroyer_damage
+    assert attacker.current_hp == Config().ship_stats.stats[ShipKind.DESTROYER].hp - cruiser_damage
     assert not result.attacker_sunk
     assert not result.defender_sunk
 

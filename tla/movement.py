@@ -148,10 +148,14 @@ def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameSta
 
 def begin_engagement(ship: Ship, path: list[AxialCoord], game_state: GameState) -> Ship:
     """Validate `path`, whose final hex must be enemy-occupied, apply the
-    approach portion of the move (everything before that hex), and consume
-    the ship's remaining movement for the turn -- entering combat ends a
-    ship's movement regardless of outcome. Returns the defending Ship;
-    battle resolution itself is `tla.battle.run_battle`.
+    approach portion of the move (everything before that hex), and charge 1
+    movement point for the attack step itself -- engaging costs exactly as
+    much as moving into an empty hex would, no more. A retreat afterward is
+    free (the ship never actually advances onto the enemy's hex unless it
+    wins), so an attack-then-retreat costs the same single point as the
+    attack alone; if the ship has movement left over -- whether it retreats
+    or wins and continues -- it can keep moving this turn. Returns the
+    defending Ship; battle resolution itself is `tla.battle.run_battle`.
 
     If the attacker wins (defender sunk), the caller must move it onto
     `defender.position` afterward -- that hex is only vacated once the
@@ -164,7 +168,7 @@ def begin_engagement(ship: Ship, path: list[AxialCoord], game_state: GameState) 
     approach_path = path[:-1]
     if len(approach_path) > 1:
         move_ship_along_path(ship, approach_path, game_state)
-    ship.movement_remaining = 0
+    ship.movement_remaining -= 1
     return defender
 
 

@@ -183,7 +183,7 @@ def test_move_ship_along_path_rejects_enemy_occupied_final_hex():
         move_ship_along_path(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
 
 
-def test_begin_engagement_applies_approach_and_zeroes_movement():
+def test_begin_engagement_applies_approach_and_charges_one_point_for_the_attack():
     board = _sea_board()
     ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
     enemy = _make_ship(AxialCoord(2, -1), movement_remaining=0, owner=PLAYER_B, ship_id=2)
@@ -194,10 +194,12 @@ def test_begin_engagement_applies_approach_and_zeroes_movement():
 
     assert defender is enemy
     assert ship.position == AxialCoord(1, -1)  # stopped at the approach hex
-    assert ship.movement_remaining == 0  # movement ends here regardless of outcome
+    # 1 point for the approach step, 1 more for the attack itself -- same
+    # per-step cost as a normal move, not a flat zero-out.
+    assert ship.movement_remaining == 1
 
 
-def test_begin_engagement_with_adjacent_enemy_does_not_move_the_attacker():
+def test_begin_engagement_with_adjacent_enemy_costs_exactly_one_point():
     board = _sea_board()
     ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
     enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
@@ -206,7 +208,23 @@ def test_begin_engagement_with_adjacent_enemy_does_not_move_the_attacker():
     begin_engagement(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
 
     assert ship.position == AxialCoord(0, 0)
-    assert ship.movement_remaining == 0
+    assert ship.movement_remaining == 2  # left over movement can still be used this turn
+
+
+def test_ship_can_keep_moving_after_an_engagement_with_movement_left():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    begin_engagement(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
+    assert ship.movement_remaining == 2  # retreat is free; 2 of the original 3 remain
+
+    # A retreat leaves the ship back at its own hex, free to draw a fresh
+    # move with whatever's left.
+    move_ship_along_path(ship, [AxialCoord(0, 0), AxialCoord(-1, 0)], gs)
+    assert ship.position == AxialCoord(-1, 0)
+    assert ship.movement_remaining == 1
 
 
 def test_begin_engagement_rejects_a_path_not_ending_on_an_enemy():
