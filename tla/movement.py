@@ -30,6 +30,7 @@ def _classify_step(
     to_coord: AxialCoord,
     leaving_origin_port: bool,
     remaining_before_step: int,
+    treat_as_open: frozenset[AxialCoord] = frozenset(),
 ) -> StepKind:
     """"blocked": can't go there at all. "open": empty, can continue past.
     "enemy": occupied by the other side -- legal only as the final step of a
@@ -39,6 +40,12 @@ def _classify_step(
     movement budget before spending a point on this step) of at least 2, so
     it always has movement left to continue past rather than getting stuck
     stopped on a hex it can't legally occupy.
+
+    `treat_as_open` overrides an otherwise-"enemy" hex to classify as
+    "open" instead -- used by the UI to preview a drag as if a hidden
+    submerged submarine weren't there, so its exact location can't be
+    inferred from where the preview stops short (see
+    tla.rendering.game_view). Has no effect on any other classification.
     """
     tile = game_state.board.get_tile(to_coord)
     if tile is None or not tile.occupiable:
@@ -50,17 +57,22 @@ def _classify_step(
         return "open"
     if occupant.owner == mover_owner:
         return "passthrough" if remaining_before_step >= 2 else "blocked"
+    if to_coord in treat_as_open:
+        return "open"
     return "enemy"
 
 
-def reachable_hexes(ship: Ship, game_state: GameState) -> dict[AxialCoord, int]:
+def reachable_hexes(
+    ship: Ship, game_state: GameState, treat_as_open: frozenset[AxialCoord] = frozenset()
+) -> dict[AxialCoord, int]:
     """Every hex `ship` could move to (i.e. legally stop at) this turn,
     mapped to the number of steps (movement points) it costs to get there.
     Does not include the ship's own current hex. See `_classify_step` for
     per-step legality -- an enemy-occupied hex is included as a terminal
     but not expanded further; a friendly-occupied hex is never included
     (can't stop there) but is expanded past if reached with enough budget
-    left, so hexes beyond it can still be reachable stopping points."""
+    left, so hexes beyond it can still be reachable stopping points.
+    `treat_as_open` is passed straight through to `_classify_step`."""
     budget = ship.movement_remaining
     origin = ship.position
     origin_tile = game_state.board.get_tile(origin)
@@ -78,7 +90,12 @@ def reachable_hexes(ship: Ship, game_state: GameState) -> dict[AxialCoord, int]:
             if n in visited:
                 continue
             step = _classify_step(
-                game_state, ship.owner, n, coord == origin and leaving_port, remaining_before_step
+                game_state,
+                ship.owner,
+                n,
+                coord == origin and leaving_port,
+                remaining_before_step,
+                treat_as_open,
             )
             if step == "blocked":
                 continue
@@ -122,7 +139,12 @@ def move_ship(ship: Ship, destination: AxialCoord, game_state: GameState) -> Mov
 
 
 def validate_path(
-    ship: Ship, path: list[AxialCoord], game_state: GameState, *, allow_passthrough_final: bool = False
+    ship: Ship,
+    path: list[AxialCoord],
+    game_state: GameState,
+    *,
+    allow_passthrough_final: bool = False,
+    treat_as_open: frozenset[AxialCoord] = frozenset(),
 ) -> None:
     """Raise ValueError if `path` isn't a legal move for `ship` this turn.
 
@@ -141,6 +163,9 @@ def validate_path(
     hex is only provisionally the end and the player may well drag further;
     the actual move (`move_ship_along_path`/`begin_engagement`) always
     validates with the default `False` and still rejects stopping there.
+
+    `treat_as_open` is passed straight through to `_classify_step`, for the
+    same drag-preview purpose as in `reachable_hexes`.
     """
     if not path or path[0] != ship.position:
         raise ValueError("path must start at the ship's current position")
@@ -157,7 +182,9 @@ def validate_path(
         if b not in neighbors(a):
             raise ValueError(f"{b} is not adjacent to {a}")
         remaining_before_step = ship.movement_remaining - i
-        step = _classify_step(game_state, ship.owner, b, i == 0 and leaving_port, remaining_before_step)
+        step = _classify_step(
+            game_state, ship.owner, b, i == 0 and leaving_port, remaining_before_step, treat_as_open
+        )
         if step == "blocked":
             raise ValueError(f"{b} is not a legal step from {a}")
         if step == "enemy" and i != steps - 1:
@@ -182,7 +209,8 @@ def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameSta
     someone adjacent still counts as occupying it.
     """
     validate_path(ship, path, game_state)
-    if game_state.ship_at(path[-1]) is not None:
+    occupant = game_state.ship_at(path[-1])
+    if occupant is not None and occupant.owner != ship.owner:
         raise ValueError(f"{path[-1]} is enemy-occupied; use begin_engagement to attack it")
     cost = len(path) - 1
     origin = ship.position
@@ -194,14 +222,22 @@ def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameSta
 
 def begin_engagement(ship: Ship, path: list[AxialCoord], game_state: GameState) -> Ship:
     """Validate `path`, whose final hex must be enemy-occupied, apply the
-    approach portion of the move (everything before that hex), and charge 1
-    movement point for the attack step itself -- engaging costs exactly as
-    much as moving into an empty hex would, no more. A retreat afterward is
-    free (the ship never actually advances onto the enemy's hex unless it
-    wins), so an attack-then-retreat costs the same single point as the
-    attack alone; if the ship has movement left over -- whether it retreats
-    or wins and continues -- it can keep moving this turn. Returns the
-    defending Ship; battle resolution itself is `tla.battle.run_battle`.
+    approach portion of the move, and charge for the final attack stretch
+    at the same per-hex rate as a normal move -- engaging never costs more
+    than moving the same distance would. Returns the defending Ship; battle
+    resolution itself is `tla.battle.run_battle`.
+
+    The attacker's approach stops at the *last hex before the target that
+    it can actually occupy* -- normally that's simply the hex right next
+    to the target, but if that hex is a friendly ship merely passed through
+    en route (see the "passthrough" rule in `_classify_step`), the attacker
+    can't literally rest there alongside it, so it stops one hex earlier
+    instead and the final attack is charged for the whole remaining
+    stretch (crossing the passthrough hex and then the target), not the
+    usual flat 1 point. A retreat afterward returns to no further than
+    wherever the attacker actually stopped, for free; if the ship has
+    movement left over -- whether it retreats or wins and continues -- it
+    can keep moving this turn.
 
     If the attacker wins (defender sunk), the caller must move it onto
     `defender.position` afterward -- that hex is only vacated once the
@@ -211,10 +247,22 @@ def begin_engagement(ship: Ship, path: list[AxialCoord], game_state: GameState) 
     defender = game_state.ship_at(path[-1])
     if defender is None or defender.owner == ship.owner:
         raise ValueError(f"{path[-1]} is not an enemy-occupied hex")
-    approach_path = path[:-1]
+
+    # The last hex before the target that's actually free to occupy --
+    # searching backward from the target so the attacker gets as close as
+    # it possibly can. path[0] (the ship's own current hex) always
+    # qualifies, so this is guaranteed to find a stop.
+    stop_index = 0
+    for i in range(len(path) - 2, -1, -1):
+        if path[i] == ship.position or game_state.ship_at(path[i]) is None:
+            stop_index = i
+            break
+
+    approach_path = path[: stop_index + 1]
     if len(approach_path) > 1:
         move_ship_along_path(ship, approach_path, game_state)
-    ship.movement_remaining -= 1
+    attack_cost = len(path) - 1 - stop_index
+    ship.movement_remaining -= attack_cost
     return defender
 
 

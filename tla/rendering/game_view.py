@@ -8,6 +8,7 @@ import arcade
 
 from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
+from tla.fow import is_hidden, visible_hexes_for
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
 from tla.movement import (
@@ -152,7 +153,7 @@ class GameView(arcade.View):
         self._tooltip_texts = [
             arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(TOOLTIP_MAX_LINES)
         ]
-        self._battle_texts = [arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(3)]
+        self._battle_texts = [arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(4)]
         self._sunk_text = arcade.Text("", 0, 0, SUNK_TEXT_COLOR, 16, anchor_x="center")
         self._game_over_text = arcade.Text(
             "", 0, 0, GAME_OVER_TEXT_COLOR, 36, anchor_x="center", bold=True
@@ -288,7 +289,9 @@ class GameView(arcade.View):
             self._close_port_panel()
             self.drag_ship = ship
             self.drag_path = [hex_coord]
-            self.range_preview = reachable_hexes(ship, gs)
+            self.range_preview = reachable_hexes(
+                ship, gs, treat_as_open=self._hidden_submerged_sub_positions()
+            )
             return
 
         tile = gs.board.get_tile(hex_coord)
@@ -319,10 +322,58 @@ class GameView(arcade.View):
             # the player may keep going -- so a friendly-occupied hex is
             # tolerated here even though it could never actually be the
             # final stop; _commit_drag's move call enforces that for real.
-            validate_path(self.drag_ship, trial_path, self.game_state, allow_passthrough_final=True)
+            # treat_as_open likewise previews a hidden submerged sub's hex
+            # as if it were empty, so its exact location can't be inferred
+            # from where the drag would otherwise refuse to extend --
+            # _commit_drag snaps the committed path back to the real thing.
+            validate_path(
+                self.drag_ship,
+                trial_path,
+                self.game_state,
+                allow_passthrough_final=True,
+                treat_as_open=self._hidden_submerged_sub_positions(),
+            )
         except ValueError:
             return
         self.drag_path = trial_path
+
+    def _hidden_submerged_sub_positions(self) -> frozenset[AxialCoord]:
+        """Positions of enemy submerged submarines currently hidden by fog
+        of war. Used only to make the drag preview (range highlight and
+        incremental path validation) behave as if those hexes were empty,
+        so their exact location can't be deduced from where movement would
+        otherwise be blocked -- the actual committed move is snapped back
+        to reality by `_truncate_path_at_first_hidden_sub`. Empty if fog of
+        war is disabled, since then nothing is hidden in the first place."""
+        gs = self.game_state
+        if not gs.config.fow.enabled:
+            return frozenset()
+        return frozenset(
+            s.position
+            for s in gs.ships.values()
+            if s.owner != gs.current_player and s.kind == ShipKind.SUBMARINE and not s.surfaced
+        )
+
+    def _truncate_path_at_first_hidden_sub(self, ship: Ship, path: list[AxialCoord]) -> list[AxialCoord]:
+        """If the drawn `path` runs through or ends on a hex holding a
+        submerged enemy submarine -- hidden during the drag preview, see
+        `_hidden_submerged_sub_positions` -- truncate it at the first one
+        encountered: the player couldn't see it coming, so their ship
+        makes contact and stops (triggering a battle) there instead of
+        sailing straight through to wherever they actually aimed."""
+        gs = self.game_state
+        if not gs.config.fow.enabled:
+            return path
+        for i in range(1, len(path)):
+            occupant = gs.ship_at(path[i])
+            if (
+                occupant is not None
+                and occupant.owner != ship.owner
+                and occupant.kind == ShipKind.SUBMARINE
+                and not occupant.surfaced
+            ):
+                return path[: i + 1]
+        return path
 
     def _commit_drag(self) -> None:
         ship = self.drag_ship
@@ -330,6 +381,7 @@ class GameView(arcade.View):
         self._abort_drag()
         if ship is None or len(path) < 2:
             return
+        path = self._truncate_path_at_first_hidden_sub(ship, path)
 
         if self.game_state.ship_at(path[-1]) is not None:
             try:
@@ -411,7 +463,34 @@ class GameView(arcade.View):
         self._mouse_screen_pos = (screen_x, screen_y)
         world = self.camera.unproject((screen_x, screen_y))
         hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
-        self._hovered_ship = self.game_state.ship_at(hex_coord)
+        gs = self.game_state
+        ship = gs.ship_at(hex_coord)
+        if ship is not None and ship.owner != gs.current_player:
+            visible = self._visible_hexes()
+            if visible is not None and not self._is_ship_visible(ship, visible):
+                ship = None  # hidden by fog of war -- no tooltip, no "T" toggle target
+        self._hovered_ship = ship
+
+    def _is_ship_visible(self, ship: Ship, visible_hexes: set[AxialCoord]) -> bool:
+        """Whether an enemy `ship` should currently be shown, given fog of
+        war is enabled (`visible_hexes` is the current player's vision).
+        The one exception to the normal fog rules (including the
+        submerged-submarine override -- see tla.fow.is_hidden): a ship
+        currently being fought is always shown, since direct combat
+        contact is the only way to spot a submerged sub in the first
+        place."""
+        if self.active_battle is not None and ship is self.active_battle.defender:
+            return True
+        return not is_hidden(self.game_state.current_player, ship, visible_hexes)
+
+    def _visible_hexes(self) -> set[AxialCoord] | None:
+        """The current player's fog-of-war vision, or None if fog of war is
+        disabled -- in which case callers should treat everything as
+        visible."""
+        gs = self.game_state
+        if not gs.config.fow.enabled:
+            return None
+        return visible_hexes_for(gs, gs.current_player)
 
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
         if scroll_y > 0:
@@ -450,18 +529,29 @@ class GameView(arcade.View):
         )
 
     def on_draw(self) -> None:
+        gs = self.game_state
+        visible = self._visible_hexes()
+
         self.clear()
         self.camera.use()
-        draw_board(self.game_state.board, self.hex_size)
+        draw_board(gs.board, self.hex_size, visible_hexes=visible)
         for coord in self.range_preview:
             draw_hex_highlight(coord, self.hex_size, RANGE_PREVIEW_COLOR)
         for coord in self.drag_path:
             draw_hex_highlight(coord, self.hex_size, PATH_HIGHLIGHT_COLOR)
         self._draw_drag_path_line()
         draw_contour(self.contour_segments)
-        draw_ships(
-            self.game_state.ships.values(), self.hex_size, current_player=self.game_state.current_player
-        )
+        if visible is None:
+            ships_to_draw = gs.ships.values()
+        else:
+            # Fog of war: your own ships are always shown; an enemy ship
+            # only if currently visible -- see _is_ship_visible for the
+            # submerged-submarine and active-battle exceptions.
+            ships_to_draw = [
+                s for s in gs.ships.values()
+                if s.owner == gs.current_player or self._is_ship_visible(s, visible)
+            ]
+        draw_ships(ships_to_draw, self.hex_size, current_player=gs.current_player)
 
         self.ui_camera.use()
         if self.game_state.winner is not None:
@@ -638,7 +728,19 @@ class GameView(arcade.View):
         def kind_name(ship: Ship) -> str:
             return ship.kind.value.replace("_", " ").title()
 
-        lines = [
+        # Announced only on the round that made contact -- the defender was
+        # hidden by submerged-submarine stealth right up until this attack,
+        # so this is the moment it's discovered, not an ongoing label.
+        is_sub_contact = (
+            len(battle.rounds) == 1
+            and defender.kind == ShipKind.SUBMARINE
+            and not defender.surfaced
+        )
+
+        lines = []
+        if is_sub_contact:
+            lines.append("SUB CONTACT!")
+        lines += [
             f"BATTLE -- {a_label} {kind_name(attacker)} ({attacker.current_hp}/{stats[attacker.kind].hp} HP)"
             f"  vs  {d_label} {kind_name(defender)} ({defender.current_hp}/{stats[defender.kind].hp} HP)",
             f"Round {len(battle.rounds)}: dealt {last_round.damage_to_defender}, "
@@ -651,13 +753,15 @@ class GameView(arcade.View):
         height = 16 + line_height * len(lines)
         left = (self.window.width - width) / 2
         top = self.window.height - 40
+        accent_color = (230, 180, 40) if is_sub_contact else (200, 60, 60)
 
         arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, (20, 20, 20, 235))
-        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, (200, 60, 60))
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, accent_color)
 
         for i, line in enumerate(lines):
             text_obj = self._battle_texts[i]
             text_obj.text = line
+            text_obj.color = accent_color if is_sub_contact and i == 0 else arcade.color.WHITE
             text_obj.x = left + 12
             text_obj.y = top - 12 - (i + 1) * line_height + 6
             text_obj.draw()

@@ -50,6 +50,9 @@ def _dim(color: tuple[int, int, int], amount: float = 0.55) -> tuple[int, int, i
 # Port hexes are tinted a lighter shade of their owner's color, so friendly
 # vs. enemy ports are distinguishable at a glance, not just by the anchor icon.
 PORT_COLORS = {player: _lighten(color, 0.55) for player, color in PLAYER_COLORS.items()}
+# How much a hex currently within the active player's fog-of-war vision is
+# lightened, so the extent of their vision reads at a glance.
+FOW_VISIBLE_LIGHTEN_AMOUNT = 0.3
 CONTOUR_COLOR = (20, 20, 20, 200)
 CONTOUR_WIDTH = 2.0
 # Background hint of a ship's total range while dragging out a move (subtle
@@ -100,7 +103,9 @@ def draw_anchor(center: tuple[float, float], size: float, color: tuple[int, int,
     arcade.draw_texture_rect(_anchor_texture_cached(), rect, color=arcade.types.Color(*color))
 
 
-def draw_board(board: Board, hex_size: float) -> None:
+def draw_board(
+    board: Board, hex_size: float, visible_hexes: set[AxialCoord] | None = None
+) -> None:
     """Draws in raw world space -- an active camera handles panning/viewport.
 
     A port is tinted its *displayed* owner's color (`Tile.port_display_owner`)
@@ -108,6 +113,13 @@ def draw_board(board: Board, hex_size: float) -> None:
     it keeps reading as captured even after that ship moves on, until the
     other side takes it back. See tla.production.handle_port_capture, which
     updates this as ships move.
+
+    `visible_hexes`, when given (fog of war enabled), is the active
+    player's current vision (see tla.fow.visible_hexes_for) -- those hexes
+    are lightened so the extent of their vision is visible at a glance. The
+    map itself is always fully known either way; fog of war only ever hides
+    ship positions, handled separately by the caller filtering what it
+    passes to `draw_ships`.
     """
     for coord, tile in board.tiles.items():
         center = axial_to_pixel(coord, hex_size)
@@ -117,6 +129,8 @@ def draw_board(board: Board, hex_size: float) -> None:
             fill_color = PORT_COLORS[color_owner]
         else:
             fill_color = TERRAIN_COLORS[tile.terrain]
+        if visible_hexes is not None and coord in visible_hexes:
+            fill_color = _lighten(fill_color, FOW_VISIBLE_LIGHTEN_AMOUNT)
         arcade.draw_polygon_filled(corners, fill_color)
         arcade.draw_polygon_outline(corners, OUTLINE_COLOR, 1)
         if tile.is_port:

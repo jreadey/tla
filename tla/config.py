@@ -14,12 +14,12 @@ from pathlib import Path
 from tla.ship import ShipKind, ShipStats
 
 DEFAULT_SHIP_STATS: dict[ShipKind, ShipStats] = {
-    ShipKind.BATTLESHIP: ShipStats(movement=4, hp=12, damage=4, asw=0, cost=10),
-    ShipKind.CARRIER: ShipStats(movement=4, hp=7, damage=2, asw=0, cost=10),
+    ShipKind.BATTLESHIP: ShipStats(movement=4, hp=12, damage=4, asw=1, cost=10),
+    ShipKind.CARRIER: ShipStats(movement=4, hp=7, damage=2, asw=1, cost=10),
     ShipKind.CRUISER: ShipStats(movement=4, hp=8, damage=3, asw=2, cost=7),
     ShipKind.DESTROYER: ShipStats(movement=3, hp=6, damage=2, asw=3, cost=4),
     ShipKind.SUBMARINE: ShipStats(
-        movement=3, movement_submerged=1, hp=4, damage=4, asw=0, cost=4
+        movement=3, movement_submerged=1, hp=4, damage=4, asw=1, cost=4
     ),
     ShipKind.PATROL_BOAT: ShipStats(movement=6, hp=2, damage=1, asw=2, cost=1),
 }
@@ -93,6 +93,20 @@ class CombatConfig:
 
 
 @dataclass
+class FowConfig:
+    """Fog of war: when enabled, a player can't see the enemy's ships
+    unless they're within vision -- see tla.fow.visible_hexes_for."""
+
+    enabled: bool = True
+    # Every hex within this many steps of one of the player's own ships.
+    ship_visibility_radius: int = 1
+    # Every hex within this many steps of a port the player controls, or
+    # one of their own aircraft carriers -- both see further than a
+    # regular ship does.
+    port_and_carrier_visibility_radius: int = 4
+
+
+@dataclass
 class Config:
     map: MapConfig = field(default_factory=MapConfig)
     ports: PortConfig = field(default_factory=PortConfig)
@@ -100,6 +114,7 @@ class Config:
     fleet: FleetConfig = field(default_factory=FleetConfig)
     production: ProductionConfig = field(default_factory=ProductionConfig)
     combat: CombatConfig = field(default_factory=CombatConfig)
+    fow: FowConfig = field(default_factory=FowConfig)
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -115,6 +130,7 @@ def _apply_overrides(base: Config, data: dict) -> Config:
     ports_cfg = replace(base.ports, **data.get("ports", {}))
     production_cfg = replace(base.production, **data.get("production", {}))
     combat_cfg = replace(base.combat, **data.get("combat", {}))
+    fow_cfg = replace(base.fow, **data.get("fow", {}))
 
     fleet_counts = dict(base.fleet.counts)
     for name, count in data.get("fleet", {}).items():
@@ -134,4 +150,5 @@ def _apply_overrides(base: Config, data: dict) -> Config:
         fleet=fleet_cfg,
         production=production_cfg,
         combat=combat_cfg,
+        fow=fow_cfg,
     )

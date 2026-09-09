@@ -6,7 +6,9 @@ same round, based on each ship's `damage` stat -- or `asw` if the target is
 a submerged submarine, which `damage` cannot touch at all. Each of a side's
 own aircraft carriers within `CombatConfig.ac_bonus_radius` of the battle
 hex adds `CombatConfig.ac_bonus_amount` to that side's attack, recomputed
-fresh every round (a carrier arriving or sinking mid-battle changes it).
+fresh every round (a carrier arriving or sinking mid-battle changes it) --
+but only for the "larger surface ships" (`_AC_BONUS_ELIGIBLE_KINDS`); a
+submarine or patrol boat gets no benefit from nearby air cover.
 After a round where both ships survive, the attacker (the ship that moved
 into the hex) chooses to stay for another round or retreat -- this is the
 `decision_fn` seam, filled by a human UI prompt or an AI policy.
@@ -22,10 +24,16 @@ from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, distance
 from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
-from tla.tile import PlayerId
 
 Decision = Literal["stay", "retreat"]
 DecisionFn = Callable[[Ship, Ship, GameState], Decision]
+
+# Only these "larger surface ship" kinds benefit from nearby carrier air
+# cover -- a submarine (submerged or not) or patrol boat gets no bonus,
+# regardless of how many friendly carriers are nearby.
+_AC_BONUS_ELIGIBLE_KINDS = frozenset(
+    {ShipKind.CARRIER, ShipKind.BATTLESHIP, ShipKind.CRUISER, ShipKind.DESTROYER}
+)
 
 
 def _base_damage(attacker_stats: ShipStats, defender: Ship) -> int:
@@ -39,13 +47,18 @@ def _base_damage(attacker_stats: ShipStats, defender: Ship) -> int:
 
 
 def _carrier_bonus(
-    game_state: GameState, owner: PlayerId, battle_hex: AxialCoord, combat_config: CombatConfig
+    game_state: GameState, attacking_ship: Ship, battle_hex: AxialCoord, combat_config: CombatConfig
 ) -> int:
+    """Bonus damage for `attacking_ship`'s side from nearby friendly
+    carriers -- zero outright if `attacking_ship` isn't one of the kinds
+    that benefits (see `_AC_BONUS_ELIGIBLE_KINDS`)."""
+    if attacking_ship.kind not in _AC_BONUS_ELIGIBLE_KINDS:
+        return 0
     radius = combat_config.ac_bonus_radius
     count = sum(
         1
         for ship in game_state.ships.values()
-        if ship.owner == owner
+        if ship.owner == attacking_ship.owner
         and ship.kind == ShipKind.CARRIER
         and not ship.is_sunk
         and distance(ship.position, battle_hex) <= radius
@@ -71,10 +84,10 @@ def resolve_round(attacker: Ship, defender: Ship, game_state: GameState) -> Roun
     battle_hex = defender.position
 
     damage_to_defender = _base_damage(stats[attacker.kind], defender) + _carrier_bonus(
-        game_state, attacker.owner, battle_hex, combat_config
+        game_state, attacker, battle_hex, combat_config
     )
     damage_to_attacker = _base_damage(stats[defender.kind], attacker) + _carrier_bonus(
-        game_state, defender.owner, battle_hex, combat_config
+        game_state, defender, battle_hex, combat_config
     )
 
     defender.current_hp = max(0, defender.current_hp - damage_to_defender)
