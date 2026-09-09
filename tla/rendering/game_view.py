@@ -11,7 +11,7 @@ from tla.ai.policy import NaivePolicy
 from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
 from tla.fow import is_hidden, visible_hexes_for
-from tla.game_state import GameState
+from tla.game_state import GameState, TurnPhase
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
 from tla.movement import (
     begin_engagement,
@@ -34,7 +34,7 @@ from tla.rendering.hex_render import (
 )
 from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import Ship, ShipKind
-from tla.tile import PLAYER_A, PlayerId
+from tla.tile import PLAYER_A, PLAYER_B, PlayerId
 from tla.turn_manager import TurnManager
 
 # The six ship kinds shown, in this fixed order, as clickable glyph buttons
@@ -70,6 +70,17 @@ class ActiveBattle:
     defender: Ship
     rounds: list[RoundResult] = field(default_factory=list)
 
+
+@dataclass
+class SpottedToast:
+    """A brief, non-blocking "<ship> spotted!" notification -- unlike the
+    sunk/battle/turn-report overlays, this never pauses input; it just
+    fades on its own after SPOTTED_TOAST_SECONDS."""
+
+    text: str
+    remaining: float = 0.0
+
+
 # Screen pixels/second for keyboard panning (divided by zoom so it always
 # feels like the same on-screen speed, not the same world-space speed).
 PAN_SPEED = 600.0
@@ -104,6 +115,29 @@ SUNK_BORDER_COLOR = (220, 60, 60)
 SUNK_TEXT_COLOR = arcade.color.WHITE
 
 GAME_OVER_BG_COLOR = (10, 10, 10, 245)
+
+SUB_CONTACT_BG_COLOR = (40, 32, 5, 235)
+SUB_CONTACT_BORDER_COLOR = (230, 180, 40)
+SUB_CONTACT_TEXT_COLOR = arcade.color.WHITE
+
+SPOTTED_TOAST_SECONDS = 4.0
+SPOTTED_TOAST_BG_COLOR = (20, 20, 20, 220)
+SPOTTED_TOAST_BORDER_COLOR = (200, 170, 60)
+SPOTTED_TOAST_WIDTH = 260.0
+SPOTTED_TOAST_HEIGHT = 26.0
+SPOTTED_TOAST_MARGIN = 10.0
+
+TURN_REPORT_BG_COLOR = (18, 18, 18, 245)
+TURN_REPORT_BORDER_COLOR = (200, 170, 60)
+TURN_REPORT_WIDTH = 620.0
+TURN_REPORT_PADDING = 20.0
+TURN_REPORT_TITLE_HEIGHT = 34.0
+TURN_REPORT_STAT_LINE_HEIGHT = 26.0
+TURN_REPORT_GLYPH_ROW_HEIGHT = 84.0
+TURN_REPORT_FOOTER_HEIGHT = 30.0
+TURN_REPORT_GLYPH_HEX_SIZE = 34.0
+TURN_REPORT_GLYPH_SPACING = 66.0
+TURN_REPORT_SUNK_X_COLOR = (230, 40, 40)
 GAME_OVER_TEXT_COLOR = arcade.color.WHITE
 
 
@@ -142,9 +176,27 @@ class GameView(arcade.View):
         self.drag_path: list[AxialCoord] = []
         self.range_preview: dict[AxialCoord, int] = {}
         self.active_battle: ActiveBattle | None = None
+        # True the instant contact is made with a previously-hidden
+        # submerged submarine, before the first round of that battle has
+        # actually been resolved -- see _start_battle. Blocks all input
+        # except the dismiss that lets the battle proceed, so the player
+        # gets a moment to register what's happening before any damage is
+        # dealt, rather than seeing the outcome and the reveal at once.
+        self.pending_sub_contact: bool = False
         # Set when a battle just concluded with a sink, dismissed by any
         # key press or click.
         self.sunk_message: str | None = None
+        # True once the second mover's (MOVE_B) movement phase is over and
+        # the after-action report covering the whole turn is waiting to be
+        # dismissed -- see _end_movement_phase. The actual phase transition
+        # (production + turn_stats reset) is deferred until dismissal.
+        self.pending_turn_report: bool = False
+        # Enemy ship ids each player has ever had in fog-of-war vision --
+        # used to fire a one-time "<ship> spotted!" toast the moment a new
+        # one is first seen. Keyed by viewer, since fog of war (and so
+        # what's "new") can differ per player. See _update_spotted_ships.
+        self._known_enemy_ship_ids: dict[PlayerId, set[int]] = {}
+        self._spotted_toasts: list[SpottedToast] = []
         # The empty friendly port currently showing its production panel,
         # if any -- opened by clicking it, closed by clicking elsewhere,
         # Escape, or ending movement.
@@ -180,6 +232,26 @@ class GameView(arcade.View):
         self._port_panel_hover_text = arcade.Text(
             "", 0, 0, arcade.color.WHITE, 12, anchor_x="center"
         )
+        self._sub_contact_text = arcade.Text(
+            "", 0, 0, SUB_CONTACT_TEXT_COLOR, 16, anchor_x="center"
+        )
+        # Reused for up to this many simultaneously-visible spotted toasts;
+        # any beyond that just don't get a slot until an older one expires.
+        self._spotted_toast_texts = [
+            arcade.Text("", 0, 0, arcade.color.WHITE, 12) for _ in range(5)
+        ]
+        self._turn_report_title_text = arcade.Text(
+            "", 0, 0, arcade.color.WHITE, 18, anchor_x="center", bold=True
+        )
+        self._turn_report_player_texts = [
+            arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(2)
+        ]
+        self._turn_report_none_texts = [
+            arcade.Text("(no ships lost)", 0, 0, (170, 170, 170), 12) for _ in range(2)
+        ]
+        self._turn_report_footer_text = arcade.Text(
+            "(press any key to continue)", 0, 0, (190, 190, 190), 12, anchor_x="center"
+        )
 
     def on_show_view(self) -> None:
         self.window.background_color = arcade.color.BLACK
@@ -205,17 +277,54 @@ class GameView(arcade.View):
         by ship. Ends the AI's movement phase itself once the generator is
         exhausted -- mirroring exactly what the Enter key does for a human
         -- and immediately checks for another AI seat, covering an
-        AI-vs-AI handoff."""
+        AI-vs-AI handoff.
+
+        If that step sank a ship, draining pauses there and shows the same
+        blocking sunk-ship overlay a human's own battles use (see
+        `on_key_press`/`on_mouse_press`) -- otherwise a ship lost while it
+        wasn't your move (an AI attack, or a scout it sent ahead) would
+        just flash by unnoticed during a paced turn you're only half
+        watching. Paused for as long as `sunk_message` is set; resumes
+        automatically once the human dismisses it, since this is called
+        again every `on_update` tick regardless."""
+        if self.sunk_message is not None:
+            return
         self._ai_pace_timer += delta_time
         pacing = self.game_state.config.ai.turn_pacing_seconds
         while self._ai_turn_iter is not None and self._ai_pace_timer >= pacing:
             self._ai_pace_timer -= pacing
+            before = {sid: (s.owner, s.kind) for sid, s in self.game_state.ships.items()}
             try:
                 next(self._ai_turn_iter)
             except StopIteration:
                 self._ai_turn_iter = None
-                self.turn_manager.end_movement_phase()
-                self._maybe_start_ai_turn()
+                self._end_movement_phase()
+                return
+            sunk = [owner_kind for sid, owner_kind in before.items() if sid not in self.game_state.ships]
+            if sunk:
+                self.sunk_message = self._sunk_message_for(sunk)
+                return
+
+    def _end_movement_phase(self) -> None:
+        """End the current player's movement phase -- the shared path for
+        both the human's Enter key and an AI's turn finishing. If this is
+        the *second* mover (MOVE_B) ending, a full turn's worth of battles
+        is now complete, so the after-action report is shown first (see
+        _dismiss_turn_report); the actual phase transition -- which runs
+        production and resets turn_stats -- is deferred until it's
+        dismissed, so the report still has the turn's real numbers to
+        read. Ending the first mover's (MOVE_A) phase has nothing to
+        report yet and proceeds immediately, as before."""
+        if self.game_state.phase == TurnPhase.MOVE_B:
+            self.pending_turn_report = True
+            return
+        self.turn_manager.end_movement_phase()
+        self._maybe_start_ai_turn()
+
+    def _dismiss_turn_report(self) -> None:
+        self.pending_turn_report = False
+        self.turn_manager.end_movement_phase()
+        self._maybe_start_ai_turn()
 
     def on_resize(self, width: int, height: int) -> None:
         # Keep the camera's current position -- only the viewport/projection
@@ -226,10 +335,24 @@ class GameView(arcade.View):
     def on_key_press(self, symbol: int, modifiers: int) -> None:
         if self.game_state.winner is not None:
             return
+        if self.sunk_message is not None:
+            # Checked BEFORE the _ai_turn_iter guard below: a sink during
+            # the AI's own turn (see _advance_ai_turn) pauses draining and
+            # sets this with _ai_turn_iter still non-None -- if the guard
+            # ran first, the human could never dismiss it and the game
+            # would be stuck. A human-driven sink (_conclude_battle) only
+            # ever happens with _ai_turn_iter already None, so this
+            # ordering is safe for both cases.
+            self.sunk_message = None
+            return
         if self._ai_turn_iter is not None:
             return  # an AI seat's paced turn is playing out -- not the human's input to give
-        if self.sunk_message is not None:
-            self.sunk_message = None
+        if self.pending_turn_report:
+            self._dismiss_turn_report()
+            return
+        if self.pending_sub_contact:
+            self.pending_sub_contact = False
+            self._resolve_battle_round()
             return
         if self.active_battle is not None:
             if symbol == arcade.key.ENTER:
@@ -260,8 +383,7 @@ class GameView(arcade.View):
         elif symbol == arcade.key.ENTER:
             self._abort_drag()
             self._close_port_panel()
-            self.turn_manager.end_movement_phase()
-            self._maybe_start_ai_turn()
+            self._end_movement_phase()
         elif symbol == arcade.key.T:
             self._toggle_hovered_submarine()
 
@@ -287,10 +409,19 @@ class GameView(arcade.View):
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
         if self.game_state.winner is not None:
             return
+        if self.sunk_message is not None:
+            # See the matching comment in on_key_press for why this must
+            # be checked before the _ai_turn_iter guard.
+            self.sunk_message = None
+            return
         if self._ai_turn_iter is not None:
             return  # an AI seat's paced turn is playing out -- not the human's input to give
-        if self.sunk_message is not None:
-            self.sunk_message = None
+        if self.pending_turn_report:
+            self._dismiss_turn_report()
+            return
+        if self.pending_sub_contact:
+            self.pending_sub_contact = False
+            self._resolve_battle_round()
             return
         if button == arcade.MOUSE_BUTTON_RIGHT:
             self._dragging = True
@@ -454,6 +585,15 @@ class GameView(arcade.View):
 
     def _start_battle(self, attacker: Ship, defender: Ship) -> None:
         self.active_battle = ActiveBattle(attacker=attacker, defender=defender)
+        if defender.kind == ShipKind.SUBMARINE and not defender.surfaced:
+            # First contact with a submerged sub: pause for acknowledgment
+            # before the first round -- which always happens the instant
+            # contact is made (see battle.run_battle) -- deals any damage,
+            # so the player has a moment to register what's going on
+            # instead of seeing the reveal and the outcome simultaneously.
+            # Dismissed by any key/click, see on_key_press/on_mouse_press.
+            self.pending_sub_contact = True
+            return
         self._resolve_battle_round()
 
     def _resolve_battle_round(self) -> None:
@@ -478,17 +618,12 @@ class GameView(arcade.View):
         self.active_battle = None
 
     def _sunk_message(self, attacker: Ship, defender: Ship) -> str | None:
-        def label(ship: Ship) -> str:
-            owner_label = "Player A" if ship.owner == PLAYER_A else "Player B"
-            kind_label = ship.kind.value.replace("_", " ").title()
-            return f"{owner_label} {kind_label}"
-
         if attacker.is_sunk and defender.is_sunk:
-            return f"{label(attacker)} and {label(defender)} both sunk!"
+            return f"{self._ship_label(attacker)} and {self._ship_label(defender)} both sunk!"
         if attacker.is_sunk:
-            return f"{label(attacker)} sunk!"
+            return f"{self._ship_label(attacker)} sunk!"
         if defender.is_sunk:
-            return f"{label(defender)} sunk!"
+            return f"{self._ship_label(defender)} sunk!"
         return None
 
     def on_mouse_release(self, x: int, y: int, button: int, modifiers: int) -> None:
@@ -559,6 +694,52 @@ class GameView(arcade.View):
             return None
         return visible_hexes_for(gs, self._display_player())
 
+    def _ship_label(self, ship: Ship) -> str:
+        return self._label_for(ship.owner, ship.kind)
+
+    def _label_for(self, owner: PlayerId, kind: ShipKind) -> str:
+        owner_label = "Player A" if owner == PLAYER_A else "Player B"
+        kind_label = kind.value.replace("_", " ").title()
+        return f"{owner_label} {kind_label}"
+
+    def _sunk_message_for(self, sunk: list[tuple[PlayerId, ShipKind]]) -> str:
+        """Same "<ship> sunk!" / "<ship> and <ship> both sunk!" phrasing as
+        `_sunk_message`, but built from bare (owner, kind) pairs rather
+        than live Ship objects -- used for a sink discovered during the
+        AI's own turn (see `_advance_ai_turn`), where the ships involved
+        are already gone from `game_state.ships` by the time it's noticed."""
+        labels = [self._label_for(owner, kind) for owner, kind in sunk]
+        if len(labels) == 2:
+            return f"{labels[0]} and {labels[1]} both sunk!"
+        return f"{labels[0]} sunk!"
+
+    def _update_spotted_ships(self, delta_time: float) -> None:
+        """Fire a one-time, non-blocking "<ship> spotted!" toast the
+        moment an enemy ship is first seen in the display player's fog of
+        war vision (never for a submerged submarine -- fow.is_hidden keeps
+        those out of `visible` entirely regardless, so a combat reveal is
+        the SUB CONTACT flow's job, not this one). No-op if fog of war is
+        disabled -- there's no "first sighting" moment without it."""
+        for toast in self._spotted_toasts:
+            toast.remaining -= delta_time
+        self._spotted_toasts = [t for t in self._spotted_toasts if t.remaining > 0]
+
+        gs = self.game_state
+        if not gs.config.fow.enabled:
+            return
+        display_player = self._display_player()
+        visible = visible_hexes_for(gs, display_player)
+        known = self._known_enemy_ship_ids.setdefault(display_player, set())
+        for ship in gs.ships.values():
+            if ship.owner == display_player or ship.id in known:
+                continue
+            if is_hidden(display_player, ship, visible):
+                continue
+            known.add(ship.id)
+            self._spotted_toasts.append(
+                SpottedToast(text=f"{self._ship_label(ship)} spotted!", remaining=SPOTTED_TOAST_SECONDS)
+            )
+
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
         if scroll_y > 0:
             self._zoom_toward_screen_point(x, y, ZOOM_STEP)
@@ -584,6 +765,7 @@ class GameView(arcade.View):
     def on_update(self, delta_time: float) -> None:
         if self._ai_turn_iter is not None:
             self._advance_ai_turn(delta_time)
+        self._update_spotted_ships(delta_time)
         if not self._held_pan_keys:
             return
         move_x = sum(dx for key, (dx, _) in _PAN_KEYS.items() if key in self._held_pan_keys)
@@ -634,10 +816,15 @@ class GameView(arcade.View):
             self._draw_port_panel()
         if self.sunk_message is not None:
             self._draw_sunk_overlay()
+        elif self.pending_turn_report:
+            self._draw_turn_report()
+        elif self.pending_sub_contact:
+            self._draw_sub_contact_overlay()
         elif self.active_battle is not None:
             self._draw_battle_banner(self.active_battle)
         elif self._hovered_ship is not None:
             self._draw_hover_tooltip(self._hovered_ship)
+        self._draw_spotted_toasts()
 
     def _draw_drag_path_line(self) -> None:
         if len(self.drag_path) < 2:
@@ -794,11 +981,6 @@ class GameView(arcade.View):
         attacker, defender = battle.attacker, battle.defender
         last_round = battle.rounds[-1]
         stats = self.game_state.config.ship_stats.stats
-        a_label = "Player A" if attacker.owner == PLAYER_A else "Player B"
-        d_label = "Player A" if defender.owner == PLAYER_A else "Player B"
-
-        def kind_name(ship: Ship) -> str:
-            return ship.kind.value.replace("_", " ").title()
 
         # Announced only on the round that made contact -- the defender was
         # hidden by submerged-submarine stealth right up until this attack,
@@ -813,8 +995,8 @@ class GameView(arcade.View):
         if is_sub_contact:
             lines.append("SUB CONTACT!")
         lines += [
-            f"BATTLE -- {a_label} {kind_name(attacker)} ({attacker.current_hp}/{stats[attacker.kind].hp} HP)"
-            f"  vs  {d_label} {kind_name(defender)} ({defender.current_hp}/{stats[defender.kind].hp} HP)",
+            f"BATTLE -- {self._ship_label(attacker)} ({attacker.current_hp}/{stats[attacker.kind].hp} HP)"
+            f"  vs  {self._ship_label(defender)} ({defender.current_hp}/{stats[defender.kind].hp} HP)",
             f"Round {len(battle.rounds)}: dealt {last_round.damage_to_defender}, "
             f"took {last_round.damage_to_attacker} damage",
             "[Enter] Stay and Fight        [Esc] Retreat",
@@ -852,6 +1034,108 @@ class GameView(arcade.View):
         self._sunk_text.x = self.window.width / 2
         self._sunk_text.y = top - height / 2 - 6
         self._sunk_text.draw()
+
+    def _draw_sub_contact_overlay(self) -> None:
+        display_text = "Submerged sub encountered!   (press any key to continue)"
+        width = min(self.window.width - 40, max(420, len(display_text) * 9 + 40))
+        height = 60
+        left = (self.window.width - width) / 2
+        top = self.window.height - 40
+
+        arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, SUB_CONTACT_BG_COLOR)
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, SUB_CONTACT_BORDER_COLOR)
+
+        self._sub_contact_text.text = display_text
+        self._sub_contact_text.x = self.window.width / 2
+        self._sub_contact_text.y = top - height / 2 - 6
+        self._sub_contact_text.draw()
+
+    def _draw_spotted_toasts(self) -> None:
+        """Stacked, non-blocking notifications in the top-right corner --
+        drawn every frame regardless of any modal overlay above (except
+        game over, which returns before this is ever reached), since
+        spotting an enemy ship shouldn't interrupt whatever else is
+        showing."""
+        top = self.window.height - 60  # clears the two-line HUD text at top-left/top-right
+        right = self.window.width - SPOTTED_TOAST_MARGIN
+        left = right - SPOTTED_TOAST_WIDTH
+        shown = self._spotted_toasts[: len(self._spotted_toast_texts)]
+        for i, toast in enumerate(shown):
+            box_top = top - i * (SPOTTED_TOAST_HEIGHT + 6)
+            box_bottom = box_top - SPOTTED_TOAST_HEIGHT
+            arcade.draw_lbwh_rectangle_filled(
+                left, box_bottom, SPOTTED_TOAST_WIDTH, SPOTTED_TOAST_HEIGHT, SPOTTED_TOAST_BG_COLOR
+            )
+            arcade.draw_lbwh_rectangle_filled(left, box_top - 2, SPOTTED_TOAST_WIDTH, 2, SPOTTED_TOAST_BORDER_COLOR)
+            text_obj = self._spotted_toast_texts[i]
+            text_obj.text = toast.text
+            text_obj.x = left + 10
+            text_obj.y = box_bottom + SPOTTED_TOAST_HEIGHT / 2 - 5
+            text_obj.draw()
+
+    def _draw_turn_report(self) -> None:
+        """The after-action report for the turn that just ended (both
+        players' movement phases) -- HP dealt/taken and any ships lost,
+        per player, covering both sides at once across the two sections.
+        A sunk ship is drawn as its normal glyph with a red X over it.
+        Blocks input until dismissed -- see on_key_press/on_mouse_press
+        and _dismiss_turn_report."""
+        gs = self.game_state
+        width = TURN_REPORT_WIDTH
+        height = (
+            TURN_REPORT_PADDING * 2
+            + TURN_REPORT_TITLE_HEIGHT
+            + 2 * (TURN_REPORT_STAT_LINE_HEIGHT + TURN_REPORT_GLYPH_ROW_HEIGHT)
+            + TURN_REPORT_FOOTER_HEIGHT
+        )
+        left = (self.window.width - width) / 2
+        top = (self.window.height + height) / 2
+        bottom = top - height
+
+        arcade.draw_lbwh_rectangle_filled(left, bottom, width, height, TURN_REPORT_BG_COLOR)
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, TURN_REPORT_BORDER_COLOR)
+
+        self._turn_report_title_text.text = f"Turn {gs.turn_number} Report"
+        self._turn_report_title_text.x = self.window.width / 2
+        self._turn_report_title_text.y = top - TURN_REPORT_PADDING - 16
+        self._turn_report_title_text.draw()
+
+        cursor_y = top - TURN_REPORT_PADDING - TURN_REPORT_TITLE_HEIGHT
+        for i, player in enumerate((PLAYER_A, PLAYER_B)):
+            stats = gs.turn_stats[player]
+            player_label = "Player A" if player == PLAYER_A else "Player B"
+
+            header_text = self._turn_report_player_texts[i]
+            header_text.text = f"{player_label} -- Dealt: {stats.hp_dealt}   Took: {stats.hp_taken}"
+            header_text.color = PLAYER_COLORS[player]
+            header_text.x = left + TURN_REPORT_PADDING
+            header_text.y = cursor_y - TURN_REPORT_STAT_LINE_HEIGHT + 8
+            header_text.draw()
+
+            glyph_y = cursor_y - TURN_REPORT_STAT_LINE_HEIGHT - TURN_REPORT_GLYPH_ROW_HEIGHT / 2 + 8
+            if stats.ships_lost:
+                for j, kind in enumerate(stats.ships_lost):
+                    cx = left + TURN_REPORT_PADDING + 30 + j * TURN_REPORT_GLYPH_SPACING
+                    draw_ship_glyph((cx, glyph_y), TURN_REPORT_GLYPH_HEX_SIZE, kind, PLAYER_COLORS[player])
+                    # Sized to roughly bound the largest hull (~0.5 local
+                    # units * SHIP_SCALE from center) at this glyph size --
+                    # a fixed multiple of hex_size, not of the individual
+                    # ship's own (very different) silhouette size, so a
+                    # tiny patrol boat doesn't get lost under an oversized X.
+                    half = TURN_REPORT_GLYPH_HEX_SIZE * 0.55
+                    arcade.draw_line(cx - half, glyph_y - half, cx + half, glyph_y + half, TURN_REPORT_SUNK_X_COLOR, 3)
+                    arcade.draw_line(cx - half, glyph_y + half, cx + half, glyph_y - half, TURN_REPORT_SUNK_X_COLOR, 3)
+            else:
+                none_text = self._turn_report_none_texts[i]
+                none_text.x = left + TURN_REPORT_PADDING
+                none_text.y = glyph_y - 5
+                none_text.draw()
+
+            cursor_y -= TURN_REPORT_STAT_LINE_HEIGHT + TURN_REPORT_GLYPH_ROW_HEIGHT
+
+        self._turn_report_footer_text.x = self.window.width / 2
+        self._turn_report_footer_text.y = bottom + TURN_REPORT_FOOTER_HEIGHT / 2 - 4
+        self._turn_report_footer_text.draw()
 
     def _draw_hover_tooltip(self, ship: Ship) -> None:
         stats = self.game_state.config.ship_stats.stats[ship.kind]

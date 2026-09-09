@@ -7,8 +7,10 @@ a submerged submarine, which `damage` cannot touch at all. Each of a side's
 own aircraft carriers within `CombatConfig.ac_bonus_radius` of the battle
 hex adds `CombatConfig.ac_bonus_amount` to that side's attack, recomputed
 fresh every round (a carrier arriving or sinking mid-battle changes it) --
-but only for the "larger surface ships" (`_AC_BONUS_ELIGIBLE_KINDS`); a
-submarine or patrol boat gets no benefit from nearby air cover.
+but only for the "larger surface ships" (`_AC_BONUS_ELIGIBLE_KINDS`), and
+never against a submerged submarine target: air cover doesn't help spot or
+track something submerged, regardless of which side has it or which side
+the submerged sub itself is fighting from (attacker or defender role).
 After a round where both ships survive, the attacker (the ship that moved
 into the hex) chooses to stay for another round or retreat -- this is the
 `decision_fn` seam, filled by a human UI prompt or an AI policy.
@@ -47,15 +49,25 @@ def _base_damage(attacker_stats: ShipStats, defender: Ship) -> int:
 
 
 def carrier_bonus_for(
-    game_state: GameState, attacking_ship: Ship, battle_hex: AxialCoord, combat_config: CombatConfig
+    game_state: GameState,
+    attacking_ship: Ship,
+    target: Ship,
+    battle_hex: AxialCoord,
+    combat_config: CombatConfig,
 ) -> int:
     """Bonus damage for `attacking_ship`'s side from nearby friendly
-    carriers -- zero outright if `attacking_ship` isn't one of the kinds
-    that benefits (see `_AC_BONUS_ELIGIBLE_KINDS`). Public so callers other
-    than `resolve_round` -- e.g. `tla.ai.scoring.matchup_score`, estimating
-    an engagement before committing to it -- can reuse the exact same
-    combat math rather than risking a duplicated, driftable copy of it."""
+    carriers, against `target` -- zero outright if `attacking_ship` isn't
+    one of the kinds that benefits (see `_AC_BONUS_ELIGIBLE_KINDS`), or if
+    `target` is a submerged submarine: air cover never helps against a
+    submerged target, no matter which side has the carrier or which role
+    (attacker/defender) the submerged sub is playing in this engagement.
+    Public so callers other than `resolve_round` -- e.g.
+    `tla.ai.scoring.matchup_score`, estimating an engagement before
+    committing to it -- can reuse the exact same combat math rather than
+    risking a duplicated, driftable copy of it."""
     if attacking_ship.kind not in _AC_BONUS_ELIGIBLE_KINDS:
+        return 0
+    if target.kind == ShipKind.SUBMARINE and not target.surfaced:
         return 0
     radius = combat_config.ac_bonus_radius
     count = sum(
@@ -87,14 +99,24 @@ def resolve_round(attacker: Ship, defender: Ship, game_state: GameState) -> Roun
     battle_hex = defender.position
 
     damage_to_defender = _base_damage(stats[attacker.kind], defender) + carrier_bonus_for(
-        game_state, attacker, battle_hex, combat_config
+        game_state, attacker, defender, battle_hex, combat_config
     )
     damage_to_attacker = _base_damage(stats[defender.kind], attacker) + carrier_bonus_for(
-        game_state, defender, battle_hex, combat_config
+        game_state, defender, attacker, battle_hex, combat_config
     )
 
     defender.current_hp = max(0, defender.current_hp - damage_to_defender)
     attacker.current_hp = max(0, attacker.current_hp - damage_to_attacker)
+
+    # Tallied for the after-action report (tla.rendering.game_view) --
+    # each side's own dealt/taken from this round, attributed by owner so
+    # it's correct regardless of which one is nominally the "attacker".
+    attacker_stats = game_state.turn_stats[attacker.owner]
+    attacker_stats.hp_dealt += damage_to_defender
+    attacker_stats.hp_taken += damage_to_attacker
+    defender_stats = game_state.turn_stats[defender.owner]
+    defender_stats.hp_dealt += damage_to_attacker
+    defender_stats.hp_taken += damage_to_defender
 
     return RoundResult(
         damage_to_defender=damage_to_defender,
@@ -155,10 +177,12 @@ def apply_battle_outcome(game_state: GameState, attacker: Ship, defender: Ship) 
     itself once the battle actually concludes.
     """
     if defender.is_sunk:
+        game_state.turn_stats[defender.owner].ships_lost.append(defender.kind)
         del game_state.ships[defender.id]
         if not attacker.is_sunk:
             attacker.position = defender.position
             handle_port_capture(game_state, attacker.position)
     if attacker.is_sunk:
+        game_state.turn_stats[attacker.owner].ships_lost.append(attacker.kind)
         del game_state.ships[attacker.id]
     game_state.refresh_winner()

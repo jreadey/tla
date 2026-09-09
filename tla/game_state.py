@@ -13,7 +13,7 @@ from tla.hexgrid import AxialCoord
 from tla.mapgen import generate_map
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, PlayerId
-from tla.win_condition import check_elimination, check_port_control
+from tla.win_condition import check_elimination
 
 
 class TurnPhase(Enum):
@@ -42,6 +42,21 @@ class PlayerState:
 
 
 @dataclass
+class TurnStats:
+    """One player's running battle tally for the turn currently in
+    progress -- both their own and the opponent's movement phases, since
+    the after-action report (tla.rendering.game_view) covers the whole
+    turn at once. Accumulated by tla.battle.resolve_round/
+    apply_battle_outcome as battles happen, and reset by
+    tla.turn_manager.end_movement_phase once a new turn actually starts
+    (after the report has had a chance to show it)."""
+
+    hp_dealt: int = 0
+    hp_taken: int = 0
+    ships_lost: list[ShipKind] = field(default_factory=list)
+
+
+@dataclass
 class GameState:
     config: Config
     board: Board
@@ -54,6 +69,16 @@ class GameState:
     )
     next_ship_id: int = 1
     winner: PlayerId | None = None
+    turn_stats: dict[PlayerId, TurnStats] = field(
+        default_factory=lambda: {PLAYER_A: TurnStats(), PLAYER_B: TurnStats()}
+    )
+    # Whoever controlled every port on the map as of the most recent full
+    # turn boundary -- None if no single player did. See
+    # tla.win_condition.advance_port_control_claim: total port control
+    # only wins once the SAME player holds this two boundaries running
+    # (i.e. continuously through one full intervening turn), so this is
+    # the "clock" that tracks whether that streak is still alive.
+    port_control_claimant: PlayerId | None = None
 
     def ship_at(self, coord: AxialCoord) -> Ship | None:
         for ship in self.ships.values():
@@ -65,16 +90,19 @@ class GameState:
         return [ship for ship in self.ships.values() if ship.owner == player]
 
     def refresh_winner(self) -> None:
-        """Re-evaluate both win conditions and set `winner` if either is now
-        met. Never un-sets an already-decided winner, so this is safe to
-        call speculatively -- it's meant to be called by the rules layer
-        itself (movement, battle, production) right after any mutation that
-        could end the game: a ship sunk, or a port's controller changing --
-        rather than left to whatever's driving the game (a human UI or an
-        AI) to remember to check afterward."""
+        """Re-evaluate the elimination win condition and set `winner` if
+        it's now met. Never un-sets an already-decided winner, so this is
+        safe to call speculatively -- it's meant to be called by the rules
+        layer itself (movement, battle) right after any mutation that
+        could end the game: a ship sunk, rather than left to whatever's
+        driving the game (a human UI or an AI) to remember to check
+        afterward. Total port control is deliberately NOT checked here --
+        unlike elimination, it doesn't win instantly; see
+        tla.win_condition.advance_port_control_claim, called once per full
+        turn boundary by tla.turn_manager."""
         if self.winner is not None:
             return
-        self.winner = check_elimination(self) or check_port_control(self)
+        self.winner = check_elimination(self)
 
 
 def new_game(config: Config, seed: int) -> GameState:

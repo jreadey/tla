@@ -1,4 +1,5 @@
 from dataclasses import replace
+from unittest.mock import patch
 
 from tla.ai.policy import NaivePolicy
 from tla.board import Board
@@ -205,6 +206,34 @@ def test_capital_ship_sends_an_escort_ahead_before_advancing():
     # The battleship holds; the scout is the one that moved this turn.
     assert gs.ships[1].position == AxialCoord(0, 0)
     assert gs.ships[2].position != AxialCoord(0, 1)
+
+
+def test_scout_prepass_survives_losing_the_last_visible_contact_mid_pass():
+    # Regression: fog-of-war vision is recomputed fresh from each ship's
+    # current position (see tla.fow), so a scout's own move earlier in the
+    # prepass can shrink the player's vision enough to lose the only
+    # visible enemy entirely -- before this was guarded, the *next*
+    # capital ship's scout-distance check crashed with
+    # "min() iterable argument is empty" instead of gracefully falling
+    # back to normal (non-scouted) movement. Reproduced deterministically
+    # by mocking enemy_ships_visible_to to go from one visible enemy to
+    # none, rather than relying on fragile real-geometry vision loss.
+    board = _sea_board(radius=25)
+    port = AxialCoord(0, 20)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    capital1 = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    escort1 = _ship(AxialCoord(0, -3), ShipKind.DESTROYER, PLAYER_A, 2)
+    capital2 = _ship(AxialCoord(5, 0), ShipKind.BATTLESHIP, PLAYER_A, 3)
+    fake_enemy = _ship(AxialCoord(0, -6), ShipKind.DESTROYER, PLAYER_B, 4)
+    gs = _game_state(board, [capital1, escort1, capital2, fake_enemy], config=Config(fow=FowConfig(enabled=False)))
+
+    calls = [{4: fake_enemy}, {}]
+
+    def fake_visible(game_state, player):
+        return calls.pop(0) if calls else {}
+
+    with patch("tla.ai.policy.enemy_ships_visible_to", side_effect=fake_visible):
+        list(NaivePolicy().plan_movement(gs, PLAYER_A))  # must not raise
 
 
 def test_plan_production_tops_up_every_controlled_port_to_queue_depth():

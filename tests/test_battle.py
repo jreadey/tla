@@ -1,6 +1,6 @@
 from dataclasses import replace
 
-from tla.battle import resolve_round, run_battle
+from tla.battle import apply_battle_outcome, resolve_round, run_battle
 from tla.board import Board
 from tla.config import Config, ShipStatsConfig
 from tla.game_state import GameState
@@ -196,6 +196,53 @@ def test_carrier_bonus_does_not_apply_to_a_patrol_boat_defender():
     assert result.damage_to_attacker == Config().ship_stats.stats[ShipKind.PATROL_BOAT].damage
 
 
+def test_carrier_bonus_does_not_apply_when_attacking_a_submerged_submarine():
+    board = _sea_board()
+    battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)  # eligible kind
+    sub = _ship(AxialCoord(1, 0), ShipKind.SUBMARINE, PLAYER_B, 2, surfaced=False)
+    carrier = _ship(AxialCoord(0, 1), ShipKind.CARRIER, PLAYER_A, 3)  # in range
+    gs = _game_state(board, [battleship, sub, carrier])
+
+    result = resolve_round(battleship, sub, gs)
+
+    # asw only -- the carrier's bonus does not carry through to anti-sub
+    # damage against a submerged target, even though a battleship would
+    # normally benefit from it against anything else.
+    assert result.damage_to_defender == Config().ship_stats.stats[ShipKind.BATTLESHIP].asw
+
+
+def test_carrier_bonus_does_not_apply_when_a_submerged_submarine_is_the_attacker():
+    board = _sea_board()
+    # The sub initiates the engagement while submerged -- it's the
+    # "attacker" role in resolve_round, but the rule is about who the
+    # damage TARGETS, not which role initiated, so the defender's carrier
+    # still shouldn't get a bonus against it either.
+    sub = _ship(AxialCoord(0, 0), ShipKind.SUBMARINE, PLAYER_A, 1, surfaced=False)
+    battleship = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_B, 2)
+    carrier = _ship(AxialCoord(1, 1), ShipKind.CARRIER, PLAYER_B, 3)  # in range, defender's side
+    gs = _game_state(board, [sub, battleship, carrier])
+
+    result = resolve_round(sub, battleship, gs)
+
+    assert result.damage_to_attacker == Config().ship_stats.stats[ShipKind.BATTLESHIP].asw
+
+
+def test_carrier_bonus_still_applies_against_a_surfaced_submarine():
+    # The exclusion is specifically about being submerged, not about being
+    # a submarine at all -- a surfaced sub is hit with ordinary `damage`,
+    # same as any other target, and the bonus applies normally to that.
+    board = _sea_board()
+    battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    sub = _ship(AxialCoord(1, 0), ShipKind.SUBMARINE, PLAYER_B, 2, surfaced=True)
+    carrier = _ship(AxialCoord(0, 1), ShipKind.CARRIER, PLAYER_A, 3)
+    gs = _game_state(board, [battleship, sub, carrier])
+
+    result = resolve_round(battleship, sub, gs)
+
+    base_damage = Config().ship_stats.stats[ShipKind.BATTLESHIP].damage
+    assert result.damage_to_defender == base_damage + 1
+
+
 def test_carrier_bonus_applies_to_another_carrier():
     board = _sea_board()
     attacking_carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
@@ -224,6 +271,50 @@ def test_run_battle_stops_on_retreat_leaving_both_ships_alive():
     assert len(result.rounds) == 1
     assert not result.attacker_sunk
     assert not result.defender_sunk
+
+
+def test_resolve_round_accumulates_turn_stats_for_both_sides():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_B, 2)
+    gs = _game_state(board, [attacker, defender])
+    destroyer_damage = Config().ship_stats.stats[ShipKind.DESTROYER].damage
+    cruiser_damage = Config().ship_stats.stats[ShipKind.CRUISER].damage
+
+    resolve_round(attacker, defender, gs)
+
+    assert gs.turn_stats[PLAYER_A].hp_dealt == destroyer_damage
+    assert gs.turn_stats[PLAYER_A].hp_taken == cruiser_damage
+    assert gs.turn_stats[PLAYER_B].hp_dealt == cruiser_damage
+    assert gs.turn_stats[PLAYER_B].hp_taken == destroyer_damage
+
+
+def test_resolve_round_accumulates_turn_stats_across_multiple_rounds():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1, hp=100)
+    defender = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 2, hp=100)
+    gs = _game_state(board, [attacker, defender])
+    damage = Config().ship_stats.stats[ShipKind.DESTROYER].damage
+
+    resolve_round(attacker, defender, gs)
+    resolve_round(attacker, defender, gs)
+
+    assert gs.turn_stats[PLAYER_A].hp_dealt == damage * 2
+    assert gs.turn_stats[PLAYER_B].hp_dealt == damage * 2
+
+
+def test_apply_battle_outcome_records_sunk_ships_by_owner():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)  # damage 4
+    defender = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2, hp=2)
+    gs = _game_state(board, [attacker, defender])
+
+    result = resolve_round(attacker, defender, gs)
+    assert result.defender_sunk
+    apply_battle_outcome(gs, attacker, defender)
+
+    assert gs.turn_stats[PLAYER_B].ships_lost == [ShipKind.PATROL_BOAT]
+    assert gs.turn_stats[PLAYER_A].ships_lost == []
 
 
 def test_run_battle_never_asks_before_the_first_round():

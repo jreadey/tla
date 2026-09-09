@@ -39,8 +39,10 @@ def handle_port_capture(game_state: GameState, coord: AxialCoord) -> None:
     (including a friendly ship simply parking on its own still-controlled
     port), and control does NOT revert just because the ship that captured
     it later leaves -- it stays captured until the other side retakes it.
-    Refreshes `game_state.winner` afterward, since a flip here can complete
-    total port control.
+    Doesn't affect `game_state.winner` itself -- a capture can't complete
+    an instant elimination win, and total port control isn't instant
+    either (see `tla.win_condition.advance_port_control_claim`, evaluated
+    only at turn boundaries), so there's nothing to refresh here.
     """
     tile = game_state.board.get_tile(coord)
     if tile is None or not tile.is_port or tile.port_owner is None:
@@ -52,7 +54,6 @@ def handle_port_capture(game_state: GameState, coord: AxialCoord) -> None:
     if occupant.owner != previous_controller:
         game_state.players[previous_controller].port_production.pop(coord, None)
         tile.port_controller = occupant.owner
-        game_state.refresh_winner()
 
 
 def run_production(game_state: GameState, player: PlayerId) -> None:

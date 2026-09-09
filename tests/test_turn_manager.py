@@ -87,3 +87,43 @@ def test_end_movement_phase_runs_production_for_both_players():
 
     assert any(s.owner == PLAYER_A and s.position == port_a for s in gs.ships.values())
     assert any(s.owner == PLAYER_B and s.position == port_b for s in gs.ships.values())
+
+
+def test_end_movement_phase_advances_the_port_control_claim_at_each_turn_boundary():
+    # A holds every port from the start -- shouldn't win on the very first
+    # boundary, only once they've still held it at a second consecutive one.
+    port_a, port_b = AxialCoord(0, 0), AxialCoord(4, 0)
+    board = Board(width=5, height=5)
+    board.tiles[port_a] = Tile(coord=port_a, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    board.tiles[port_b] = Tile(
+        coord=port_b, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B, port_controller=PLAYER_A
+    )
+    gs = GameState(config=Config(), board=board, ships={})
+    manager = TurnManager(gs)
+
+    manager.end_movement_phase()  # A -> B, no boundary yet
+    manager.end_movement_phase()  # B -> new turn: boundary 1
+
+    assert gs.winner is None
+    assert gs.port_control_claimant == PLAYER_A
+
+    manager.end_movement_phase()  # A -> B
+    manager.end_movement_phase()  # B -> new turn: boundary 2 -- confirmed
+
+    assert gs.winner == PLAYER_A
+
+
+def test_end_movement_phase_resets_turn_stats_only_once_a_new_turn_starts():
+    gs = _game_state()
+    manager = TurnManager(gs)
+    gs.turn_stats[PLAYER_A].hp_dealt = 5
+    gs.turn_stats[PLAYER_B].hp_taken = 5
+
+    manager.end_movement_phase()  # A -> B: still mid-turn, stats untouched
+
+    assert gs.turn_stats[PLAYER_A].hp_dealt == 5
+
+    manager.end_movement_phase()  # B -> new turn: now reset
+
+    assert gs.turn_stats[PLAYER_A].hp_dealt == 0
+    assert gs.turn_stats[PLAYER_B].hp_taken == 0

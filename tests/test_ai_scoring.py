@@ -131,6 +131,27 @@ def test_matchup_score_includes_the_carrier_bonus():
     assert score_with_carrier > score_no_carrier
 
 
+def test_matchup_score_carrier_bonus_does_not_apply_against_a_submerged_submarine():
+    board = _sea_board()
+    battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    sub = _ship(AxialCoord(1, 0), ShipKind.SUBMARINE, PLAYER_B, 2, surfaced=False)
+    gs_no_carrier = _game_state(board, [battleship, sub])
+    score_no_carrier = matchup_score(battleship, sub, gs_no_carrier)
+
+    carrier = _ship(AxialCoord(0, 1), ShipKind.CARRIER, PLAYER_A, 3)
+    gs_with_carrier = _game_state(
+        board,
+        [
+            _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1),
+            _ship(AxialCoord(1, 0), ShipKind.SUBMARINE, PLAYER_B, 2, surfaced=False),
+            carrier,
+        ],
+    )
+    score_with_carrier = matchup_score(gs_with_carrier.ships[1], gs_with_carrier.ships[2], gs_with_carrier)
+
+    assert score_with_carrier == score_no_carrier
+
+
 def test_nearest_enemy_picks_the_closest_and_breaks_ties_by_id():
     ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
     far = _ship(AxialCoord(5, 0), ShipKind.DESTROYER, PLAYER_B, 2)
