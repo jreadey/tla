@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from tla.ship import ShipKind, ShipStats
+from tla.tile import PLAYER_A, PLAYER_B, PlayerId
 
 DEFAULT_SHIP_STATS: dict[ShipKind, ShipStats] = {
     ShipKind.BATTLESHIP: ShipStats(movement=4, hp=12, damage=4, asw=1, cost=10),
@@ -107,6 +108,45 @@ class FowConfig:
 
 
 @dataclass
+class AiConfig:
+    """Tuning knobs for tla.ai.NaivePolicy -- see that module for how each
+    is used."""
+
+    # Retreat from an otherwise-winning battle once the attacker's own HP
+    # fraction drops below this, to avoid a follow-up ambush.
+    damaged_withdraw_fraction: float = 0.34
+    # How many orders to keep queued at each controlled port at once.
+    queue_depth: int = 1
+    # Cycled through (by turn number) to pick what a port's next order is,
+    # whenever its queue has room -- repetition IS the weighting, so
+    # cheaper/faster ships appear more often than expensive ones.
+    production_order: list[ShipKind] = field(
+        default_factory=lambda: [
+            ShipKind.PATROL_BOAT,
+            ShipKind.DESTROYER,
+            ShipKind.SUBMARINE,
+            ShipKind.CRUISER,
+            ShipKind.PATROL_BOAT,
+            ShipKind.DESTROYER,
+            ShipKind.BATTLESHIP,
+            ShipKind.CARRIER,
+        ]
+    )
+    # A carrier retreats toward its escorts once a visible enemy comes
+    # within this many hexes of it.
+    carrier_threat_radius: int = 3
+    # A battleship/carrier's chosen destination is only worth scouting
+    # ahead of (see tla.ai.policy._scout_prepass) if it's within this many
+    # hexes of a currently visible enemy -- otherwise the whole ocean would
+    # need "clearing" the instant any enemy is spotted anywhere, even far
+    # from where a capital ship is actually headed.
+    scout_trigger_radius: int = 4
+    # Seconds paced between each AI ship's move, so a human opponent can
+    # watch an AI turn unfold instead of it resolving instantly.
+    turn_pacing_seconds: float = 0.4
+
+
+@dataclass
 class Config:
     map: MapConfig = field(default_factory=MapConfig)
     ports: PortConfig = field(default_factory=PortConfig)
@@ -115,6 +155,14 @@ class Config:
     production: ProductionConfig = field(default_factory=ProductionConfig)
     combat: CombatConfig = field(default_factory=CombatConfig)
     fow: FowConfig = field(default_factory=FowConfig)
+    ai: AiConfig = field(default_factory=AiConfig)
+    # Which side each player is -- "human" (default) or "ai". Session/launch
+    # configuration (who's driving each seat), not persisted game state --
+    # see main.py's --ai flag and tla.rendering.game_view's use of this to
+    # decide when to drive tla.ai.NaivePolicy instead of waiting on input.
+    player_kinds: dict[PlayerId, str] = field(
+        default_factory=lambda: {PLAYER_A: "human", PLAYER_B: "human"}
+    )
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -131,6 +179,17 @@ def _apply_overrides(base: Config, data: dict) -> Config:
     production_cfg = replace(base.production, **data.get("production", {}))
     combat_cfg = replace(base.combat, **data.get("combat", {}))
     fow_cfg = replace(base.fow, **data.get("fow", {}))
+
+    ai_overrides = dict(data.get("ai", {}))
+    if "production_order" in ai_overrides:
+        ai_overrides["production_order"] = [
+            ShipKind(name) for name in ai_overrides["production_order"]
+        ]
+    ai_cfg = replace(base.ai, **ai_overrides)
+
+    player_kinds = dict(base.player_kinds)
+    for name, kind in data.get("player_kinds", {}).items():
+        player_kinds[{"a": PLAYER_A, "b": PLAYER_B}[name.lower()]] = kind
 
     fleet_counts = dict(base.fleet.counts)
     for name, count in data.get("fleet", {}).items():
@@ -151,4 +210,6 @@ def _apply_overrides(base: Config, data: dict) -> Config:
         production=production_cfg,
         combat=combat_cfg,
         fow=fow_cfg,
+        ai=ai_cfg,
+        player_kinds=player_kinds,
     )

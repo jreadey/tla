@@ -11,6 +11,7 @@ from pathlib import Path
 from tla.config import Config
 from tla.game_state import new_game
 from tla.rendering.app import compute_default_map_size, run
+from tla.tile import PLAYER_A, PLAYER_B
 
 
 def main() -> None:
@@ -24,9 +25,18 @@ def main() -> None:
         default=None,
         help="Fixed map generation seed, to reproduce a specific map. Omit for a random map.",
     )
+    parser.add_argument(
+        "--ai",
+        choices=("a", "b"),
+        default=None,
+        help="Play one-player against the AI: the given side is AI-controlled, the other stays human. Omit for two-human mode.",
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
+    if args.ai is not None:
+        ai_player = {"a": PLAYER_A, "b": PLAYER_B}[args.ai]
+        config = replace(config, player_kinds={**config.player_kinds, ai_player: "ai"})
 
     # Auto-fit the map to the current screen so the whole thing is visible
     # without panning, unless the chosen config file explicitly pins a map

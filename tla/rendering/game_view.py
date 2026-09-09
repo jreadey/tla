@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Iterator
 
 import arcade
 
+from tla.ai.policy import NaivePolicy
 from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
 from tla.fow import is_hidden, visible_hexes_for
@@ -32,7 +34,7 @@ from tla.rendering.hex_render import (
 )
 from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import Ship, ShipKind
-from tla.tile import PLAYER_A
+from tla.tile import PLAYER_A, PlayerId
 from tla.turn_manager import TurnManager
 
 # The six ship kinds shown, in this fixed order, as clickable glyph buttons
@@ -123,6 +125,16 @@ class GameView(arcade.View):
         self.ui_camera = arcade.Camera2D()
 
         self.turn_manager = TurnManager(game_state)
+        # AI opponent: NaivePolicy is stateless, so one instance covers
+        # whichever seat(s) game_state.config.player_kinds marks "ai" (see
+        # main.py's --ai flag). _ai_turn_iter is the in-progress
+        # plan_movement generator being drained one ship per
+        # AiConfig.turn_pacing_seconds by on_update, so a human opponent
+        # can watch the AI's turn unfold rather than it resolving
+        # instantly; None means no AI turn is currently running.
+        self.ai_policy = NaivePolicy()
+        self._ai_turn_iter: Iterator[None] | None = None
+        self._ai_pace_timer: float = 0.0
         # An in-progress drag: the ship being moved, the exact route drawn
         # so far (starting with its current hex), and a background "how far
         # could I go" hint computed once at drag-start.
@@ -171,6 +183,39 @@ class GameView(arcade.View):
 
     def on_show_view(self) -> None:
         self.window.background_color = arcade.color.BLACK
+        self._maybe_start_ai_turn()
+
+    def _maybe_start_ai_turn(self) -> None:
+        """If it's now an AI-controlled seat's movement phase, queue up its
+        production and start draining its movement turn (see
+        `_advance_ai_turn`, called from `on_update`). No-op if the current
+        player is human-controlled or the game's already over."""
+        gs = self.game_state
+        if gs.winner is not None:
+            return
+        if gs.config.player_kinds.get(gs.current_player) != "ai":
+            return
+        self.ai_policy.plan_production(gs, gs.current_player)
+        self._ai_turn_iter = self.ai_policy.plan_movement(gs, gs.current_player)
+        self._ai_pace_timer = 0.0
+
+    def _advance_ai_turn(self, delta_time: float) -> None:
+        """Drain one step of `_ai_turn_iter` every `AiConfig.turn_pacing_
+        seconds`, so a human opponent can watch the AI's turn unfold ship
+        by ship. Ends the AI's movement phase itself once the generator is
+        exhausted -- mirroring exactly what the Enter key does for a human
+        -- and immediately checks for another AI seat, covering an
+        AI-vs-AI handoff."""
+        self._ai_pace_timer += delta_time
+        pacing = self.game_state.config.ai.turn_pacing_seconds
+        while self._ai_turn_iter is not None and self._ai_pace_timer >= pacing:
+            self._ai_pace_timer -= pacing
+            try:
+                next(self._ai_turn_iter)
+            except StopIteration:
+                self._ai_turn_iter = None
+                self.turn_manager.end_movement_phase()
+                self._maybe_start_ai_turn()
 
     def on_resize(self, width: int, height: int) -> None:
         # Keep the camera's current position -- only the viewport/projection
@@ -181,6 +226,8 @@ class GameView(arcade.View):
     def on_key_press(self, symbol: int, modifiers: int) -> None:
         if self.game_state.winner is not None:
             return
+        if self._ai_turn_iter is not None:
+            return  # an AI seat's paced turn is playing out -- not the human's input to give
         if self.sunk_message is not None:
             self.sunk_message = None
             return
@@ -214,6 +261,7 @@ class GameView(arcade.View):
             self._abort_drag()
             self._close_port_panel()
             self.turn_manager.end_movement_phase()
+            self._maybe_start_ai_turn()
         elif symbol == arcade.key.T:
             self._toggle_hovered_submarine()
 
@@ -239,6 +287,8 @@ class GameView(arcade.View):
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
         if self.game_state.winner is not None:
             return
+        if self._ai_turn_iter is not None:
+            return  # an AI seat's paced turn is playing out -- not the human's input to give
         if self.sunk_message is not None:
             self.sunk_message = None
             return
@@ -465,7 +515,7 @@ class GameView(arcade.View):
         hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
         gs = self.game_state
         ship = gs.ship_at(hex_coord)
-        if ship is not None and ship.owner != gs.current_player:
+        if ship is not None and ship.owner != self._display_player():
             visible = self._visible_hexes()
             if visible is not None and not self._is_ship_visible(ship, visible):
                 ship = None  # hidden by fog of war -- no tooltip, no "T" toggle target
@@ -473,24 +523,41 @@ class GameView(arcade.View):
 
     def _is_ship_visible(self, ship: Ship, visible_hexes: set[AxialCoord]) -> bool:
         """Whether an enemy `ship` should currently be shown, given fog of
-        war is enabled (`visible_hexes` is the current player's vision).
-        The one exception to the normal fog rules (including the
+        war is enabled (`visible_hexes` is `_display_player`'s vision). The
+        one exception to the normal fog rules (including the
         submerged-submarine override -- see tla.fow.is_hidden): a ship
         currently being fought is always shown, since direct combat
         contact is the only way to spot a submerged sub in the first
         place."""
         if self.active_battle is not None and ship is self.active_battle.defender:
             return True
-        return not is_hidden(self.game_state.current_player, ship, visible_hexes)
+        return not is_hidden(self._display_player(), ship, visible_hexes)
+
+    def _display_player(self) -> PlayerId:
+        """Whose fog-of-war perspective the screen should currently show.
+        Normally whoever's turn it is (`current_player`) -- correct for
+        two-human hotseat play, where the screen always represents
+        whichever player is at the keyboard right now. But while an AI
+        seat is playing out its own turn, `current_player` is the AI, and
+        showing *its* vision would hand the watching human a free look at
+        everything the AI can see -- including ships fog of war would
+        otherwise hide from them. Whenever exactly one seat is
+        human-controlled, that seat's own vision is used instead,
+        regardless of whose turn it technically is."""
+        gs = self.game_state
+        human_players = [p for p, kind in gs.config.player_kinds.items() if kind == "human"]
+        if len(human_players) == 1:
+            return human_players[0]
+        return gs.current_player
 
     def _visible_hexes(self) -> set[AxialCoord] | None:
-        """The current player's fog-of-war vision, or None if fog of war is
+        """`_display_player`'s fog-of-war vision, or None if fog of war is
         disabled -- in which case callers should treat everything as
         visible."""
         gs = self.game_state
         if not gs.config.fow.enabled:
             return None
-        return visible_hexes_for(gs, gs.current_player)
+        return visible_hexes_for(gs, self._display_player())
 
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
         if scroll_y > 0:
@@ -515,6 +582,8 @@ class GameView(arcade.View):
         )
 
     def on_update(self, delta_time: float) -> None:
+        if self._ai_turn_iter is not None:
+            self._advance_ai_turn(delta_time)
         if not self._held_pan_keys:
             return
         move_x = sum(dx for key, (dx, _) in _PAN_KEYS.items() if key in self._held_pan_keys)
@@ -544,12 +613,15 @@ class GameView(arcade.View):
         if visible is None:
             ships_to_draw = gs.ships.values()
         else:
-            # Fog of war: your own ships are always shown; an enemy ship
-            # only if currently visible -- see _is_ship_visible for the
-            # submerged-submarine and active-battle exceptions.
+            # Fog of war: the display player's own ships are always shown
+            # (see _display_player -- normally current_player, but the
+            # watching human's own seat while an AI's turn is playing
+            # out); an enemy ship only if currently visible -- see
+            # _is_ship_visible for the submerged-submarine and
+            # active-battle exceptions.
             ships_to_draw = [
                 s for s in gs.ships.values()
-                if s.owner == gs.current_player or self._is_ship_visible(s, visible)
+                if s.owner == self._display_player() or self._is_ship_visible(s, visible)
             ]
         draw_ships(ships_to_draw, self.hex_size, current_player=gs.current_player)
 

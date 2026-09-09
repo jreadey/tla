@@ -46,12 +46,15 @@ def _base_damage(attacker_stats: ShipStats, defender: Ship) -> int:
     return attacker_stats.damage
 
 
-def _carrier_bonus(
+def carrier_bonus_for(
     game_state: GameState, attacking_ship: Ship, battle_hex: AxialCoord, combat_config: CombatConfig
 ) -> int:
     """Bonus damage for `attacking_ship`'s side from nearby friendly
     carriers -- zero outright if `attacking_ship` isn't one of the kinds
-    that benefits (see `_AC_BONUS_ELIGIBLE_KINDS`)."""
+    that benefits (see `_AC_BONUS_ELIGIBLE_KINDS`). Public so callers other
+    than `resolve_round` -- e.g. `tla.ai.scoring.matchup_score`, estimating
+    an engagement before committing to it -- can reuse the exact same
+    combat math rather than risking a duplicated, driftable copy of it."""
     if attacking_ship.kind not in _AC_BONUS_ELIGIBLE_KINDS:
         return 0
     radius = combat_config.ac_bonus_radius
@@ -83,10 +86,10 @@ def resolve_round(attacker: Ship, defender: Ship, game_state: GameState) -> Roun
     combat_config = game_state.config.combat
     battle_hex = defender.position
 
-    damage_to_defender = _base_damage(stats[attacker.kind], defender) + _carrier_bonus(
+    damage_to_defender = _base_damage(stats[attacker.kind], defender) + carrier_bonus_for(
         game_state, attacker, battle_hex, combat_config
     )
-    damage_to_attacker = _base_damage(stats[defender.kind], attacker) + _carrier_bonus(
+    damage_to_attacker = _base_damage(stats[defender.kind], attacker) + carrier_bonus_for(
         game_state, defender, battle_hex, combat_config
     )
 
