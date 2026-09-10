@@ -125,7 +125,12 @@ def move_ship(ship: Ship, destination: AxialCoord, game_state: GameState) -> Mov
     (e.g. the AI); the player-facing UI instead draws an explicit route via
     `move_ship_along_path`, since the shortest route to a hex isn't always
     the one the player meant (e.g. routing around a threat). Raises if
-    `destination` is enemy-occupied -- that's `begin_engagement`'s job."""
+    `destination` is enemy-occupied -- that's `begin_engagement`'s job.
+
+    May capture a port at `destination` (see
+    `tla.production.handle_port_capture`), exactly like
+    `move_ship_along_path` -- callers don't need to check for that
+    separately."""
     reachable = reachable_hexes(ship, game_state)
     if destination not in reachable:
         raise ValueError(f"{destination} is not reachable by ship {ship.id} this turn")
@@ -135,6 +140,7 @@ def move_ship(ship: Ship, destination: AxialCoord, game_state: GameState) -> Mov
     origin = ship.position
     ship.position = destination
     ship.movement_remaining -= cost
+    handle_port_capture(game_state, destination)
     return MoveResult(ship=ship, origin=origin, destination=destination, cost=cost)
 
 

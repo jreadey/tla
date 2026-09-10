@@ -242,6 +242,22 @@ def test_move_ship_updates_position_and_deducts_cost():
     assert ship.movement_remaining == 1
 
 
+def test_move_ship_captures_an_undefended_enemy_port():
+    # Regression: move_ship is the AI's own mover (see its docstring), and
+    # unlike move_ship_along_path it used to never call
+    # handle_port_capture -- an AI ship could sail onto an empty enemy
+    # port and simply sit there without ever taking it.
+    board = _sea_board()
+    port = AxialCoord(1, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=2, owner=PLAYER_A)
+    gs = _game_state(board, [ship])
+
+    move_ship(ship, port, gs)
+
+    assert board.tiles[port].port_display_owner == PLAYER_A
+
+
 def test_move_ship_rejects_unreachable_destination():
     board = _sea_board()
     ship = _make_ship(AxialCoord(0, 0), movement_remaining=1)

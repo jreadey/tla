@@ -33,13 +33,16 @@ _MAX_TURNS = 400
 
 
 def test_naive_policy_vs_itself_reaches_a_winner_without_raising():
-    # Seeds 2 and 6 deliberately excluded: both hit a known, accepted naive-AI
-    # limitation rather than a bug -- a ship that correctly declines a fight
-    # it can't win, with the enemy still in sight, has no fallback behavior
-    # (no healing exists to make "retreat and wait" meaningful) and just
-    # holds position indefinitely, so the game never concludes within
-    # _MAX_TURNS. See project_combat_balance memory; left as-is per the user.
-    for seed in (1, 3, 4):
+    # Seeds 2 and 6 used to hit a real naive-AI limitation: a ship that
+    # correctly declines a fight it can't win, with the enemy still in
+    # sight, had no fallback and just held position forever (no healing
+    # exists to make "retreat and wait" meaningful either). Task forces
+    # (tla.ai.task_force) fix this via stall detection -- a force notices
+    # zero progress toward its goal after AiConfig.task_force_stall_turns
+    # and reassigns instead of camping indefinitely -- so both seeds are
+    # included here now as the direct end-to-end proof that actually works,
+    # not just narrow unit tests. See project_combat_balance memory.
+    for seed in (1, 2, 3, 4, 6):
         config = _SMALL_CONFIG
         game_state = new_game(config, seed=seed)
         turn_manager = TurnManager(game_state)

@@ -82,10 +82,10 @@ def pixel_to_axial(x: float, y: float, hex_size: float) -> AxialCoord:
     """Inverse of axial_to_pixel: which hex contains pixel point (x, y)."""
     q = x / (1.5 * hex_size)
     r = y / (math.sqrt(3) * hex_size) - q / 2
-    return _round_to_axial(q, r)
+    return round_to_axial(q, r)
 
 
-def _round_to_axial(q: float, r: float) -> AxialCoord:
+def round_to_axial(q: float, r: float) -> AxialCoord:
     """Cube-round fractional axial coordinates to the nearest hex."""
     x, z = q, r
     y = -x - z

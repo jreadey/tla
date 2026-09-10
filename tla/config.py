@@ -144,6 +144,56 @@ class AiConfig:
     # Seconds paced between each AI ship's move, so a human opponent can
     # watch an AI turn unfold instead of it resolving instantly.
     turn_pacing_seconds: float = 0.4
+    # Task forces (see tla.ai.task_force) -- an AI-internal grouping of
+    # ships pursuing one shared strategic goal, never visible outside the
+    # AI itself.
+    # Max hex distance a ship can be pulled into a forming force.
+    task_force_gather_radius: int = 3
+    # Max members per force, anchor included.
+    task_force_max_size: int = 4
+    # Below this many members after casualties, a force dissolves; also
+    # the minimum size to bother forming a non-carrier-anchored force.
+    task_force_min_size: int = 2
+    task_force_allow_non_carrier_forces: bool = True
+    # Turns with no strict improvement in distance-to-goal before a force
+    # gives up on its current goal and gets reassigned a new one -- the
+    # fix for a ship/force camping forever next to a fight it can't win.
+    task_force_stall_turns: int = 8
+    # Radius (from any force member) within which enemies count as
+    # "nearby" for the is_outnumbered check.
+    task_force_threat_radius: int = 4
+    # Minimum turns a force spends retreating once outnumbered triggers,
+    # before re-checking whether it's safe to resume its goal.
+    task_force_retreat_turns: int = 4
+    # How much clearer the disadvantage must be than a bare tie before a
+    # force retreats -- 0 means retreat the instant the race would go
+    # against it, which in practice is *far* too trigger-happy (confirmed
+    # via self-play: a margin of 0 caused otherwise-winnable games to
+    # never conclude within a generous turn cap, by making forces retreat
+    # from marginal, often-recoverable disadvantages instead of pressing
+    # small, real advantages elsewhere). A higher margin requires a more
+    # decisive, unambiguous mismatch before backing off.
+    task_force_outnumbered_margin: int = 4
+    # Retreats for the same goal before it's treated as stalled (reassigned)
+    # instead of retreating yet again -- guards against a retreat/resume
+    # loop that never accumulates enough consecutive stalled turns to trip
+    # task_force_stall_turns on its own.
+    task_force_max_retreats: int = 3
+    # Below this many members, a force is "open" and actively recruits
+    # nearby unassigned ships (see tla.ai.task_force.recruit_into_open_
+    # forces) instead of them always spinning up a new, separate force.
+    # Distinct from task_force_min_size (the dissolution floor) -- a force
+    # can be open without being anywhere near dissolving.
+    task_force_target_min_size: int = 6
+    # Recruitment stops once a force reaches this many members.
+    task_force_target_max_size: int = 12
+    # How far a stray/new ship can be from an open force's centroid and
+    # still be pulled into it. Deliberately larger than
+    # task_force_gather_radius (used only at the instant a force first
+    # forms, among already-co-located ships) -- a reinforcement (e.g. a
+    # newly produced ship spawning at a home port) needs to reach a force
+    # that may already be deployed far away.
+    task_force_recruit_radius: int = 10
 
 
 @dataclass
