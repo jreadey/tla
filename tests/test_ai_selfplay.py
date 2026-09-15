@@ -50,7 +50,6 @@ def test_naive_policy_vs_itself_reaches_a_winner_without_raising():
 
         while game_state.winner is None and game_state.turn_number <= _MAX_TURNS:
             player = PLAYER_A if game_state.phase == TurnPhase.MOVE_A else PLAYER_B
-            policy.plan_production(game_state, player)
             list(policy.plan_movement(game_state, player))
             turn_manager.end_movement_phase()
 

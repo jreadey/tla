@@ -1,7 +1,10 @@
-"""Automatic, per-port production: each port keeps its own build queue and
-independently earns `ProductionConfig.points_per_turn` points every turn --
-not a shared budget split across ports, so a player's total production
-scales with how many ports they control."""
+"""Automatic, per-port production: each port independently earns
+`ProductionConfig.points_per_turn` points every turn -- not a shared budget
+split across ports, so a player's total production scales with how many
+ports they control -- and automatically builds from the same fixed,
+shared `ProductionConfig.build_order` sequence. There is no player choice
+of what to build, for either side: this keeps both players' fleets on
+comparable footing regardless of who's making the moment-to-moment calls."""
 
 from __future__ import annotations
 
@@ -9,14 +12,6 @@ from tla.game_state import GameState, PortProduction
 from tla.hexgrid import AxialCoord
 from tla.ship import Ship, ShipKind
 from tla.tile import PlayerId
-
-
-def order(game_state: GameState, player: PlayerId, port: AxialCoord, kind: ShipKind) -> None:
-    """Queue one `kind` at `port` -- unlimited, no cost check up front. It's
-    paid for gradually by run_production, whenever it reaches the front of
-    that port's own queue."""
-    progress = game_state.players[player].port_production.setdefault(port, PortProduction())
-    progress.orders.append(kind)
 
 
 def handle_port_capture(game_state: GameState, coord: AxialCoord) -> None:
@@ -63,15 +58,18 @@ def run_production(game_state: GameState, player: PlayerId) -> None:
     `ProductionConfig.points_per_turn` points independently -- controlling
     more ports means more total production, not a thinner split of a fixed
     budget. A port occupied by either side's ship earns nothing this turn.
-    Points bank even at a port with nothing queued, ready the moment an
-    order arrives; a port with an order spawns a ship as soon as its banked
-    points cover the cost of the order at the front of its queue -- one
-    spawn per port per turn (the hex becomes occupied) -- and any leftover
-    carries toward its next order."""
+    Once its banked points cover the cost of whatever `build_order` kind
+    its own progress is currently on, it spawns that ship -- one spawn per
+    port per turn (the hex becomes occupied) -- carries any leftover points
+    toward the next kind, and advances to the next position in the
+    sequence, wrapping back to the start once it runs off the end."""
     player_state = game_state.players[player]
     progress = player_state.port_production
     stats = game_state.config.ship_stats.stats
     points_per_turn = game_state.config.production.points_per_turn
+    build_order = game_state.config.production.build_order
+    if not build_order:
+        return
 
     active_ports = [
         p for p in game_state.board.controlled_ports_for(player) if game_state.ship_at(p) is None
@@ -79,13 +77,11 @@ def run_production(game_state: GameState, player: PlayerId) -> None:
     for port in active_ports:
         state = progress.setdefault(port, PortProduction())
         state.points += points_per_turn
-        if not state.orders:
-            continue
-        kind = state.orders[0]
+        kind = build_order[state.next_index % len(build_order)]
         if state.points >= stats[kind].cost:
             state.points -= stats[kind].cost
             _spawn_ship(game_state, player, port, kind)
-            state.orders.pop(0)
+            state.next_index += 1
 
 
 def _spawn_ship(game_state: GameState, player: PlayerId, port: AxialCoord, kind: ShipKind) -> None:

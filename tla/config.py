@@ -85,6 +85,21 @@ class ProductionConfig:
     # shared budget split across ports, so a player's total production
     # scales with how many ports they control.
     points_per_turn: int = 5
+    # Every port -- either player's, human or AI -- automatically builds
+    # from this same fixed sequence, repeating once it reaches the end;
+    # there is no player choice of what to build (see tla.production).
+    # A captured port's progress through the sequence resets to the start
+    # for its new controller (see tla.production.handle_port_capture).
+    build_order: list[ShipKind] = field(
+        default_factory=lambda: [
+            ShipKind.BATTLESHIP,
+            ShipKind.CARRIER,
+            ShipKind.CRUISER,
+            ShipKind.DESTROYER,
+            ShipKind.SUBMARINE,
+            ShipKind.PATROL_BOAT,
+        ]
+    )
 
 
 @dataclass
@@ -115,23 +130,6 @@ class AiConfig:
     # Retreat from an otherwise-winning battle once the attacker's own HP
     # fraction drops below this, to avoid a follow-up ambush.
     damaged_withdraw_fraction: float = 0.34
-    # How many orders to keep queued at each controlled port at once.
-    queue_depth: int = 1
-    # Cycled through (by turn number) to pick what a port's next order is,
-    # whenever its queue has room -- repetition IS the weighting, so
-    # cheaper/faster ships appear more often than expensive ones.
-    production_order: list[ShipKind] = field(
-        default_factory=lambda: [
-            ShipKind.PATROL_BOAT,
-            ShipKind.DESTROYER,
-            ShipKind.SUBMARINE,
-            ShipKind.CRUISER,
-            ShipKind.PATROL_BOAT,
-            ShipKind.DESTROYER,
-            ShipKind.BATTLESHIP,
-            ShipKind.CARRIER,
-        ]
-    )
     # A carrier retreats toward its escorts once a visible enemy comes
     # within this many hexes of it.
     carrier_threat_radius: int = 3
@@ -141,6 +139,14 @@ class AiConfig:
     # need "clearing" the instant any enemy is spotted anywhere, even far
     # from where a capital ship is actually headed.
     scout_trigger_radius: int = 4
+    # A capital ship held so its escort can scout ahead (see
+    # tla.ai.policy._scout_prepass) can be held for at most this many turns
+    # in a row -- past that it proceeds with its own chosen destination
+    # regardless, accepting a bounded ambush risk rather than potentially
+    # freezing in place indefinitely if an escort keeps being available
+    # turn after turn without the hold ever actually resolving into the
+    # capital ship completing its own move.
+    max_consecutive_scout_holds: int = 2
     # Seconds paced between each AI ship's move, so a human opponent can
     # watch an AI turn unfold instead of it resolving instantly.
     turn_pacing_seconds: float = 0.4
@@ -149,7 +155,12 @@ class AiConfig:
     # AI itself.
     # Max hex distance a ship can be pulled into a forming force.
     task_force_gather_radius: int = 3
-    # Max members per force, anchor included.
+    # Cap on a force's size at the instant it *first forms* (anchor
+    # included) -- not how big it can ever grow. A force seeded this small
+    # then grows toward task_force_target_max_size afterward, turn by
+    # turn, via recruit_into_open_forces -- deliberately kept separate
+    # (rather than just raising this instead) so a force never forms
+    # already-huge in one shot, only builds up to that size gradually.
     task_force_max_size: int = 4
     # Below this many members after casualties, a force dissolves; also
     # the minimum size to bother forming a non-carrier-anchored force.
@@ -159,12 +170,22 @@ class AiConfig:
     # gives up on its current goal and gets reassigned a new one -- the
     # fix for a ship/force camping forever next to a fight it can't win.
     task_force_stall_turns: int = 8
+    # Consecutive turns a force can lose a member while also making no
+    # progress toward its goal (see is_attritting) before that alone
+    # triggers a retreat, same as is_outnumbered would -- an enemy
+    # reinforcing piecemeal can keep a fight looking "close" turn after
+    # turn without ever presenting one clearly-superior force at a single
+    # instant, so a force can bleed to death in a stalled fight that
+    # is_outnumbered's own instantaneous group-power check never flags.
+    # (Lowering task_force_stall_turns instead -- reassign sooner rather
+    # than retreat sooner -- was tried first and reverted: self-play
+    # showed forces abandoning goals before they had a real chance to
+    # succeed, stalling otherwise-winnable games. This is the version of
+    # the fix that held up under the same 20-seed sweep.)
+    task_force_attrition_turns: int = 3
     # Radius (from any force member) within which enemies count as
     # "nearby" for the is_outnumbered check.
     task_force_threat_radius: int = 4
-    # Minimum turns a force spends retreating once outnumbered triggers,
-    # before re-checking whether it's safe to resume its goal.
-    task_force_retreat_turns: int = 4
     # How much clearer the disadvantage must be than a bare tie before a
     # force retreats -- 0 means retreat the instant the race would go
     # against it, which in practice is *far* too trigger-happy (confirmed
@@ -172,21 +193,33 @@ class AiConfig:
     # never conclude within a generous turn cap, by making forces retreat
     # from marginal, often-recoverable disadvantages instead of pressing
     # small, real advantages elsewhere). A higher margin requires a more
-    # decisive, unambiguous mismatch before backing off.
+    # decisive, unambiguous mismatch before backing off. Also the margin
+    # used to decide when a *retreating* force has recruited enough to
+    # safely resume -- see task_force_max_retreat_turns.
     task_force_outnumbered_margin: int = 4
-    # Retreats for the same goal before it's treated as stalled (reassigned)
-    # instead of retreating yet again -- guards against a retreat/resume
-    # loop that never accumulates enough consecutive stalled turns to trip
-    # task_force_stall_turns on its own.
-    task_force_max_retreats: int = 3
+    # A retreating force keeps retreating toward its rally port -- absorbing
+    # nearby unassigned ships via recruit_into_open_forces the same as any
+    # other open force -- until its own current strength clearly outmatches
+    # (by task_force_outnumbered_margin) whatever it retreated from, not for
+    # a fixed number of turns; home isn't safety in itself, it's just where
+    # new production shows up to actually change the balance. This caps how
+    # long ONE continuous retreat is allowed to chase that condition before
+    # giving up instead -- reassigning the goal exactly like a stall does --
+    # in case the opponent is reinforcing just as fast and the force would
+    # otherwise never catch up. Generous relative to task_force_stall_turns
+    # (8) and task_force_attrition_turns (3) since the whole point here is
+    # giving real production time to matter.
+    task_force_max_retreat_turns: int = 15
     # Below this many members, a force is "open" and actively recruits
     # nearby unassigned ships (see tla.ai.task_force.recruit_into_open_
     # forces) instead of them always spinning up a new, separate force.
     # Distinct from task_force_min_size (the dissolution floor) -- a force
     # can be open without being anywhere near dissolving.
-    task_force_target_min_size: int = 6
-    # Recruitment stops once a force reaches this many members.
-    task_force_target_max_size: int = 12
+    task_force_target_min_size: int = 12
+    # Recruitment stops once a force reaches this many members -- the real
+    # ceiling on how big a force ever gets, as opposed to task_force_max_
+    # size (only the cap at the moment a force first forms).
+    task_force_target_max_size: int = 20
     # How far a stray/new ship can be from an open force's centroid and
     # still be pulled into it. Deliberately larger than
     # task_force_gather_radius (used only at the instant a force first
@@ -226,16 +259,17 @@ class Config:
 def _apply_overrides(base: Config, data: dict) -> Config:
     map_cfg = replace(base.map, **data.get("map", {}))
     ports_cfg = replace(base.ports, **data.get("ports", {}))
-    production_cfg = replace(base.production, **data.get("production", {}))
+
+    production_overrides = dict(data.get("production", {}))
+    if "build_order" in production_overrides:
+        production_overrides["build_order"] = [
+            ShipKind(name) for name in production_overrides["build_order"]
+        ]
+    production_cfg = replace(base.production, **production_overrides)
+
     combat_cfg = replace(base.combat, **data.get("combat", {}))
     fow_cfg = replace(base.fow, **data.get("fow", {}))
-
-    ai_overrides = dict(data.get("ai", {}))
-    if "production_order" in ai_overrides:
-        ai_overrides["production_order"] = [
-            ShipKind(name) for name in ai_overrides["production_order"]
-        ]
-    ai_cfg = replace(base.ai, **ai_overrides)
+    ai_cfg = replace(base.ai, **data.get("ai", {}))
 
     player_kinds = dict(base.player_kinds)
     for name, kind in data.get("player_kinds", {}).items():

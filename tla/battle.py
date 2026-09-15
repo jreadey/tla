@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from tla.config import CombatConfig
-from tla.game_state import GameState
+from tla.game_state import BattleLogEntry, GameState
 from tla.hexgrid import AxialCoord, distance
 from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
@@ -98,12 +98,10 @@ def resolve_round(attacker: Ship, defender: Ship, game_state: GameState) -> Roun
     combat_config = game_state.config.combat
     battle_hex = defender.position
 
-    damage_to_defender = _base_damage(stats[attacker.kind], defender) + carrier_bonus_for(
-        game_state, attacker, defender, battle_hex, combat_config
-    )
-    damage_to_attacker = _base_damage(stats[defender.kind], attacker) + carrier_bonus_for(
-        game_state, defender, attacker, battle_hex, combat_config
-    )
+    attacker_bonus = carrier_bonus_for(game_state, attacker, defender, battle_hex, combat_config)
+    defender_bonus = carrier_bonus_for(game_state, defender, attacker, battle_hex, combat_config)
+    damage_to_defender = _base_damage(stats[attacker.kind], defender) + attacker_bonus
+    damage_to_attacker = _base_damage(stats[defender.kind], attacker) + defender_bonus
 
     defender.current_hp = max(0, defender.current_hp - damage_to_defender)
     attacker.current_hp = max(0, attacker.current_hp - damage_to_attacker)
@@ -117,6 +115,31 @@ def resolve_round(attacker: Ship, defender: Ship, game_state: GameState) -> Roun
     defender_stats = game_state.turn_stats[defender.owner]
     defender_stats.hp_dealt += damage_to_attacker
     defender_stats.hp_taken += damage_to_defender
+
+    # Recorded for post-game replay review (see GameState.battle_log and
+    # tla.replay) -- the carrier-bonus components are kept separate from
+    # the combined damage above so a reader can compute exact assist
+    # totals instead of estimating them from ship positions after the
+    # fact.
+    game_state.battle_log.append(
+        BattleLogEntry(
+            attacker_id=attacker.id,
+            attacker_kind=attacker.kind,
+            attacker_owner=attacker.owner,
+            defender_id=defender.id,
+            defender_kind=defender.kind,
+            defender_owner=defender.owner,
+            battle_hex=battle_hex,
+            damage_to_defender=damage_to_defender,
+            damage_to_attacker=damage_to_attacker,
+            attacker_carrier_bonus=attacker_bonus,
+            defender_carrier_bonus=defender_bonus,
+            defender_hp_after=defender.current_hp,
+            attacker_hp_after=attacker.current_hp,
+            defender_sunk=defender.is_sunk,
+            attacker_sunk=attacker.is_sunk,
+        )
+    )
 
     return RoundResult(
         damage_to_defender=damage_to_defender,

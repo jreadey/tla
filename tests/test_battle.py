@@ -331,3 +331,77 @@ def test_run_battle_never_asks_before_the_first_round():
 
     run_battle(attacker, defender, gs, decision_fn=decision_fn)
     assert len(calls) == 1  # asked only after the (only) round that occurred
+
+
+def test_resolve_round_appends_a_battle_log_entry():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_B, 2)
+    gs = _game_state(board, [attacker, defender])
+    destroyer_damage = Config().ship_stats.stats[ShipKind.DESTROYER].damage
+    cruiser_damage = Config().ship_stats.stats[ShipKind.CRUISER].damage
+
+    resolve_round(attacker, defender, gs)
+
+    assert len(gs.battle_log) == 1
+    entry = gs.battle_log[0]
+    assert entry.attacker_id == 1
+    assert entry.attacker_kind == ShipKind.DESTROYER
+    assert entry.attacker_owner == PLAYER_A
+    assert entry.defender_id == 2
+    assert entry.defender_kind == ShipKind.CRUISER
+    assert entry.defender_owner == PLAYER_B
+    assert entry.battle_hex == AxialCoord(1, 0)
+    assert entry.damage_to_defender == destroyer_damage
+    assert entry.damage_to_attacker == cruiser_damage
+    assert entry.attacker_carrier_bonus == 0
+    assert entry.defender_carrier_bonus == 0
+    assert entry.defender_hp_after == defender.current_hp
+    assert entry.attacker_hp_after == attacker.current_hp
+    assert entry.defender_sunk is False
+    assert entry.attacker_sunk is False
+
+
+def test_resolve_round_battle_log_entry_breaks_out_carrier_bonus_per_side():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+    attacker_carrier = _ship(AxialCoord(0, 1), ShipKind.CARRIER, PLAYER_A, 3)
+    defender_carrier = _ship(AxialCoord(1, 1), ShipKind.CARRIER, PLAYER_B, 4)
+    gs = _game_state(board, [attacker, defender, attacker_carrier, defender_carrier])
+
+    resolve_round(attacker, defender, gs)
+
+    entry = gs.battle_log[0]
+    assert entry.attacker_carrier_bonus == 1
+    assert entry.defender_carrier_bonus == 1
+    base_damage = Config().ship_stats.stats[ShipKind.DESTROYER].damage
+    assert entry.damage_to_defender == base_damage + 1
+    assert entry.damage_to_attacker == base_damage + 1
+
+
+def test_resolve_round_battle_log_accumulates_across_multiple_rounds():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1, hp=100)
+    defender = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2, hp=100)
+    gs = _game_state(board, [attacker, defender])
+
+    resolve_round(attacker, defender, gs)
+    resolve_round(attacker, defender, gs)
+
+    assert len(gs.battle_log) == 2
+    assert all(e.attacker_id == 1 and e.defender_id == 2 for e in gs.battle_log)
+
+
+def test_resolve_round_battle_log_entry_reflects_a_kill():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2, hp=2)
+    gs = _game_state(board, [attacker, defender])
+
+    resolve_round(attacker, defender, gs)
+
+    entry = gs.battle_log[0]
+    assert entry.defender_sunk is True
+    assert entry.attacker_sunk is False
+    assert entry.defender_hp_after == 0

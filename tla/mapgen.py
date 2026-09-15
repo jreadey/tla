@@ -14,7 +14,7 @@ import random
 
 from tla.board import Board
 from tla.config import MapConfig, PortConfig
-from tla.elevation import ElevationGrid, build_elevation_grid
+from tla.elevation import ElevationGrid, Point, Segment, build_elevation_grid
 from tla.hexgrid import AxialCoord, axial_to_pixel, distance, neighbors, offset_to_axial, pixel_to_axial
 from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
 
@@ -87,6 +87,62 @@ def generate_map(
 def _classify(values: list[float], land_area_threshold: float) -> TerrainType:
     land_fraction = sum(1 for v in values if v > 0) / len(values)
     return TerrainType.LAND if land_fraction > land_area_threshold else TerrainType.SEA
+
+
+def filter_islet_contours(segments: list[Segment], board: Board) -> list[Segment]:
+    """Drop closed coastline loops that don't correspond to any actual LAND
+    hex -- pure visual clutter, not real geography.
+
+    The elevation raster (see tla.elevation) is sampled far finer than a
+    hex, and a hex only classifies as LAND once more than
+    `MapConfig.land_area_threshold` of its own samples are above sea
+    level (see `_classify`). An isolated noise bump can cross sea level
+    locally -- drawing a tiny closed contour ring in open water -- without
+    ever pushing any hex there over that threshold. Real coastline is
+    unaffected: an open path (one that reaches the raster's outer
+    boundary, meaning the landmass continues past the generated bounds)
+    is always kept, and a genuine island's loop reliably touches at least
+    one LAND hex somewhere along its length even if a threshold-adjacent
+    edge hex or two along the same loop doesn't.
+    """
+    if not segments:
+        return segments
+    hex_size = board.hex_pixel_size
+
+    adjacency: dict[Point, list[int]] = {}
+    for i, (p1, p2) in enumerate(segments):
+        adjacency.setdefault(p1, []).append(i)
+        adjacency.setdefault(p2, []).append(i)
+
+    visited: set[int] = set()
+    kept: list[Segment] = []
+
+    for start in range(len(segments)):
+        if start in visited:
+            continue
+        component: set[int] = set()
+        stack = [start]
+        while stack:
+            idx = stack.pop()
+            if idx in component:
+                continue
+            component.add(idx)
+            for point in segments[idx]:
+                component_neighbors = adjacency[point]
+                stack.extend(other for other in component_neighbors if other not in component)
+        visited |= component
+
+        points = [p for idx in component for p in segments[idx]]
+        is_closed_loop = all(len(adjacency[p]) == 2 for p in points)
+        touches_land = any(
+            (tile := board.tiles.get(pixel_to_axial(x, y, hex_size))) is not None
+            and tile.terrain == TerrainType.LAND
+            for x, y in points
+        )
+        if not is_closed_loop or touches_land:
+            kept.extend(segments[idx] for idx in component)
+
+    return kept
 
 
 def largest_sea_component(board: Board) -> set[AxialCoord]:

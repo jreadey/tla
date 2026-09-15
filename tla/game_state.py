@@ -23,13 +23,16 @@ class TurnPhase(Enum):
 
 @dataclass
 class PortProduction:
-    """One port's own build queue and the points banked toward the order at
-    its front. Points persist even while the port is occupied by a friendly
-    ship and can't spawn -- see tla.production.run_production -- but the
-    entire queue is wiped the instant an enemy ship occupies the port; see
-    tla.production.handle_port_capture."""
+    """One port's own progress through `ProductionConfig.build_order` (its
+    position in that fixed, shared sequence -- there is no player choice of
+    what to build, see tla.production) and the points banked toward the
+    kind currently at that position. Points persist even while the port is
+    occupied by a friendly ship and can't spawn -- see
+    tla.production.run_production -- but both are wiped the instant an
+    enemy ship occupies the port, resetting the sequence to the start for
+    whoever controls it next; see tla.production.handle_port_capture."""
 
-    orders: list[ShipKind] = field(default_factory=list)
+    next_index: int = 0
     points: int = 0
 
 
@@ -57,6 +60,51 @@ class TurnStats:
 
 
 @dataclass
+class BattleLogEntry:
+    """One resolved combat round -- appended by `tla.battle.resolve_round`,
+    the single chokepoint both the AI's synchronous `run_battle` loop and
+    the human UI's manual round-by-round driving
+    (`tla.rendering.game_view._resolve_battle_round`) already go through,
+    so this is a complete, per-round record of every exchange regardless of
+    who's playing. Lives here rather than in `tla.battle` for the same
+    reason `TurnStats` does: `tla.battle` imports `GameState` from this
+    module, so a type it populates can't also be defined there without a
+    circular import.
+
+    One entry per *round*, not per battle -- grouping consecutive entries
+    that share the same `attacker_id`/`defender_id` into one printed
+    "battle" is left to a reader (see `replay_viewer.py`), not tracked
+    here with an explicit id.
+
+    Unlike `TurnStats` (deliberately cumulative across both halves of a
+    turn, reset once after `move_b`), this is cleared at the start of
+    *every* half-turn (see `tla.turn_manager.TurnManager.
+    end_movement_phase`) -- half-turn granularity is what following a
+    specific battle actually needs, and a turn-cumulative list would just
+    force every consumer to de-duplicate what it already saw last record."""
+
+    attacker_id: int
+    attacker_kind: ShipKind
+    attacker_owner: PlayerId
+    defender_id: int
+    defender_kind: ShipKind
+    defender_owner: PlayerId
+    battle_hex: AxialCoord
+    damage_to_defender: int
+    damage_to_attacker: int
+    # The carrier-bonus component of each side's damage above, broken out
+    # -- see `tla.battle.carrier_bonus_for` -- so a reader can compute
+    # exact carrier-assist totals instead of estimating them from ship
+    # positions after the fact.
+    attacker_carrier_bonus: int
+    defender_carrier_bonus: int
+    defender_hp_after: int
+    attacker_hp_after: int
+    defender_sunk: bool
+    attacker_sunk: bool
+
+
+@dataclass
 class GameState:
     config: Config
     board: Board
@@ -72,6 +120,10 @@ class GameState:
     turn_stats: dict[PlayerId, TurnStats] = field(
         default_factory=lambda: {PLAYER_A: TurnStats(), PLAYER_B: TurnStats()}
     )
+    # Every combat round resolved since the current half-turn began -- see
+    # BattleLogEntry for why this has a different (shorter) lifecycle than
+    # turn_stats above, despite both being populated by tla.battle.
+    battle_log: list[BattleLogEntry] = field(default_factory=list)
     # Whoever controlled every port on the map as of the most recent full
     # turn boundary -- None if no single player did. See
     # tla.win_condition.advance_port_control_claim: total port control

@@ -31,6 +31,13 @@ def main() -> None:
         default=None,
         help="Play one-player against the AI: the given side is AI-controlled, the other stays human. Omit for two-human mode.",
     )
+    parser.add_argument(
+        "--replay",
+        type=str,
+        default=None,
+        help="Write a post-game replay log (JSON Lines) to this path as the game is played. "
+        "Omit for no replay logging. See replay_viewer.py to review one afterward.",
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
@@ -57,7 +64,7 @@ def main() -> None:
     print(f"Map size: {config.map.width}x{config.map.height} hexes (fit to your screen)")
 
     game_state = new_game(config, seed)
-    run(game_state)
+    run(game_state, replay_path=args.replay, seed=seed)
 
 
 if __name__ == "__main__":

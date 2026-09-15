@@ -1,7 +1,8 @@
+from tla.board import Board
 from tla.config import Config, MapConfig, PortConfig
-from tla.hexgrid import axial_to_offset, distance, neighbors
-from tla.mapgen import largest_sea_component, generate_map
-from tla.tile import PLAYER_A, PLAYER_B, TerrainType
+from tla.hexgrid import AxialCoord, axial_to_offset, axial_to_pixel, distance, neighbors
+from tla.mapgen import filter_islet_contours, largest_sea_component, generate_map
+from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
 
 
 def _small_configs(seed_map_seed=None):
@@ -94,6 +95,68 @@ def test_ports_border_the_main_sea_not_an_isolated_pond():
                 assert any(n in main_sea for n in neighbors(port)), (
                     f"seed={seed} port={port} does not border the main sea"
                 )
+
+
+_HEX_SIZE = 18.0
+
+
+def _small_square_loop(center: tuple[float, float]) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """A tiny closed 4-segment loop of points all well within one hex around
+    `center`, matching what an isolated noise bump would draw."""
+    cx, cy = center
+    a, b, c, d = (cx - 0.5, cy - 0.5), (cx + 0.5, cy - 0.5), (cx + 0.5, cy + 0.5), (cx - 0.5, cy + 0.5)
+    return [(a, b), (b, c), (c, d), (d, a)]
+
+
+def _board_with(coord_terrains: dict[AxialCoord, TerrainType]) -> Board:
+    board = Board(width=10, height=10, hex_pixel_size=_HEX_SIZE)
+    for coord, terrain in coord_terrains.items():
+        board.tiles[coord] = Tile(coord=coord, terrain=terrain)
+    return board
+
+
+def test_filter_islet_contours_drops_a_closed_loop_over_sea_only():
+    sea_coord = AxialCoord(0, 0)
+    board = _board_with({sea_coord: TerrainType.SEA})
+    segments = _small_square_loop(axial_to_pixel(sea_coord, _HEX_SIZE))
+
+    assert filter_islet_contours(segments, board) == []
+
+
+def test_filter_islet_contours_keeps_a_closed_loop_touching_land():
+    land_coord = AxialCoord(3, 3)
+    board = _board_with({land_coord: TerrainType.LAND})
+    segments = _small_square_loop(axial_to_pixel(land_coord, _HEX_SIZE))
+
+    kept = filter_islet_contours(segments, board)
+
+    assert sorted(kept) == sorted(segments)
+
+
+def test_filter_islet_contours_always_keeps_an_open_path():
+    # A path with an unshared (degree-1) endpoint represents a coastline
+    # that reaches the raster's outer boundary and continues past the
+    # generated bounds -- always real geography, regardless of the hexes
+    # its points happen to fall in.
+    sea_coord = AxialCoord(0, 0)
+    board = _board_with({sea_coord: TerrainType.SEA})
+    cx, cy = axial_to_pixel(sea_coord, _HEX_SIZE)
+    p1, p2, p3 = (cx - 0.5, cy), (cx, cy), (cx + 0.5, cy)
+    segments = [(p1, p2), (p2, p3)]
+
+    assert filter_islet_contours(segments, board) == segments
+
+
+def test_filter_islet_contours_treats_independent_loops_separately():
+    sea_coord = AxialCoord(0, 0)
+    land_coord = AxialCoord(3, 3)
+    board = _board_with({sea_coord: TerrainType.SEA, land_coord: TerrainType.LAND})
+    islet = _small_square_loop(axial_to_pixel(sea_coord, _HEX_SIZE))
+    real_island = _small_square_loop(axial_to_pixel(land_coord, _HEX_SIZE))
+
+    kept = filter_islet_contours(islet + real_island, board)
+
+    assert sorted(kept) == sorted(real_island)
 
 
 def test_port_tiles_are_occupiable_but_other_land_is_not():

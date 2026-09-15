@@ -10,6 +10,7 @@ import arcade
 from tla.ai.policy import NaivePolicy
 from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
+from tla.mapgen import filter_islet_contours
 from tla.fow import is_hidden, visible_hexes_for
 from tla.game_state import GameState, TurnPhase
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
@@ -20,7 +21,7 @@ from tla.movement import (
     toggle_submarine_state,
     validate_path,
 )
-from tla.production import order
+from tla.replay import ReplayWriter
 from tla.rendering.hex_render import (
     PATH_HIGHLIGHT_COLOR,
     PATH_LINE_COLOR,
@@ -37,25 +38,15 @@ from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, PlayerId
 from tla.turn_manager import TurnManager
 
-# The six ship kinds shown, in this fixed order, as clickable glyph buttons
-# in a port's production panel.
-_PORT_PANEL_KINDS = [
-    ShipKind.BATTLESHIP,
-    ShipKind.CARRIER,
-    ShipKind.CRUISER,
-    ShipKind.DESTROYER,
-    ShipKind.SUBMARINE,
-    ShipKind.PATROL_BOAT,
-]
 PORT_PANEL_BG_COLOR = (25, 25, 25, 235)
 PORT_PANEL_ICON_BOX = 84.0
 PORT_PANEL_ICON_HEX_SIZE = 32.0
 PORT_PANEL_MARGIN = 14.0
 PORT_PANEL_ICON_ROW_HEIGHT = 92.0
 PORT_PANEL_HEADER_HEIGHT = 44.0
-# Wide enough for the longest title ("Choose a ship to order" at this font
-# size measures ~182px) plus margins, so the title never overflows the
-# panel when there's only 1-2 icon slots (an empty or near-empty queue).
+# The panel is always exactly one glyph wide (a port's build-in-progress is
+# a single, automatic, non-interactive value -- see tla.production) --
+# this just keeps the title ("Port Production") from feeling cramped.
 PORT_PANEL_MIN_WIDTH = 230.0
 
 
@@ -142,17 +133,27 @@ GAME_OVER_TEXT_COLOR = arcade.color.WHITE
 
 
 class GameView(arcade.View):
-    def __init__(self, game_state: GameState, hex_size: float | None = None) -> None:
+    def __init__(
+        self,
+        game_state: GameState,
+        hex_size: float | None = None,
+        *,
+        replay_path: str | None = None,
+        seed: int | None = None,
+    ) -> None:
         super().__init__()
         self.game_state = game_state
         board = game_state.board
         self.hex_size = hex_size if hex_size is not None else board.hex_pixel_size
 
         self.contour_segments = (
-            marching_squares_segments(board.elevation) if board.elevation else []
+            filter_islet_contours(marching_squares_segments(board.elevation), board)
+            if board.elevation
+            else []
         )
 
         min_x, min_y, max_x, max_y = board_pixel_bounds(board, self.hex_size)
+        self._board_pixel_bounds = (min_x, min_y, max_x, max_y)
         self.camera = arcade.Camera2D(position=((min_x + max_x) / 2, (min_y + max_y) / 2))
         # Screen-space camera for the hover tooltip -- fixed 1:1 with window
         # pixels regardless of the world camera's pan/zoom.
@@ -169,6 +170,14 @@ class GameView(arcade.View):
         self.ai_policy = NaivePolicy()
         self._ai_turn_iter: Iterator[None] | None = None
         self._ai_pace_timer: float = 0.0
+        # Post-game replay logging (see tla.replay) -- None unless
+        # --replay was passed, in which case every half-turn boundary and
+        # the game's end get appended to it (see _end_movement_phase and
+        # on_draw).
+        self.replay_writer: ReplayWriter | None = None
+        if replay_path is not None:
+            self.replay_writer = ReplayWriter(replay_path)
+            self.replay_writer.write_initial(game_state, seed=seed)
         # An in-progress drag: the ship being moved, the exact route drawn
         # so far (starting with its current hex), and a background "how far
         # could I go" hint computed once at drag-start.
@@ -197,13 +206,13 @@ class GameView(arcade.View):
         # what's "new") can differ per player. See _update_spotted_ships.
         self._known_enemy_ship_ids: dict[PlayerId, set[int]] = {}
         self._spotted_toasts: list[SpottedToast] = []
-        # The empty friendly port currently showing its production panel,
-        # if any -- opened by clicking it, closed by clicking elsewhere,
-        # Escape, or ending movement.
+        # The empty friendly port currently showing its (read-only) production
+        # panel, if any -- opened by clicking it, closed by clicking
+        # elsewhere, Escape, or ending movement. There is nothing to choose
+        # here: every port automatically builds from the same fixed
+        # `ProductionConfig.build_order` (see tla.production) -- this just
+        # shows what it's currently building and its banked points.
         self.selected_port: AxialCoord | None = None
-        # Within an open port panel: False shows the queue + an "Order"
-        # button, True shows the six ship-kind glyphs to pick from.
-        self._port_panel_picking = False
 
         self._held_pan_keys: set[int] = set()
         self._dragging = False
@@ -223,13 +232,7 @@ class GameView(arcade.View):
             "", 0, 0, GAME_OVER_TEXT_COLOR, 36, anchor_x="center", bold=True
         )
         self._port_panel_title_text = arcade.Text("", 0, 0, arcade.color.WHITE, 13)
-        self._port_panel_cost_texts = [
-            arcade.Text("", 0, 0, arcade.color.WHITE, 11, anchor_x="center") for _ in range(6)
-        ]
-        self._port_panel_order_text = arcade.Text(
-            "+", 0, 0, arcade.color.WHITE, 20, anchor_x="center", anchor_y="center"
-        )
-        self._port_panel_hover_text = arcade.Text(
+        self._port_panel_caption_text = arcade.Text(
             "", 0, 0, arcade.color.WHITE, 12, anchor_x="center"
         )
         self._sub_contact_text = arcade.Text(
@@ -258,16 +261,17 @@ class GameView(arcade.View):
         self._maybe_start_ai_turn()
 
     def _maybe_start_ai_turn(self) -> None:
-        """If it's now an AI-controlled seat's movement phase, queue up its
-        production and start draining its movement turn (see
-        `_advance_ai_turn`, called from `on_update`). No-op if the current
-        player is human-controlled or the game's already over."""
+        """If it's now an AI-controlled seat's movement phase, start
+        draining its movement turn (see `_advance_ai_turn`, called from
+        `on_update`). No-op if the current player is human-controlled or
+        the game's already over. Production needs no AI decision at all --
+        every port, either side, automatically builds from the same fixed
+        `ProductionConfig.build_order` (see `tla.production`)."""
         gs = self.game_state
         if gs.winner is not None:
             return
         if gs.config.player_kinds.get(gs.current_player) != "ai":
             return
-        self.ai_policy.plan_production(gs, gs.current_player)
         self._ai_turn_iter = self.ai_policy.plan_movement(gs, gs.current_player)
         self._ai_pace_timer = 0.0
 
@@ -315,6 +319,18 @@ class GameView(arcade.View):
         dismissed, so the report still has the turn's real numbers to
         read. Ending the first mover's (MOVE_A) phase has nothing to
         report yet and proceeds immediately, as before."""
+        if self.replay_writer is not None:
+            # Recorded here, before either branch below runs, so phase/
+            # current_player/turn_stats still reflect the half-turn that
+            # just finished -- the MOVE_B branch doesn't mutate game_state
+            # itself (it only defers to _dismiss_turn_report), so this is
+            # correct and sufficient for both branches.
+            self.replay_writer.write_half_turn(
+                self.game_state,
+                phase=self.game_state.phase,
+                player=self.game_state.current_player,
+                task_forces=self.ai_policy.task_forces_for(PLAYER_A) + self.ai_policy.task_forces_for(PLAYER_B),
+            )
         if self.game_state.phase == TurnPhase.MOVE_B:
             self.pending_turn_report = True
             return
@@ -331,6 +347,29 @@ class GameView(arcade.View):
         # need to match the new window size, so panning isn't reset.
         self.camera.match_window(position=False)
         self.ui_camera.match_window(position=True)
+        self._grow_zoom_to_fill_window(width, height)
+
+    def _grow_zoom_to_fill_window(self, width: int, height: int) -> None:
+        """If the window has grown past the map's natural size at the
+        current zoom, zoom in just enough that the map keeps filling the
+        frame -- otherwise a bigger window just reveals more blank canvas
+        around the same content, and the player has to zoom/pan manually
+        to compensate (which is exactly the reported annoyance).
+
+        Never zooms *out* on a resize: a map that needs panning to see in
+        full at its native size (see app.py's initial window sizing,
+        which deliberately never shrinks hexes to force a big map to fit
+        on screen) keeps that behavior unchanged, and a deliberate manual
+        zoom-in the player already made is never undone by an incidental
+        resize.
+        """
+        min_x, min_y, max_x, max_y = self._board_pixel_bounds
+        natural_width = max_x - min_x
+        natural_height = max_y - min_y
+        if natural_width <= 0 or natural_height <= 0:
+            return
+        cover_zoom = max(width / natural_width, height / natural_height)
+        self.camera.zoom = max(self.camera.zoom, min(cover_zoom, MAX_ZOOM))
 
     def on_key_press(self, symbol: int, modifiers: int) -> None:
         if self.game_state.winner is not None:
@@ -370,8 +409,6 @@ class GameView(arcade.View):
                 self.window.set_fullscreen(False)
             elif self.drag_ship is not None:
                 self._abort_drag()
-            elif self._port_panel_picking:
-                self._port_panel_picking = False
             elif self.selected_port is not None:
                 self._close_port_panel()
         elif symbol in (arcade.key.PLUS, arcade.key.EQUAL, arcade.key.NUM_ADD):
@@ -429,36 +466,39 @@ class GameView(arcade.View):
         if button != arcade.MOUSE_BUTTON_LEFT or self.active_battle is not None:
             return
         if self.selected_port is not None:
-            if self._port_panel_picking:
-                clicked_kind = self._picker_glyph_at(x, y)
-                if clicked_kind is not None:
-                    order(self.game_state, self.game_state.current_player, self.selected_port, clicked_kind)
-                    self._port_panel_picking = False
-                    # Return immediately rather than falling into the bounds
-                    # check below: adding to the queue changes its length,
-                    # which resizes/re-centers the panel, so re-checking
-                    # against the now-different geometry could wrongly
-                    # decide this same click landed outside it.
-                    return
-            elif self._order_button_at(x, y):
-                self._port_panel_picking = True
-                return
-            # Any click within the panel's (still-current, since neither
-            # branch above matched) bounds is consumed here even though it
-            # missed every button -- it must never fall through to
-            # _start_drag, which would reinterpret it as a click on
-            # whatever map hex happens to be underneath the panel.
-            if self._point_in_port_panel(x, y):
+            # The panel is read-only (nothing to click -- see tla.production),
+            # so any click within its bounds is simply consumed rather than
+            # falling through to _start_drag, which would reinterpret it as
+            # a click on whatever map hex happens to be underneath the
+            # panel. Except when that hex holds the player's own movable
+            # ship: the panel is drawn at a fixed screen position unrelated
+            # to where the selected port actually sits on the map, so it
+            # can coincidentally overlap an unrelated ship elsewhere on
+            # screen -- a click meant to drag that ship must still win, or
+            # the ship becomes stuck with no visible cause.
+            if self._point_in_port_panel(x, y) and self._draggable_ship_at_screen_point(x, y) is None:
                 return
         self._start_drag(x, y)
 
+    def _draggable_ship_at_screen_point(self, screen_x: float, screen_y: float) -> Ship | None:
+        """The current player's own ship at this screen position, if it
+        still has movement left this turn -- i.e. exactly what a click
+        there would start dragging (see _start_drag). Used by
+        on_mouse_press to let such a click win over an open port panel's
+        fixed-position bounds check."""
+        gs = self.game_state
+        world = self.camera.unproject((screen_x, screen_y))
+        hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
+        ship = gs.ship_at(hex_coord)
+        if ship is not None and ship.owner == gs.current_player and ship.movement_remaining > 0:
+            return ship
+        return None
+
     def _open_port_panel(self, coord: AxialCoord) -> None:
         self.selected_port = coord
-        self._port_panel_picking = False
 
     def _close_port_panel(self) -> None:
         self.selected_port = None
-        self._port_panel_picking = False
 
     def _start_drag(self, screen_x: float, screen_y: float) -> None:
         gs = self.game_state
@@ -809,6 +849,16 @@ class GameView(arcade.View):
 
         self.ui_camera.use()
         if self.game_state.winner is not None:
+            if self.replay_writer is not None:
+                # A win can occur mid-movement-phase (e.g. an elimination
+                # via battle), and the game-over overlay gate below means
+                # the player may never get to trigger _end_movement_phase
+                # again -- checking here instead, every frame, reliably
+                # fires exactly once (write_final no-ops once finalized).
+                self.replay_writer.write_final(
+                    self.game_state,
+                    task_forces=self.ai_policy.task_forces_for(PLAYER_A) + self.ai_policy.task_forces_for(PLAYER_B),
+                )
             self._draw_game_over_overlay()
             return
         self._draw_hud()
@@ -847,38 +897,21 @@ class GameView(arcade.View):
             text_obj.y = self.window.height - 22 - i * 20
             text_obj.draw()
 
-    def _selected_port_queue(self) -> list[ShipKind]:
-        if self.selected_port is None:
-            return []
-        gs = self.game_state
-        progress = gs.players[gs.current_player].port_production.get(self.selected_port)
-        return progress.orders if progress else []
-
-    def _port_panel_slot_count(self) -> int:
-        return len(_PORT_PANEL_KINDS) if self._port_panel_picking else len(self._selected_port_queue()) + 1
-
     def _port_panel_geometry(self) -> tuple[float, float, float, float]:
         """(left, bottom, width, height) of the port panel in screen space.
-        Width is at least PORT_PANEL_MIN_WIDTH so the title text (measured
-        for the longer of the two possible titles) never overflows the
-        panel when there are only 1-2 icon slots -- see
-        `_port_panel_slot_centers` for how the icon row stays centered
-        within whatever width this ends up being."""
-        content_width = PORT_PANEL_MARGIN * 2 + PORT_PANEL_ICON_BOX * self._port_panel_slot_count()
+        Always sized for exactly one glyph -- a port's build-in-progress is
+        a single, automatic, non-interactive value (see tla.production),
+        never a queue of choices -- with width floored at
+        PORT_PANEL_MIN_WIDTH so the title text isn't cramped."""
+        content_width = PORT_PANEL_MARGIN * 2 + PORT_PANEL_ICON_BOX
         width = max(content_width, PORT_PANEL_MIN_WIDTH)
         height = PORT_PANEL_MARGIN + PORT_PANEL_HEADER_HEIGHT + PORT_PANEL_ICON_ROW_HEIGHT
         left = (self.window.width - width) / 2
         return left, PORT_PANEL_MARGIN, width, height
 
-    def _port_panel_slot_centers(self) -> list[tuple[float, float]]:
+    def _port_panel_slot_center(self) -> tuple[float, float]:
         left, bottom, width, _height = self._port_panel_geometry()
-        slot_count = self._port_panel_slot_count()
-        icons_left = left + (width - PORT_PANEL_ICON_BOX * slot_count) / 2
-        icon_cy = bottom + PORT_PANEL_ICON_ROW_HEIGHT / 2
-        return [
-            (icons_left + PORT_PANEL_ICON_BOX * (i + 0.5), icon_cy)
-            for i in range(slot_count)
-        ]
+        return left + width / 2, bottom + PORT_PANEL_ICON_ROW_HEIGHT / 2
 
     def _point_in_port_panel(self, screen_x: float, screen_y: float) -> bool:
         if self.selected_port is None:
@@ -886,86 +919,48 @@ class GameView(arcade.View):
         left, bottom, width, height = self._port_panel_geometry()
         return left <= screen_x <= left + width and bottom <= screen_y <= bottom + height
 
-    def _picker_glyph_at(self, screen_x: float, screen_y: float) -> ShipKind | None:
-        half = PORT_PANEL_ICON_BOX / 2
-        for kind, (cx, cy) in zip(_PORT_PANEL_KINDS, self._port_panel_slot_centers()):
-            if abs(screen_x - cx) <= half and abs(screen_y - cy) <= half:
-                return kind
-        return None
-
-    def _order_button_at(self, screen_x: float, screen_y: float) -> bool:
-        half = PORT_PANEL_ICON_BOX / 2
-        cx, cy = self._port_panel_slot_centers()[-1]  # the button is always the last slot
-        return abs(screen_x - cx) <= half and abs(screen_y - cy) <= half
+    def _selected_port_progress(self) -> tuple[ShipKind, int, int] | None:
+        """(kind currently being built, points banked toward it, its cost)
+        for `self.selected_port`, or None if no port is selected or
+        `ProductionConfig.build_order` is empty."""
+        if self.selected_port is None:
+            return None
+        gs = self.game_state
+        build_order = gs.config.production.build_order
+        if not build_order:
+            return None
+        progress = gs.players[gs.current_player].port_production.get(self.selected_port)
+        index = progress.next_index if progress else 0
+        points = progress.points if progress else 0
+        kind = build_order[index % len(build_order)]
+        return kind, points, gs.config.ship_stats.stats[kind].cost
 
     def _draw_port_panel(self) -> None:
         gs = self.game_state
         player = gs.current_player
-        progress = gs.players[player].port_production.get(self.selected_port)
-        queue = progress.orders if progress else []
-        banked_points = progress.points if progress else 0
-        stats = gs.config.ship_stats.stats
 
         left, bottom, width, height = self._port_panel_geometry()
         top = bottom + height
         arcade.draw_lbwh_rectangle_filled(left, bottom, width, height, PORT_PANEL_BG_COLOR)
         arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, PLAYER_COLORS[player])
 
-        self._port_panel_title_text.text = (
-            "Choose a ship to order" if self._port_panel_picking else "Port Production"
-        )
+        self._port_panel_title_text.text = "Port Production"
         self._port_panel_title_text.x = left + PORT_PANEL_MARGIN
         self._port_panel_title_text.y = top - 20
         self._port_panel_title_text.draw()
 
-        half = PORT_PANEL_ICON_BOX / 2
-        slot_centers = self._port_panel_slot_centers()
-
-        mouse_x, mouse_y = self._mouse_screen_pos
-
-        if self._port_panel_picking:
-            hovered_kind: ShipKind | None = None
-            hovered_cx = 0.0
-            for i, (kind, (cx, cy)) in enumerate(zip(_PORT_PANEL_KINDS, slot_centers)):
-                arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
-                draw_ship_glyph((cx, cy + 9), PORT_PANEL_ICON_HEX_SIZE, kind, PLAYER_COLORS[player])
-                cost_text = self._port_panel_cost_texts[i]
-                cost_text.text = str(stats[kind].cost)
-                cost_text.x = cx
-                cost_text.y = cy - half + 5
-                cost_text.draw()
-                if abs(mouse_x - cx) <= half and abs(mouse_y - cy) <= half:
-                    hovered_kind, hovered_cx = kind, cx
-
-            if hovered_kind is not None:
-                self._port_panel_hover_text.text = hovered_kind.value.replace("_", " ").title()
-                self._port_panel_hover_text.x = hovered_cx
-                self._port_panel_hover_text.y = top + 6
-                self._port_panel_hover_text.draw()
+        progress = self._selected_port_progress()
+        if progress is None:
             return
-
-        hovered_index: int | None = None
-        for i, (cx, cy) in enumerate(slot_centers):
-            arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
-            if i == len(queue):  # the trailing "Order" slot
-                self._port_panel_order_text.x = cx
-                self._port_panel_order_text.y = cy
-                self._port_panel_order_text.draw()
-                continue
-            draw_ship_glyph((cx, cy + 9), PORT_PANEL_ICON_HEX_SIZE, queue[i], PLAYER_COLORS[player])
-            if abs(mouse_x - cx) <= half and abs(mouse_y - cy) <= half:
-                hovered_index = i
-
-        if hovered_index is not None:
-            kind = queue[hovered_index]
-            cx, _cy = slot_centers[hovered_index]
-            points = banked_points if hovered_index == 0 else 0
-            self._port_panel_hover_text.text = (
-                f"{kind.value.replace('_', ' ').title()}  {points}/{stats[kind].cost}"
-            )
-            self._port_panel_hover_text.x = cx
-            self._port_panel_hover_text.y = top + 6
-            self._port_panel_hover_text.draw()
+        kind, points, cost = progress
+        half = PORT_PANEL_ICON_BOX / 2
+        cx, cy = self._port_panel_slot_center()
+        arcade.draw_lbwh_rectangle_outline(cx - half, cy - half, PORT_PANEL_ICON_BOX, PORT_PANEL_ICON_BOX, (100, 100, 100), 1)
+        draw_ship_glyph((cx, cy + 9), PORT_PANEL_ICON_HEX_SIZE, kind, PLAYER_COLORS[player])
+        self._port_panel_caption_text.text = f"{kind.value.replace('_', ' ').title()}  {points}/{cost}"
+        self._port_panel_caption_text.x = cx
+        self._port_panel_caption_text.y = cy - half + 5
+        self._port_panel_caption_text.draw()
 
     def _draw_game_over_overlay(self) -> None:
         winner_label = "Player A" if self.game_state.winner == PLAYER_A else "Player B"

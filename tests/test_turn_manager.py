@@ -1,8 +1,7 @@
 from tla.board import Board
-from tla.config import Config
+from tla.config import Config, ProductionConfig
 from tla.game_state import GameState, TurnPhase
 from tla.hexgrid import AxialCoord
-from tla.production import order
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
 from tla.turn_manager import TurnManager
@@ -77,9 +76,12 @@ def test_end_movement_phase_runs_production_for_both_players():
     port_a, port_b = AxialCoord(0, 0), AxialCoord(4, 0)
     board.tiles[port_a] = Tile(coord=port_a, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
     board.tiles[port_b] = Tile(coord=port_b, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
-    gs = GameState(config=Config(), board=board, ships={})
-    order(gs, PLAYER_A, port_a, ShipKind.PATROL_BOAT)
-    order(gs, PLAYER_B, port_b, ShipKind.PATROL_BOAT)
+    # points_per_turn=20 covers even the build order's most expensive kind
+    # (10) in one turn -- production is now fully automatic, no order() to
+    # call, so this just needs to guarantee an immediate spawn regardless
+    # of which kind is first in the sequence.
+    config = Config(production=ProductionConfig(points_per_turn=20))
+    gs = GameState(config=config, board=board, ships={})
     manager = TurnManager(gs)
 
     manager.end_movement_phase()  # A -> B
@@ -127,3 +129,22 @@ def test_end_movement_phase_resets_turn_stats_only_once_a_new_turn_starts():
 
     assert gs.turn_stats[PLAYER_A].hp_dealt == 0
     assert gs.turn_stats[PLAYER_B].hp_taken == 0
+
+
+def test_end_movement_phase_resets_battle_log_at_both_transitions():
+    # Unlike turn_stats above (deliberately cumulative across a whole
+    # turn), battle_log has a half-turn lifecycle -- see
+    # GameState.BattleLogEntry -- so it's cleared at *every* transition,
+    # not just the once-per-full-turn one.
+    gs = _game_state()
+    manager = TurnManager(gs)
+    gs.battle_log = ["placeholder"]
+
+    manager.end_movement_phase()  # A -> B: cleared here too
+
+    assert gs.battle_log == []
+
+    gs.battle_log = ["placeholder"]
+    manager.end_movement_phase()  # B -> new turn: cleared again
+
+    assert gs.battle_log == []
