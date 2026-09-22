@@ -105,6 +105,32 @@ class BattleLogEntry:
 
 
 @dataclass
+class MoveLogEntry:
+    """One continuous stretch of hexes a single ship actually traveled --
+    appended, in the exact chronological order ships moved, by
+    `tla.movement.move_ship`/`move_ship_along_path` and
+    `tla.battle.apply_battle_outcome`'s final capture step (a surviving
+    attacker's last hex onto a just-sunk defender's position). `path` is
+    inclusive of both ends (`path[0]` is where this stretch started,
+    `path[-1]` is where it ended), the exact hex-by-hex route -- not just
+    origin/destination -- so a reader (the replay viewer) can animate the
+    real route instead of a straight-line jump between the two.
+
+    A single ship can appear more than once in one half-turn: an
+    engagement's approach is one entry, and (if the attacker wins) the
+    final single-hex capture step is a second, separate entry right after
+    it. Same half-turn lifecycle as `battle_log` (see `BattleLogEntry`) --
+    cleared at both transitions by `tla.turn_manager.TurnManager.
+    end_movement_phase`, for the same reason: this is what happened
+    *this* half-turn, not a cumulative history."""
+
+    ship_id: int
+    kind: ShipKind
+    owner: PlayerId
+    path: list[AxialCoord]
+
+
+@dataclass
 class GameState:
     config: Config
     board: Board
@@ -124,6 +150,10 @@ class GameState:
     # BattleLogEntry for why this has a different (shorter) lifecycle than
     # turn_stats above, despite both being populated by tla.battle.
     battle_log: list[BattleLogEntry] = field(default_factory=list)
+    # Every ship movement resolved since the current half-turn began, in the
+    # order it actually happened -- see MoveLogEntry for why this has the
+    # same half-turn lifecycle as battle_log above.
+    move_log: list[MoveLogEntry] = field(default_factory=list)
     # Whoever controlled every port on the map as of the most recent full
     # turn boundary -- None if no single player did. See
     # tla.win_condition.advance_port_control_claim: total port control

@@ -16,8 +16,7 @@ def _ship(owner, ship_id, kind=ShipKind.DESTROYER, movement_remaining=0, surface
         current_hp=6,
         surfaced=surfaced,
         movement_remaining=movement_remaining,
-        toggled_pre_move=True,
-        toggled_post_move=True,
+        toggled_this_turn=True,
     )
 
 
@@ -49,11 +48,10 @@ def test_end_movement_phase_resets_the_new_players_ships():
 
     ship_b = gs.ships[2]
     assert ship_b.movement_remaining == gs.config.ship_stats.stats[ship_b.kind].movement
-    assert ship_b.toggled_pre_move is False
-    assert ship_b.toggled_post_move is False
+    assert ship_b.toggled_this_turn is False
     # Player A's ships are untouched by B's phase starting.
     ship_a = gs.ships[1]
-    assert ship_a.toggled_pre_move is True
+    assert ship_a.toggled_this_turn is True
 
 
 def test_end_movement_phase_from_move_b_starts_a_new_turn():
@@ -68,7 +66,7 @@ def test_end_movement_phase_from_move_b_starts_a_new_turn():
     assert gs.turn_number == 2
     ship_a = gs.ships[1]
     assert ship_a.movement_remaining == gs.config.ship_stats.stats[ship_a.kind].movement
-    assert ship_a.toggled_pre_move is False
+    assert ship_a.toggled_this_turn is False
 
 
 def test_end_movement_phase_runs_production_for_both_players():
@@ -148,3 +146,19 @@ def test_end_movement_phase_resets_battle_log_at_both_transitions():
     manager.end_movement_phase()  # B -> new turn: cleared again
 
     assert gs.battle_log == []
+
+
+def test_end_movement_phase_resets_move_log_at_both_transitions():
+    # Same half-turn lifecycle as battle_log above -- see GameState.MoveLogEntry.
+    gs = _game_state()
+    manager = TurnManager(gs)
+    gs.move_log = ["placeholder"]
+
+    manager.end_movement_phase()  # A -> B: cleared here too
+
+    assert gs.move_log == []
+
+    gs.move_log = ["placeholder"]
+    manager.end_movement_phase()  # B -> new turn: cleared again
+
+    assert gs.move_log == []

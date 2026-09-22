@@ -23,8 +23,7 @@ def start_movement_phase(game_state: GameState, player: PlayerId) -> None:
     for ship in game_state.ships_for(player):
         stats = stats_map[ship.kind]
         ship.movement_remaining = ship.max_movement(stats)
-        ship.toggled_pre_move = False
-        ship.toggled_post_move = False
+        ship.toggled_this_turn = False
 
 
 class TurnManager:
@@ -41,10 +40,12 @@ class TurnManager:
             gs.phase = TurnPhase.MOVE_B
             gs.current_player = PLAYER_B
             start_movement_phase(gs, PLAYER_B)
-            # battle_log has a half-turn lifecycle, unlike turn_stats below
-            # -- see BattleLogEntry -- so it's cleared at both transitions,
-            # not just the once-per-full-turn one.
+            # battle_log/move_log both have a half-turn lifecycle, unlike
+            # turn_stats below -- see BattleLogEntry/MoveLogEntry -- so
+            # they're cleared at both transitions, not just the
+            # once-per-full-turn one.
             gs.battle_log = []
+            gs.move_log = []
         elif gs.phase == TurnPhase.MOVE_B:
             # The turn boundary: both players have now moved, so this is
             # exactly the once-per-turn checkpoint total port control gets
@@ -64,3 +65,4 @@ class TurnManager:
             gs.turn_stats = {PLAYER_A: TurnStats(), PLAYER_B: TurnStats()}
             start_movement_phase(gs, PLAYER_A)
             gs.battle_log = []
+            gs.move_log = []

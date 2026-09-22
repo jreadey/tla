@@ -5,6 +5,7 @@ from tla.board import Board
 from tla.config import Config, ShipStatsConfig
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, hexes_in_range
+from tla.movement import begin_engagement
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
 
@@ -315,6 +316,37 @@ def test_apply_battle_outcome_records_sunk_ships_by_owner():
 
     assert gs.turn_stats[PLAYER_B].ships_lost == [ShipKind.PATROL_BOAT]
     assert gs.turn_stats[PLAYER_A].ships_lost == []
+
+
+def test_apply_battle_outcome_logs_the_real_route_when_the_approach_stopped_short():
+    # Regression: begin_engagement's "stops short" case (a friendly ship
+    # merely passed through en route -- see test_movement.py's own
+    # test_begin_engagement_stops_short_when_the_only_approach_hex_is_a_
+    # friendly_ship) leaves the attacker sitting multiple hexes away from
+    # the target it's fighting, charging the remaining distance as a flat
+    # attack_cost rather than ever walking it hex by hex. If the attacker
+    # wins, apply_battle_outcome must log the *real* route across that gap
+    # -- not a bare two-point jump straight across whatever's in between,
+    # which (confirmed against a real replay) can visibly cut across land
+    # once drawn as a straight line in the graphical viewer.
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    attacker.movement_remaining = 3
+    friendly = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_A, 2)
+    defender = _ship(AxialCoord(2, 0), ShipKind.PATROL_BOAT, PLAYER_B, 3, hp=1)
+    gs = _game_state(board, [attacker, friendly, defender])
+
+    begin_engagement(attacker, [AxialCoord(0, 0), AxialCoord(1, 0), AxialCoord(2, 0)], gs)
+    assert attacker.position == AxialCoord(0, 0)  # stopped short, per the existing rule
+    assert gs.move_log == []  # no real movement happened yet to log
+
+    result = resolve_round(attacker, defender, gs)
+    assert result.defender_sunk
+    apply_battle_outcome(gs, attacker, defender)
+
+    assert attacker.position == AxialCoord(2, 0)
+    assert len(gs.move_log) == 1
+    assert gs.move_log[0].path == [AxialCoord(0, 0), AxialCoord(1, 0), AxialCoord(2, 0)]
 
 
 def test_run_battle_never_asks_before_the_first_round():

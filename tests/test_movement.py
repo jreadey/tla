@@ -9,6 +9,7 @@ from tla.movement import (
     move_ship,
     move_ship_along_path,
     reachable_hexes,
+    shortest_path,
     toggle_submarine_state,
     validate_path,
 )
@@ -435,27 +436,39 @@ def test_validate_path_rejects_exceeding_budget():
         validate_path(ship, [AxialCoord(0, 0), AxialCoord(1, 0), AxialCoord(2, 0)], gs)
 
 
-def test_toggle_submarine_state_allows_two_then_blocks_third():
+def test_toggle_submarine_state_submerges_and_refreshes_budget():
     stats = Config().ship_stats.stats[ShipKind.SUBMARINE]
     ship = _make_ship(AxialCoord(0, 0), movement_remaining=stats.movement, kind=ShipKind.SUBMARINE)
     assert ship.surfaced is True
 
-    # Pre-move toggle: submerges and refreshes the budget to the (lower)
-    # submerged movement, since nothing has been spent yet.
     toggle_submarine_state(ship, stats)
+
     assert ship.surfaced is False
-    assert ship.toggled_pre_move is True
+    assert ship.toggled_this_turn is True
     assert ship.movement_remaining == stats.movement_submerged
 
-    # Post-move toggle: resurfaces but does not touch movement_remaining.
-    ship.movement_remaining = 0
+
+def test_toggle_submarine_state_rejects_a_second_toggle_the_same_turn():
+    stats = Config().ship_stats.stats[ShipKind.SUBMARINE]
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=stats.movement, kind=ShipKind.SUBMARINE)
+
     toggle_submarine_state(ship, stats)
-    assert ship.surfaced is True
-    assert ship.toggled_post_move is True
-    assert ship.movement_remaining == 0
 
     with pytest.raises(ValueError):
         toggle_submarine_state(ship, stats)
+
+
+def test_toggle_submarine_state_rejects_toggling_after_movement_has_been_spent():
+    # The new rule, replacing the old two-toggles-per-turn (pre/post move)
+    # design: a submarine may only surface/submerge at the very start of
+    # its movement, before spending any of this turn's budget.
+    stats = Config().ship_stats.stats[ShipKind.SUBMARINE]
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=stats.movement - 1, kind=ShipKind.SUBMARINE)
+
+    with pytest.raises(ValueError):
+        toggle_submarine_state(ship, stats)
+
+    assert ship.surfaced is True  # rejected -- no partial effect
 
 
 def test_toggle_submarine_state_rejects_non_submarine():
@@ -463,3 +476,136 @@ def test_toggle_submarine_state_rejects_non_submarine():
     ship = _make_ship(AxialCoord(0, 0), movement_remaining=3, kind=ShipKind.DESTROYER)
     with pytest.raises(ValueError):
         toggle_submarine_state(ship, stats)
+
+
+# -- shortest_path (formerly tla.ai.pathing -- moved here since replay
+# logging, not just the AI, now needs an explicit route; see move_ship's
+# own use of it below) --------------------------------------------------
+
+
+def test_shortest_path_starts_and_ends_correctly():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=5)
+    gs = _game_state(board, [ship])
+
+    path = shortest_path(ship, AxialCoord(2, 0), gs)
+
+    assert path[0] == AxialCoord(0, 0)
+    assert path[-1] == AxialCoord(2, 0)
+    assert len(path) - 1 <= ship.movement_remaining
+
+
+def test_shortest_path_to_own_position_is_a_single_hex():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=5)
+    gs = _game_state(board, [ship])
+
+    assert shortest_path(ship, AxialCoord(0, 0), gs) == [AxialCoord(0, 0)]
+
+
+def test_shortest_path_ends_on_an_enemy_hex_for_an_attack():
+    board = _sea_board()
+    attacker = _make_ship(AxialCoord(0, 0), movement_remaining=5, owner=PLAYER_A, ship_id=1)
+    defender = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [attacker, defender])
+
+    path = shortest_path(attacker, AxialCoord(1, 0), gs)
+
+    assert path == [AxialCoord(0, 0), AxialCoord(1, 0)]
+
+
+def test_shortest_path_raises_when_unreachable():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=1)
+    gs = _game_state(board, [ship])
+
+    with pytest.raises(ValueError):
+        shortest_path(ship, AxialCoord(5, 0), gs)
+
+
+def test_shortest_path_ignore_budget_reaches_past_the_real_movement_remaining():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=1)
+    gs = _game_state(board, [ship])
+
+    with pytest.raises(ValueError):
+        shortest_path(ship, AxialCoord(5, 0), gs)  # confirms the budget really would block it
+
+    path = shortest_path(ship, AxialCoord(5, 0), gs, ignore_budget=True)
+
+    assert path[0] == AxialCoord(0, 0)
+    assert path[-1] == AxialCoord(5, 0)
+    assert len(path) - 1 == 5  # still the real, fully hex-by-hex shortest route
+
+
+# -- move_log (see game_state.MoveLogEntry) -------------------------------
+
+
+def test_move_ship_logs_the_exact_route_traveled():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    gs = _game_state(board, [ship])
+
+    move_ship(ship, AxialCoord(2, 0), gs)
+
+    assert len(gs.move_log) == 1
+    entry = gs.move_log[0]
+    assert entry.ship_id == ship.id
+    assert entry.kind == ship.kind
+    assert entry.owner == ship.owner
+    assert entry.path == [AxialCoord(0, 0), AxialCoord(1, 0), AxialCoord(2, 0)]
+
+
+def test_move_ship_along_path_logs_the_drawn_route_not_just_the_shortest():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    gs = _game_state(board, [ship])
+    path = [AxialCoord(0, 0), AxialCoord(1, -1), AxialCoord(1, 0), AxialCoord(0, 1)]
+
+    move_ship_along_path(ship, path, gs)
+
+    assert len(gs.move_log) == 1
+    assert gs.move_log[0].path == path
+
+
+def test_begin_engagement_logs_the_approach_only_not_the_attack_hex():
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    enemy = _make_ship(AxialCoord(2, -1), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    begin_engagement(ship, [AxialCoord(0, 0), AxialCoord(1, -1), AxialCoord(2, -1)], gs)
+
+    assert len(gs.move_log) == 1
+    assert gs.move_log[0].path == [AxialCoord(0, 0), AxialCoord(1, -1)]  # stops short, per ship.position
+
+
+def test_begin_engagement_with_adjacent_enemy_logs_nothing():
+    # No approach movement at all (attacker never leaves its own hex), so
+    # nothing should be logged -- see _log_move's length-1 guard.
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    enemy = _make_ship(AxialCoord(1, 0), movement_remaining=0, owner=PLAYER_B, ship_id=2)
+    gs = _game_state(board, [ship, enemy])
+
+    begin_engagement(ship, [AxialCoord(0, 0), AxialCoord(1, 0)], gs)
+
+    assert gs.move_log == []
+
+
+def test_move_ship_rejects_its_own_current_position():
+    # Regression: move_ship routes through shortest_path to get the actual
+    # traveled path (for move_log), and shortest_path treats "to your own
+    # hex" as a trivial no-op route rather than an error (useful for other
+    # callers) -- move_ship must still reject it exactly like any other
+    # unreachable destination, not silently treat it as a real (zero-hex)
+    # move, and not misreport it as "enemy-occupied" just because the ship
+    # itself occupies that hex.
+    board = _sea_board()
+    ship = _make_ship(AxialCoord(0, 0), movement_remaining=3)
+    gs = _game_state(board, [ship])
+
+    with pytest.raises(ValueError, match="not reachable"):
+        move_ship(ship, AxialCoord(0, 0), gs)
+
+    assert gs.move_log == []

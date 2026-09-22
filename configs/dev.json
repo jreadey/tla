@@ -16,5 +16,10 @@
     "destroyer": 1,
     "submarine": 1,
     "patrol_boat": 1
+  },
+  "ai": {
+    "task_force_max_size": 6,
+    "task_force_gather_radius": 8,
+    "task_force_max_separation": 4
   }
 }

@@ -63,10 +63,11 @@ class ActiveBattle:
 
 
 @dataclass
-class SpottedToast:
-    """A brief, non-blocking "<ship> spotted!" notification -- unlike the
-    sunk/battle/turn-report overlays, this never pauses input; it just
-    fades on its own after SPOTTED_TOAST_SECONDS."""
+class Toast:
+    """A brief, non-blocking notification (a ship spotted, or first coming
+    under attack -- see `_update_spotted_ships`/`_advance_ai_turn`) --
+    unlike the sunk/battle/turn-report overlays, this never pauses input;
+    it just fades on its own after TOAST_SECONDS."""
 
     text: str
     remaining: float = 0.0
@@ -111,12 +112,12 @@ SUB_CONTACT_BG_COLOR = (40, 32, 5, 235)
 SUB_CONTACT_BORDER_COLOR = (230, 180, 40)
 SUB_CONTACT_TEXT_COLOR = arcade.color.WHITE
 
-SPOTTED_TOAST_SECONDS = 4.0
-SPOTTED_TOAST_BG_COLOR = (20, 20, 20, 220)
-SPOTTED_TOAST_BORDER_COLOR = (200, 170, 60)
-SPOTTED_TOAST_WIDTH = 260.0
-SPOTTED_TOAST_HEIGHT = 26.0
-SPOTTED_TOAST_MARGIN = 10.0
+TOAST_SECONDS = 4.0
+TOAST_BG_COLOR = (20, 20, 20, 220)
+TOAST_BORDER_COLOR = (200, 170, 60)
+TOAST_WIDTH = 260.0
+TOAST_HEIGHT = 26.0
+TOAST_MARGIN = 10.0
 
 TURN_REPORT_BG_COLOR = (18, 18, 18, 245)
 TURN_REPORT_BORDER_COLOR = (200, 170, 60)
@@ -205,7 +206,19 @@ class GameView(arcade.View):
         # one is first seen. Keyed by viewer, since fog of war (and so
         # what's "new") can differ per player. See _update_spotted_ships.
         self._known_enemy_ship_ids: dict[PlayerId, set[int]] = {}
-        self._spotted_toasts: list[SpottedToast] = []
+        self._toasts: list[Toast] = []
+        # Ship ids already toasted as "under attack" during the current
+        # half-turn's AI draining (see _advance_ai_turn) -- so a multi-round
+        # battle only announces itself once, not every round. Reset in
+        # _maybe_start_ai_turn alongside _battle_log_watermark.
+        self._attack_toasted_ship_ids: set[int] = set()
+        # How many of game_state.battle_log's (half-turn-scoped, see
+        # GameState.battle_log) entries have already been considered for an
+        # attack toast -- battle_log only grows during one player's whole
+        # move, so this is the position to resume scanning from on the next
+        # _advance_ai_turn step rather than re-scanning entries already
+        # handled.
+        self._battle_log_watermark: int = 0
         # The empty friendly port currently showing its (read-only) production
         # panel, if any -- opened by clicking it, closed by clicking
         # elsewhere, Escape, or ending movement. There is nothing to choose
@@ -222,7 +235,7 @@ class GameView(arcade.View):
         # arcade.Text objects are reused and repositioned every frame rather
         # than calling arcade.draw_text() fresh each time, which rebuilds a
         # full text layout from scratch and is too slow to do every frame.
-        self._hud_texts = [arcade.Text("", 10, 0, arcade.color.WHITE, 13) for _ in range(2)]
+        self._hud_texts = [arcade.Text("", 10, 0, arcade.color.WHITE, 13) for _ in range(1)]
         self._tooltip_texts = [
             arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(TOOLTIP_MAX_LINES)
         ]
@@ -238,9 +251,10 @@ class GameView(arcade.View):
         self._sub_contact_text = arcade.Text(
             "", 0, 0, SUB_CONTACT_TEXT_COLOR, 16, anchor_x="center"
         )
-        # Reused for up to this many simultaneously-visible spotted toasts;
-        # any beyond that just don't get a slot until an older one expires.
-        self._spotted_toast_texts = [
+        # Reused for up to this many simultaneously-visible toasts (spotted
+        # or under-attack); any beyond that just don't get a slot until an
+        # older one expires.
+        self._toast_texts = [
             arcade.Text("", 0, 0, arcade.color.WHITE, 12) for _ in range(5)
         ]
         self._turn_report_title_text = arcade.Text(
@@ -274,6 +288,12 @@ class GameView(arcade.View):
             return
         self._ai_turn_iter = self.ai_policy.plan_movement(gs, gs.current_player)
         self._ai_pace_timer = 0.0
+        # gs.battle_log was just cleared for this half-turn (see
+        # tla.turn_manager.TurnManager.end_movement_phase) -- start
+        # scanning it from the beginning, with a clean slate of which ships
+        # have already gotten an under-attack toast this half-turn.
+        self._battle_log_watermark = 0
+        self._attack_toasted_ship_ids = set()
 
     def _advance_ai_turn(self, delta_time: float) -> None:
         """Drain one step of `_ai_turn_iter` every `AiConfig.turn_pacing_
@@ -282,6 +302,12 @@ class GameView(arcade.View):
         exhausted -- mirroring exactly what the Enter key does for a human
         -- and immediately checks for another AI seat, covering an
         AI-vs-AI handoff.
+
+        Each step also fires a one-time, non-blocking "<ship> attacks
+        <ship>!" toast for any battle that started this step (see
+        `_toast_new_attacks`) -- otherwise it's hard to follow which of the
+        AI's ships are even fighting during a paced turn you're only half
+        watching.
 
         If that step sank a ship, draining pauses there and shows the same
         blocking sunk-ship overlay a human's own battles use (see
@@ -304,10 +330,34 @@ class GameView(arcade.View):
                 self._ai_turn_iter = None
                 self._end_movement_phase()
                 return
+            self._toast_new_attacks()
             sunk = [owner_kind for sid, owner_kind in before.items() if sid not in self.game_state.ships]
             if sunk:
                 self.sunk_message = self._sunk_message_for(sunk)
                 return
+
+    def _toast_new_attacks(self) -> None:
+        """Fire a one-time, non-blocking "<ship> attacks <ship>!" toast the
+        first time each ship enters combat during the AI's current
+        half-turn (as attacker or defender) -- a later round of the same,
+        still-ongoing battle doesn't re-announce either ship (only skipped
+        once BOTH ships in a round have already been toasted, so a ship
+        that gets attacked again later by a *different* ship still gets a
+        fresh toast). Reads `game_state.battle_log` (see `tla.battle.
+        resolve_round`), which -- like `_battle_log_watermark` and
+        `_attack_toasted_ship_ids` themselves (see `_maybe_start_ai_turn`)
+        -- is cleared at the start of every half-turn, so this only ever
+        considers battles from the turn in progress."""
+        entries = self.game_state.battle_log[self._battle_log_watermark :]
+        self._battle_log_watermark = len(self.game_state.battle_log)
+        for entry in entries:
+            if entry.attacker_id in self._attack_toasted_ship_ids and entry.defender_id in self._attack_toasted_ship_ids:
+                continue
+            self._attack_toasted_ship_ids.add(entry.attacker_id)
+            self._attack_toasted_ship_ids.add(entry.defender_id)
+            attacker_label = self._label_for(entry.attacker_owner, entry.attacker_kind)
+            defender_label = self._label_for(entry.defender_owner, entry.defender_kind)
+            self._toasts.append(Toast(text=f"{attacker_label} attacks {defender_label}!", remaining=TOAST_SECONDS))
 
     def _end_movement_phase(self) -> None:
         """End the current player's movement phase -- the shared path for
@@ -753,17 +803,23 @@ class GameView(arcade.View):
             return f"{labels[0]} and {labels[1]} both sunk!"
         return f"{labels[0]} sunk!"
 
-    def _update_spotted_ships(self, delta_time: float) -> None:
+    def _update_toasts(self, delta_time: float) -> None:
+        """Age every current toast (spotted-ship or under-attack -- see
+        `_update_spotted_ships`/`_advance_ai_turn`) and drop any that have
+        faded out. Called once per frame regardless of what's producing
+        toasts, so timing is smooth and independent of the AI's own
+        (slower, paced) update cadence."""
+        for toast in self._toasts:
+            toast.remaining -= delta_time
+        self._toasts = [t for t in self._toasts if t.remaining > 0]
+
+    def _update_spotted_ships(self) -> None:
         """Fire a one-time, non-blocking "<ship> spotted!" toast the
         moment an enemy ship is first seen in the display player's fog of
         war vision (never for a submerged submarine -- fow.is_hidden keeps
         those out of `visible` entirely regardless, so a combat reveal is
         the SUB CONTACT flow's job, not this one). No-op if fog of war is
         disabled -- there's no "first sighting" moment without it."""
-        for toast in self._spotted_toasts:
-            toast.remaining -= delta_time
-        self._spotted_toasts = [t for t in self._spotted_toasts if t.remaining > 0]
-
         gs = self.game_state
         if not gs.config.fow.enabled:
             return
@@ -776,8 +832,8 @@ class GameView(arcade.View):
             if is_hidden(display_player, ship, visible):
                 continue
             known.add(ship.id)
-            self._spotted_toasts.append(
-                SpottedToast(text=f"{self._ship_label(ship)} spotted!", remaining=SPOTTED_TOAST_SECONDS)
+            self._toasts.append(
+                Toast(text=f"{self._ship_label(ship)} spotted!", remaining=TOAST_SECONDS)
             )
 
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
@@ -805,7 +861,8 @@ class GameView(arcade.View):
     def on_update(self, delta_time: float) -> None:
         if self._ai_turn_iter is not None:
             self._advance_ai_turn(delta_time)
-        self._update_spotted_ships(delta_time)
+        self._update_toasts(delta_time)
+        self._update_spotted_ships()
         if not self._held_pan_keys:
             return
         move_x = sum(dx for key, (dx, _) in _PAN_KEYS.items() if key in self._held_pan_keys)
@@ -874,7 +931,7 @@ class GameView(arcade.View):
             self._draw_battle_banner(self.active_battle)
         elif self._hovered_ship is not None:
             self._draw_hover_tooltip(self._hovered_ship)
-        self._draw_spotted_toasts()
+        self._draw_toasts()
 
     def _draw_drag_path_line(self) -> None:
         if len(self.drag_path) < 2:
@@ -889,7 +946,6 @@ class GameView(arcade.View):
             f"Turn {gs.turn_number} -- {player_label}'s move    "
             "[Drag a ship] Move    [Esc] Cancel move    "
             "[Enter] End Movement    [T] Toggle hovered submarine",
-            "[Click an empty friendly port] Manage its production queue",
         ]
         for i, line in enumerate(lines):
             text_obj = self._hud_texts[i]
@@ -1045,27 +1101,25 @@ class GameView(arcade.View):
         self._sub_contact_text.y = top - height / 2 - 6
         self._sub_contact_text.draw()
 
-    def _draw_spotted_toasts(self) -> None:
-        """Stacked, non-blocking notifications in the top-right corner --
-        drawn every frame regardless of any modal overlay above (except
-        game over, which returns before this is ever reached), since
-        spotting an enemy ship shouldn't interrupt whatever else is
-        showing."""
-        top = self.window.height - 60  # clears the two-line HUD text at top-left/top-right
-        right = self.window.width - SPOTTED_TOAST_MARGIN
-        left = right - SPOTTED_TOAST_WIDTH
-        shown = self._spotted_toasts[: len(self._spotted_toast_texts)]
+    def _draw_toasts(self) -> None:
+        """Stacked, non-blocking notifications (spotted-ship or
+        under-attack) in the top-right corner -- drawn every frame
+        regardless of any modal overlay above (except game over, which
+        returns before this is ever reached), since neither should
+        interrupt whatever else is showing."""
+        top = self.window.height - 60  # clears the HUD text at top-left
+        right = self.window.width - TOAST_MARGIN
+        left = right - TOAST_WIDTH
+        shown = self._toasts[: len(self._toast_texts)]
         for i, toast in enumerate(shown):
-            box_top = top - i * (SPOTTED_TOAST_HEIGHT + 6)
-            box_bottom = box_top - SPOTTED_TOAST_HEIGHT
-            arcade.draw_lbwh_rectangle_filled(
-                left, box_bottom, SPOTTED_TOAST_WIDTH, SPOTTED_TOAST_HEIGHT, SPOTTED_TOAST_BG_COLOR
-            )
-            arcade.draw_lbwh_rectangle_filled(left, box_top - 2, SPOTTED_TOAST_WIDTH, 2, SPOTTED_TOAST_BORDER_COLOR)
-            text_obj = self._spotted_toast_texts[i]
+            box_top = top - i * (TOAST_HEIGHT + 6)
+            box_bottom = box_top - TOAST_HEIGHT
+            arcade.draw_lbwh_rectangle_filled(left, box_bottom, TOAST_WIDTH, TOAST_HEIGHT, TOAST_BG_COLOR)
+            arcade.draw_lbwh_rectangle_filled(left, box_top - 2, TOAST_WIDTH, 2, TOAST_BORDER_COLOR)
+            text_obj = self._toast_texts[i]
             text_obj.text = toast.text
             text_obj.x = left + 10
-            text_obj.y = box_bottom + SPOTTED_TOAST_HEIGHT / 2 - 5
+            text_obj.y = box_bottom + TOAST_HEIGHT / 2 - 5
             text_obj.draw()
 
     def _draw_turn_report(self) -> None:

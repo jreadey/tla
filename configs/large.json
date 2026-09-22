@@ -1,8 +1,15 @@
 {
+  "_comment": "task_force_gather_radius/task_force_max_separation below are hex-distance values self-play-tuned for dev.json's much smaller 20x12 map -- copied here as-is, but likely need their own re-tuning for this map's 80x40 scale rather than assuming they transfer directly.",
   "map": {
     "width": 80,
     "height": 40,
     "noise_scale": 12.0,
-    "sea_level": 0.15
+    "sea_level": 0.15,
+    "max_generation_attempts": 400
+  },
+  "ai": {
+    "task_force_max_size": 6,
+    "task_force_gather_radius": 8,
+    "task_force_max_separation": 4
   }
 }

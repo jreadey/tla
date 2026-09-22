@@ -12,10 +12,11 @@ mid-hex on someone else's ship.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Literal
 
-from tla.game_state import GameState
+from tla.game_state import GameState, MoveLogEntry
 from tla.hexgrid import AxialCoord, neighbors
 from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
@@ -118,6 +119,78 @@ class MoveResult:
     cost: int
 
 
+def shortest_path(
+    ship: Ship, destination: AxialCoord, game_state: GameState, *, ignore_budget: bool = False
+) -> list[AxialCoord]:
+    """The shortest legal route from `ship`'s current position to
+    `destination` this turn, inclusive of both ends (`path[0]` is `ship`'s
+    current position, `path[-1]` is `destination`). Mirrors
+    `reachable_hexes`'s own BFS traversal exactly (same step legality, via
+    `_classify_step`) with parent-pointer tracking added, so any hex it can
+    reach is exactly what `reachable_hexes` would also consider reachable.
+    Raises `ValueError` if `destination` isn't reachable within
+    `ship.movement_remaining` -- unless `ignore_budget` is set, which
+    explores with an unlimited budget instead (used by
+    `battle.apply_battle_outcome` to re-derive, purely for `move_log`,
+    the real hex-by-hex route a winning attacker's *already-abstracted*
+    final capture-hop covers; the distance itself was already paid for as
+    `begin_engagement`'s flat `attack_cost`, not deducted hex by hex, so
+    there's no real remaining budget left to check against)."""
+    origin = ship.position
+    if destination == origin:
+        return [origin]
+
+    budget = math.inf if ignore_budget else ship.movement_remaining
+    origin_tile = game_state.board.get_tile(origin)
+    leaving_port = origin_tile is not None and origin_tile.is_port
+
+    reachable: dict[AxialCoord, int] = {}
+    parents: dict[AxialCoord, AxialCoord] = {}
+    visited = {origin}
+    frontier: list[tuple[AxialCoord, int]] = [(origin, 0)]
+    while frontier:
+        coord, cost = frontier.pop(0)
+        if cost >= budget:
+            continue
+        remaining_before_step = budget - cost
+        for n in neighbors(coord):
+            if n in visited:
+                continue
+            step = _classify_step(
+                game_state, ship.owner, n, coord == origin and leaving_port, remaining_before_step
+            )
+            if step == "blocked":
+                continue
+            visited.add(n)
+            parents[n] = coord
+            new_cost = cost + 1
+            if step == "passthrough":
+                frontier.append((n, new_cost))
+                continue
+            reachable[n] = new_cost
+            if step == "open":
+                frontier.append((n, new_cost))
+
+    if destination not in reachable:
+        raise ValueError(f"{destination} is not reachable by ship {ship.id} this turn")
+
+    path = [destination]
+    while path[-1] != origin:
+        path.append(parents[path[-1]])
+    path.reverse()
+    return path
+
+
+def _log_move(game_state: GameState, ship: Ship, path: list[AxialCoord]) -> None:
+    """Record one continuous stretch actually traveled, for replay
+    playback -- see MoveLogEntry. A path of length 1 (no actual movement)
+    logs nothing."""
+    if len(path) > 1:
+        game_state.move_log.append(
+            MoveLogEntry(ship_id=ship.id, kind=ship.kind, owner=ship.owner, path=list(path))
+        )
+
+
 def move_ship(ship: Ship, destination: AxialCoord, game_state: GameState) -> MoveResult:
     """Move `ship` to `destination` by the shortest legal route, which must
     be in `reachable_hexes(ship, game_state)`. Deducts that route's cost
@@ -131,16 +204,21 @@ def move_ship(ship: Ship, destination: AxialCoord, game_state: GameState) -> Mov
     `tla.production.handle_port_capture`), exactly like
     `move_ship_along_path` -- callers don't need to check for that
     separately."""
-    reachable = reachable_hexes(ship, game_state)
-    if destination not in reachable:
+    if destination == ship.position:
+        # shortest_path treats "to your own hex" as a trivial no-op route
+        # (useful for other callers -- see its own docstring), but
+        # reachable_hexes never includes a ship's own hex, so a real move
+        # here must reject it exactly as an out-of-range destination would.
         raise ValueError(f"{destination} is not reachable by ship {ship.id} this turn")
+    path = shortest_path(ship, destination, game_state)
     if game_state.ship_at(destination) is not None:
         raise ValueError(f"{destination} is enemy-occupied; use begin_engagement to attack it")
-    cost = reachable[destination]
+    cost = len(path) - 1
     origin = ship.position
     ship.position = destination
     ship.movement_remaining -= cost
     handle_port_capture(game_state, destination)
+    _log_move(game_state, ship, path)
     return MoveResult(ship=ship, origin=origin, destination=destination, cost=cost)
 
 
@@ -223,6 +301,7 @@ def move_ship_along_path(ship: Ship, path: list[AxialCoord], game_state: GameSta
     ship.position = path[-1]
     ship.movement_remaining -= cost
     handle_port_capture(game_state, path[-1])
+    _log_move(game_state, ship, path)
     return MoveResult(ship=ship, origin=origin, destination=path[-1], cost=cost)
 
 
@@ -273,22 +352,22 @@ def begin_engagement(ship: Ship, path: list[AxialCoord], game_state: GameState) 
 
 
 def toggle_submarine_state(ship: Ship, stats: ShipStats) -> None:
-    """Flip `ship.surfaced`. A submarine gets two toggle opportunities per
-    turn (one before it moves, one after); this consumes whichever hasn't
-    been used yet, in order. `stats` must be this ship's own ShipStats.
+    """Flip `ship.surfaced`. A submarine gets exactly one toggle per turn,
+    and only at the very start of its movement -- before it has spent any
+    of this turn's budget (moving or attacking both count). `stats` must
+    be this ship's own ShipStats.
 
-    A pre-move toggle refreshes movement_remaining to match the new
-    surfaced/submerged budget, since nothing has been spent yet. A
-    post-move toggle doesn't -- movement for the turn is already done.
+    Always refreshes movement_remaining to match the new surfaced/
+    submerged budget -- safe to do unconditionally since a toggle is only
+    ever allowed before anything's been spent yet, so there's nothing to
+    preserve.
     """
     if ship.kind != ShipKind.SUBMARINE:
         raise ValueError(f"Only submarines can surface/submerge, not {ship.kind.value}")
-    if not ship.toggled_pre_move:
-        ship.toggled_pre_move = True
-        ship.surfaced = not ship.surfaced
-        ship.movement_remaining = ship.max_movement(stats)
-    elif not ship.toggled_post_move:
-        ship.toggled_post_move = True
-        ship.surfaced = not ship.surfaced
-    else:
-        raise ValueError(f"Submarine {ship.id} already toggled surfaced/submerged twice this turn")
+    if ship.toggled_this_turn:
+        raise ValueError(f"Submarine {ship.id} already toggled surfaced/submerged this turn")
+    if ship.movement_remaining != ship.max_movement(stats):
+        raise ValueError(f"Submarine {ship.id} has already spent movement this turn -- toggle only at the start")
+    ship.toggled_this_turn = True
+    ship.surfaced = not ship.surfaced
+    ship.movement_remaining = ship.max_movement(stats)

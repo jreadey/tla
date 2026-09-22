@@ -7,7 +7,7 @@ a submerged submarine, which `damage` cannot touch at all. Each of a side's
 own aircraft carriers within `CombatConfig.ac_bonus_radius` of the battle
 hex adds `CombatConfig.ac_bonus_amount` to that side's attack, recomputed
 fresh every round (a carrier arriving or sinking mid-battle changes it) --
-but only for the "larger surface ships" (`_AC_BONUS_ELIGIBLE_KINDS`), and
+but only for the "larger surface ships" (`AC_BONUS_ELIGIBLE_KINDS`), and
 never against a submerged submarine target: air cover doesn't help spot or
 track something submerged, regardless of which side has it or which side
 the submerged sub itself is fighting from (attacker or defender role).
@@ -22,8 +22,9 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 from tla.config import CombatConfig
-from tla.game_state import BattleLogEntry, GameState
+from tla.game_state import BattleLogEntry, GameState, MoveLogEntry
 from tla.hexgrid import AxialCoord, distance
+from tla.movement import shortest_path
 from tla.production import handle_port_capture
 from tla.ship import Ship, ShipKind, ShipStats
 
@@ -32,8 +33,11 @@ DecisionFn = Callable[[Ship, Ship, GameState], Decision]
 
 # Only these "larger surface ship" kinds benefit from nearby carrier air
 # cover -- a submarine (submerged or not) or patrol boat gets no bonus,
-# regardless of how many friendly carriers are nearby.
-_AC_BONUS_ELIGIBLE_KINDS = frozenset(
+# regardless of how many friendly carriers are nearby. Public so callers
+# other than carrier_bonus_for -- e.g. tla.ai.policy's carrier-bonus
+# formation-keeping -- can check eligibility the same way rather than
+# risking a duplicated, driftable copy of this list.
+AC_BONUS_ELIGIBLE_KINDS = frozenset(
     {ShipKind.CARRIER, ShipKind.BATTLESHIP, ShipKind.CRUISER, ShipKind.DESTROYER}
 )
 
@@ -57,7 +61,7 @@ def carrier_bonus_for(
 ) -> int:
     """Bonus damage for `attacking_ship`'s side from nearby friendly
     carriers, against `target` -- zero outright if `attacking_ship` isn't
-    one of the kinds that benefits (see `_AC_BONUS_ELIGIBLE_KINDS`), or if
+    one of the kinds that benefits (see `AC_BONUS_ELIGIBLE_KINDS`), or if
     `target` is a submerged submarine: air cover never helps against a
     submerged target, no matter which side has the carrier or which role
     (attacker/defender) the submerged sub is playing in this engagement.
@@ -65,7 +69,7 @@ def carrier_bonus_for(
     `tla.ai.scoring.matchup_score`, estimating an engagement before
     committing to it -- can reuse the exact same combat math rather than
     risking a duplicated, driftable copy of it."""
-    if attacking_ship.kind not in _AC_BONUS_ELIGIBLE_KINDS:
+    if attacking_ship.kind not in AC_BONUS_ELIGIBLE_KINDS:
         return 0
     if target.kind == ShipKind.SUBMARINE and not target.surfaced:
         return 0
@@ -203,8 +207,29 @@ def apply_battle_outcome(game_state: GameState, attacker: Ship, defender: Ship) 
         game_state.turn_stats[defender.owner].ships_lost.append(defender.kind)
         del game_state.ships[defender.id]
         if not attacker.is_sunk:
+            # The attacker's approach may have stopped short of the target
+            # (see tla.movement.begin_engagement's "stops short" case, a
+            # friendly ship passed through en route that it couldn't rest
+            # on) -- the remaining distance was already paid for as a flat
+            # attack_cost there, never actually walked hex by hex. Re-derive
+            # that real route now, purely for move_log/replay -- with an
+            # unlimited budget, since the cost is already spent and there's
+            # nothing left to check against -- rather than logging a bare
+            # two-point jump straight across whatever's in between (which,
+            # on a replay, can visibly cut across land). Falls back to the
+            # simple two-point path if that's ever somehow not derivable
+            # (e.g. a hex's legality changed in some unforeseen way between
+            # the approach and now) -- logging must never crash the game.
+            origin = attacker.position
+            try:
+                path = shortest_path(attacker, defender.position, game_state, ignore_budget=True)
+            except ValueError:
+                path = [origin, defender.position]
             attacker.position = defender.position
             handle_port_capture(game_state, attacker.position)
+            game_state.move_log.append(
+                MoveLogEntry(ship_id=attacker.id, kind=attacker.kind, owner=attacker.owner, path=path)
+            )
     if attacker.is_sunk:
         game_state.turn_stats[attacker.owner].ships_lost.append(attacker.kind)
         del game_state.ships[attacker.id]

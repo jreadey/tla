@@ -59,12 +59,46 @@ class MapConfig:
     # Pixel scale shared by map generation (elevation raster spacing) and
     # rendering (hex drawing size), so both stay in sync.
     hex_pixel_size: float = 18.0
+    # A generated map is rejected (see tla.mapgen.generate_map) unless
+    # every sea hex is within `max_route_distance_fraction * max(width,
+    # height)` real sea-route hexes of one of the (up to two) shortest
+    # routes between the two sides' ports -- see tla.mapgen.has_sea_route_
+    # coverage. Without this, a map can pass every other playability
+    # condition while still burying a large stretch of open ocean nowhere
+    # near anywhere the two sides could plausibly ever meet -- user's own
+    # diagnosis of a real generated map. A fraction of map size rather than
+    # a flat hex count so it scales with the map instead of needing its
+    # own per-config retuning -- empirically, the typical (median, across
+    # several seeds) real gap on a random candidate map sits at roughly
+    # 0.5-0.55x the longer map dimension on both this module's small
+    # default map and configs/large.json's much bigger one; 0.6 sits just
+    # above that median on both, so it still meaningfully rejects the
+    # worst outlier candidates without making an already-rare acceptable
+    # candidate (see has_fully_connected_sea) rarer still by compounding
+    # with an overly strict threshold.
+    max_route_distance_fraction: float = 0.6
+    # How many candidate maps generate_map will try (each with a different
+    # derived seed) before giving up and raising -- see PortConfig.
+    # min_port_sea_neighbors and tla.mapgen.has_wide_enough_sea_passage,
+    # two of the several conditions a candidate map/port-placement must
+    # all pass -- see tla.mapgen._map_is_playable. 100, not a smaller round
+    # number, because has_fully_connected_sea (requiring literally zero
+    # stray disconnected ponds anywhere, not just away from a port) can
+    # take several dozen attempts to satisfy by chance even at this
+    # module's own default map size -- an empirical sweep of 30 seeds at
+    # that size found one needing 66 attempts and none needing more.
+    max_generation_attempts: int = 100
 
 
 @dataclass
 class PortConfig:
     ports_per_player: int = 4
     min_port_spacing: int = 4
+    # A generated map is rejected (see tla.mapgen.generate_map) unless
+    # every port has at least this many sea-hex neighbors -- fewer would
+    # let a single blockading ship pin a port shut right at its own
+    # doorstep, with no other way in or out at all.
+    min_port_sea_neighbors: int = 2
 
 
 @dataclass
@@ -130,23 +164,26 @@ class AiConfig:
     # Retreat from an otherwise-winning battle once the attacker's own HP
     # fraction drops below this, to avoid a follow-up ambush.
     damaged_withdraw_fraction: float = 0.34
-    # A carrier retreats toward its escorts once a visible enemy comes
-    # within this many hexes of it.
+    # A carrier retreats toward its escorts once a visible enemy battleship,
+    # cruiser, or submarine -- the kinds that can actually hurt a carrier in
+    # a fight, per tla.ai.policy._DANGEROUS_TO_CARRIER_KINDS -- comes within
+    # this many hexes of it; a destroyer or patrol boat alone doesn't
+    # trigger it. Modeled on a human player's own reported tactic ("retreat
+    # if a battleship/cruiser/submarine comes within four hexes"), but kept
+    # at 3 here: self-play on a map only modestly bigger than this radius
+    # showed 4 making the carrier "threatened" by nearly the whole board at
+    # once, freezing its advance rather than merely making it cautious --
+    # bump this in a specific deployment's own config once the map is big
+    # enough that 4 doesn't swallow it.
     carrier_threat_radius: int = 3
-    # A battleship/carrier's chosen destination is only worth scouting
-    # ahead of (see tla.ai.policy._scout_prepass) if it's within this many
-    # hexes of a currently visible enemy -- otherwise the whole ocean would
-    # need "clearing" the instant any enemy is spotted anywhere, even far
-    # from where a capital ship is actually headed.
-    scout_trigger_radius: int = 4
-    # A capital ship held so its escort can scout ahead (see
-    # tla.ai.policy._scout_prepass) can be held for at most this many turns
-    # in a row -- past that it proceeds with its own chosen destination
-    # regardless, accepting a bounded ambush risk rather than potentially
-    # freezing in place indefinitely if an escort keeps being available
-    # turn after turn without the hold ever actually resolving into the
-    # capital ship completing its own move.
-    max_consecutive_scout_holds: int = 2
+    # How many of its own movement points a carrier holds back each turn
+    # when advancing toward a task-force goal, rather than spending its
+    # full budget -- see tla.ai.policy._choose_carrier_destination. Same
+    # human tactic as carrier_threat_radius: advance a couple hexes at a
+    # time and re-scan (next turn, from the new position) rather than
+    # committing the full move every turn and having farther to fall back
+    # from once a threat does turn up.
+    carrier_advance_reserve: int = 2
     # Seconds paced between each AI ship's move, so a human opponent can
     # watch an AI turn unfold instead of it resolving instantly.
     turn_pacing_seconds: float = 0.4
@@ -166,6 +203,17 @@ class AiConfig:
     # the minimum size to bother forming a non-carrier-anchored force.
     task_force_min_size: int = 2
     task_force_allow_non_carrier_forces: bool = True
+    # If set, a non-submarine force member advancing toward a non-RETREAT
+    # goal (tla.ai.policy.choose_task_force_destination) won't let its own
+    # sea-route progress toward that goal get more than this many hexes
+    # ahead of the force's own straggler (its slowest-progressing living
+    # non-submarine member) -- it redirects toward the straggler instead
+    # of continuing to advance. None (default) leaves cohesion purely
+    # emergent from the shared per-turn pace cap (_compute_force_pace),
+    # which bounds *speed* but not the position drift that different
+    # members' independent path choices (favorable attacks taken, escort
+    # rerouting, etc.) can still accumulate turn over turn.
+    task_force_max_separation: int | None = None
     # Turns with no strict improvement in distance-to-goal before a force
     # gives up on its current goal and gets reassigned a new one -- the
     # fix for a ship/force camping forever next to a fight it can't win.
@@ -188,15 +236,20 @@ class AiConfig:
     task_force_threat_radius: int = 4
     # How much clearer the disadvantage must be than a bare tie before a
     # force retreats -- 0 means retreat the instant the race would go
-    # against it, which in practice is *far* too trigger-happy (confirmed
-    # via self-play: a margin of 0 caused otherwise-winnable games to
-    # never conclude within a generous turn cap, by making forces retreat
-    # from marginal, often-recoverable disadvantages instead of pressing
-    # small, real advantages elsewhere). A higher margin requires a more
-    # decisive, unambiguous mismatch before backing off. Also the margin
-    # used to decide when a *retreating* force has recruited enough to
-    # safely resume -- see task_force_max_retreat_turns.
-    task_force_outnumbered_margin: int = 4
+    # against it. Also the margin used to decide when a *retreating* force
+    # has recruited enough to safely resume -- see task_force_max_retreat_
+    # turns. A margin of 0 was originally found to be *far* too
+    # trigger-happy on its own: self-play showed otherwise-winnable games
+    # never concluding, because a retreating force could get stuck unable
+    # to clear even a zero margin against its frozen threat snapshot,
+    # having also retreated too readily in the first place. That regression
+    # is specific to margin 0 with no other way to stop retreating --
+    # retesting after adding retreat_cancel_port_distance (an independent,
+    # non-strength way to end a retreat) showed the same margin of 0 winning
+    # a head-to-head tournament ~62% of the time against the old default (4)
+    # with zero non-convergent games across a 20-seed sweep, since a force
+    # is no longer solely dependent on clearing this margin to ever resume.
+    task_force_outnumbered_margin: int = 0
     # A retreating force keeps retreating toward its rally port -- absorbing
     # nearby unassigned ships via recruit_into_open_forces the same as any
     # other open force -- until its own current strength clearly outmatches
@@ -210,6 +263,52 @@ class AiConfig:
     # (8) and task_force_attrition_turns (3) since the whole point here is
     # giving real production time to matter.
     task_force_max_retreat_turns: int = 15
+    # A retreating force also stops retreating -- regardless of whether it
+    # has actually out-grown what it retreated from -- once it comes within
+    # this many hexes (real sea route, not straight-line) of one of its own
+    # controlled ports. Rationale: retreating helps an attacker advance
+    # unopposed more than it helps the defender, since the defender bleeds
+    # ships either way and a fight near home still slows the attacker down
+    # while staying close to where new production actually arrives -- so
+    # once a force is already that close, standing and fighting is worth
+    # more than continuing to retreat purely because it hasn't cleared
+    # task_force_outnumbered_margin yet. Confirmed via a self-play
+    # head-to-head tournament (30 seeds, both sides swapped): every
+    # threshold from 1 to 100 hexes beat "disabled" ~60-63% of the time,
+    # with results essentially flat across that whole range -- the value
+    # itself barely matters (the real fix is having *any* non-strength way
+    # to stop retreating), so 8 was picked on the original strategic
+    # reasoning above, not because the data preferred it specifically. See
+    # project_retreat_cancel_near_port memory for the full experiment.
+    # None disables this, leaving the strength check as the only way to
+    # stop retreating (the pre-tournament behavior).
+    retreat_cancel_port_distance: int | None = 8
+    # Whether resuming via retreat_cancel_port_distance (as opposed to
+    # actually out-growing the threat) also resets turns_since_progress/
+    # best_progress_distance for the force's goal, same as a strength-based
+    # resume always does. False (default) keeps the prior progress tracking
+    # intact across a distance-based resume instead -- found necessary
+    # after a real game showed a force cycling trigger-retreat-resume-
+    # repeat near its own territory, each fast, cheap resume erasing
+    # hard-won progress toward a distant goal and trapping the whole war
+    # near one side of the map. A head-to-head self-play tournament (30
+    # seeds, both sides swapped, both a 14x10 and a 20x12 map) came back an
+    # even 48-50% against the old (True) behavior either way -- not a
+    # measured improvement, but no measured cost either, and it directly
+    # fixes a diagnosed, reproducible failure mode the aggregate win-rate
+    # metric is apparently too coarse to reward or punish. See
+    # project_retreat_cancel_near_port memory for the full experiment,
+    # including a second candidate fix (capping how far a retreat travels)
+    # that was tried and NOT adopted -- it measurably regressed in one of
+    # the two tournament configurations.
+    reset_progress_on_distance_resume: bool = False
+    # If set, a retreating force's movement target is capped to this many
+    # hexes along the real sea route toward its rally port (see
+    # rally_point/_pullback_waypoint), not the port itself -- so a force
+    # already reasonably safe doesn't have to fully retreat before the
+    # resume checks above can apply. None (default) retreats all the way
+    # to the rally port, as before.
+    retreat_pullback_hexes: int | None = None
     # Below this many members, a force is "open" and actively recruits
     # nearby unassigned ships (see tla.ai.task_force.recruit_into_open_
     # forces) instead of them always spinning up a new, separate force.
@@ -227,6 +326,22 @@ class AiConfig:
     # newly produced ship spawning at a home port) needs to reach a force
     # that may already be deployed far away.
     task_force_recruit_radius: int = 10
+    # Port-defense doctrine (see tla.ai.task_force.compute_port_defense_
+    # directives), specified directly by the user from their own playtest
+    # strategy: a controlled port is "threatened" once a visible enemy is
+    # within this many sea hexes of it.
+    port_defense_trigger_radius: int = 4
+    # Only a player's own ships within this many sea hexes of a threatened
+    # port are considered as candidate responders -- anything farther is
+    # judged too far to arrive in time and is left doing whatever it's
+    # already doing rather than recalled.
+    port_defense_response_radius: int = 8
+    # How much stronger the threat must be (see tla.ai.task_force.
+    # outmatched) before responders fall back to a single delaying
+    # blocker instead of counterattacking as a group. 0 -- the default,
+    # matching the user's own stated doctrine -- means "counterattack as
+    # long as we're at least as strong," not strictly stronger.
+    port_defense_margin: int = 0
 
 
 @dataclass

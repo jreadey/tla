@@ -1,3 +1,5 @@
+import dataclasses
+
 from tla.config import Config, FleetConfig, MapConfig, PortConfig
 from tla.fleet_setup import place_initial_fleets
 from tla.mapgen import generate_map, largest_sea_component
@@ -70,8 +72,15 @@ def test_starting_ships_are_never_placed_in_an_isolated_pond():
     # actual path (through occupiable hexes) to the rest of the map --
     # hex-distance search doesn't account for land blocking the route.
     config = Config()
+    # Tests fleet placement specifically, not map generation itself --
+    # has_fully_connected_sea (requiring literally zero stray disconnected
+    # ponds anywhere) can need many dozens of attempts by chance alone at
+    # the bare default Config's own (large, 4-port) map size, so max_
+    # generation_attempts is raised well past the (smaller-map-tuned)
+    # default here rather than risk flakiness in an unrelated test.
+    map_config = dataclasses.replace(config.map, max_generation_attempts=200)
     seed = 323368
-    board = generate_map(config.map, config.ports, seed=seed)
+    board = generate_map(map_config, config.ports, seed=seed)
     ships = place_initial_fleets(board, config, seed)
     main_sea = largest_sea_component(board)
 

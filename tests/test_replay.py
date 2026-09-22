@@ -3,12 +3,13 @@ import json
 from tla.ai.task_force import GoalKind, TaskForce, TaskForceGoal
 from tla.board import Board
 from tla.config import Config
-from tla.game_state import BattleLogEntry, GameState, TurnPhase, TurnStats
+from tla.game_state import BattleLogEntry, GameState, MoveLogEntry, TurnPhase, TurnStats
 from tla.hexgrid import AxialCoord
 from tla.replay import (
     ReplayWriter,
     _battle_log_entry_dict,
     _config_dict,
+    _move_log_entry_dict,
     _port_dict,
     _ship_dict,
     _task_force_dict,
@@ -353,3 +354,64 @@ def test_write_final_includes_battle_log(tmp_path):
     final_record = json.loads(path.read_text().splitlines()[1])
     assert len(final_record["battle_log"]) == 1
     assert final_record["battle_log"][0]["defender_sunk"] is True
+
+
+def test_move_log_entry_dict_encodes_all_fields():
+    entry = MoveLogEntry(
+        ship_id=1, kind=ShipKind.DESTROYER, owner=PLAYER_A, path=[AxialCoord(0, 0), AxialCoord(1, 0)]
+    )
+
+    data = _move_log_entry_dict(entry)
+
+    assert data == {
+        "ship_id": 1,
+        "kind": "destroyer",
+        "owner": PLAYER_A,
+        "path": [[0, 0], [1, 0]],
+    }
+
+
+def test_write_half_turn_includes_move_log(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+    writer.write_initial(gs)
+
+    gs.move_log.append(
+        MoveLogEntry(ship_id=1, kind=ShipKind.DESTROYER, owner=PLAYER_A, path=[AxialCoord(1, 2), AxialCoord(1, 0)])
+    )
+    writer.write_half_turn(gs, phase=TurnPhase.MOVE_A, player=PLAYER_A)
+
+    record = json.loads(path.read_text().splitlines()[1])
+    assert len(record["move_log"]) == 1
+    assert record["move_log"][0]["ship_id"] == 1
+    assert record["move_log"][0]["path"] == [[1, 2], [1, 0]]
+
+
+def test_write_half_turn_move_log_empty_when_nothing_moved(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+    writer.write_initial(gs)
+
+    writer.write_half_turn(gs, phase=TurnPhase.MOVE_A, player=PLAYER_A)
+
+    record = json.loads(path.read_text().splitlines()[1])
+    assert record["move_log"] == []
+
+
+def test_write_final_includes_move_log(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+    writer.write_initial(gs)
+    gs.winner = PLAYER_A
+    gs.move_log.append(
+        MoveLogEntry(ship_id=1, kind=ShipKind.DESTROYER, owner=PLAYER_A, path=[AxialCoord(1, 2), AxialCoord(1, 0)])
+    )
+
+    writer.write_final(gs)
+
+    final_record = json.loads(path.read_text().splitlines()[1])
+    assert len(final_record["move_log"]) == 1
+    assert final_record["move_log"][0]["ship_id"] == 1

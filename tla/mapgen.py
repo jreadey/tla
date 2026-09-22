@@ -22,8 +22,54 @@ from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
 def generate_map(
     map_config: MapConfig, port_config: PortConfig, seed: int | None = None
 ) -> Board:
+    """Generates a candidate map + port placement, rejecting and retrying
+    (with a different derived seed each attempt -- `_derive_seed(base_seed,
+    attempt)`, so the whole sequence stays reproducible from `base_seed`
+    alone) any candidate that fails any of the playability conditions
+    checked by `_map_is_playable`: every sea hex belongs to one single
+    connected body of water, every port needs room to maneuver, the two
+    sides' territories need at least one route between them that a single
+    blockading ship can't fully choke off, there needs to be a real island
+    somewhere in the sea so at least one such route has a genuinely
+    distinct alternative (not just one shape every path is stuck inside),
+    and no sea hex may sit too far from either of those two routes -- see
+    `has_fully_connected_sea`/`_ports_have_sea_room`/`has_wide_enough_sea_
+    passage`/`has_non_homotopic_sea_paths`/`has_sea_route_coverage`.
+    Raises `RuntimeError` after `MapConfig.max_generation_attempts` straight
+    rejections -- the same "give up and tell the caller to adjust config"
+    contract `_place_ports` already uses for too few coastal tiles."""
     if seed is None:
         seed = map_config.seed if map_config.seed is not None else random.randrange(1_000_000)
+    base_seed = seed
+    for attempt in range(map_config.max_generation_attempts):
+        board = _generate_map_once(map_config, port_config, _derive_seed(base_seed, attempt))
+        if _map_is_playable(board, map_config, port_config):
+            return board
+    max_route_distance = map_config.max_route_distance_fraction * max(map_config.width, map_config.height)
+    raise RuntimeError(
+        f"No playable map found in {map_config.max_generation_attempts} attempts from seed "
+        f"{base_seed} -- the sea needs to be a single connected body of water, every port needs "
+        f">= {port_config.min_port_sea_neighbors} sea-hex neighbors, the two sides need at least "
+        "one route a single blockading ship can't fully cut, the sea needs at least one real "
+        f"island for routes to actually differ around, and no sea hex may sit more than "
+        f"{max_route_distance:.0f} hexes ({map_config.max_route_distance_fraction} of the longer map "
+        "dimension) from either resulting route. Adjust map size/shape config, "
+        "min_port_sea_neighbors, max_route_distance_fraction, or max_generation_attempts."
+    )
+
+
+def _derive_seed(base_seed: int, attempt: int) -> int:
+    """A well-scattered per-attempt seed derived from `base_seed` -- deter-
+    ministic (same inputs always give the same output), but nearby base
+    seeds (e.g. two callers using seed=1 and seed=2) don't retry through
+    near-identical sequences the way plain `base_seed + attempt` would,
+    which could otherwise make two *different* starting seeds converge on
+    generating the exact same accepted map. Knuth's multiplicative-hash
+    constant mixes the two inputs across a full 32-bit range."""
+    return (base_seed * 2_654_435_761 + attempt * 40_503 + 1) & 0xFFFFFFFF
+
+
+def _generate_map_once(map_config: MapConfig, port_config: PortConfig, seed: int) -> Board:
     noise_base = seed % 256
     hex_size = map_config.hex_pixel_size
 
@@ -242,3 +288,261 @@ def _cluster_near(
         remaining = [c for c in by_distance if c not in chosen]
         chosen.extend(remaining[: count - len(chosen)])
     return chosen
+
+
+def _map_is_playable(board: Board, map_config: MapConfig, port_config: PortConfig) -> bool:
+    """The playability conditions a candidate map/port-placement must all
+    pass, user-specified directly: (1) the sea is a single connected body
+    of water, not several disconnected ones, (2) every port has room to
+    maneuver, not just a single blockadable doorway, (3) the two sides
+    aren't separated only by chokepoints a single ship can plug, (4)
+    there's a real choice of route between the sides, not just one region
+    of open water with a single topological "shape" every route is stuck
+    inside, and (5) no sea hex sits too far from wherever that choice of
+    route actually goes -- see `has_fully_connected_sea`/`_ports_have_sea_
+    room`/`has_wide_enough_sea_passage`/`has_non_homotopic_sea_paths`/
+    `has_sea_route_coverage`. Ordered roughly cheapest-first so a
+    thoroughly broken candidate is rejected before paying for the pricier
+    checks later in the chain."""
+    return (
+        has_fully_connected_sea(board)
+        and _ports_have_sea_room(board, port_config)
+        and has_wide_enough_sea_passage(board)
+        and has_non_homotopic_sea_paths(board)
+        and has_sea_route_coverage(board, map_config)
+    )
+
+
+def has_fully_connected_sea(board: Board) -> bool:
+    """Whether every SEA hex on `board` belongs to one single connected
+    body of water -- no isolated pond anywhere on the map, not just away
+    from a port's own doorstep (`_ports_have_sea_room` and every other
+    check here already only care about `largest_sea_component`, so a small
+    stray pond elsewhere would otherwise pass every other condition
+    silently). An empty sea counts as trivially connected -- nothing to be
+    disconnected from."""
+    sea_tiles = {c for c, t in board.tiles.items() if t.terrain == TerrainType.SEA}
+    return sea_tiles == largest_sea_component(board)
+
+
+def _ports_have_sea_room(board: Board, port_config: PortConfig) -> bool:
+    """Every port on `board` borders at least `PortConfig.min_port_sea_
+    neighbors` hexes of the main sea component -- fewer would mean a
+    single blockading ship could pin the port shut right at its own
+    doorstep, with no other way in or out at all. Only counts neighbors
+    in `largest_sea_component` (not a tiny, disconnected pond next door --
+    that wouldn't actually give the port anywhere useful to go)."""
+    main_sea = largest_sea_component(board)
+    ports = board.ports_for(PLAYER_A) + board.ports_for(PLAYER_B)
+    return all(
+        sum(1 for n in neighbors(port) if n in main_sea) >= port_config.min_port_sea_neighbors
+        for port in ports
+    )
+
+
+def has_wide_enough_sea_passage(board: Board) -> bool:
+    """Whether Player A's ports stay sea-connected to Player B's ports no
+    matter which single sea hex is removed -- i.e. there's always some
+    surviving route between the two sides, so one blockading ship can
+    never fully cut naval movement between them. Equivalent to asking
+    whether the two sides are 2-vertex-connected in the sea-hex adjacency
+    graph; checked directly (try removing each sea hex in turn and see if
+    a source->sink route still exists for every one of them) rather than
+    via a dedicated min-cut algorithm, since the small board sizes here
+    make the brute-force version plenty fast and far simpler to get right.
+
+    False (map should be rejected) if the two sides aren't even connected
+    at all with nothing removed, which is the same failure by definition."""
+    main_sea = largest_sea_component(board)
+    ports_a = board.ports_for(PLAYER_A)
+    ports_b = board.ports_for(PLAYER_B)
+    sources = {n for p in ports_a for n in neighbors(p) if n in main_sea}
+    sinks = {n for p in ports_b for n in neighbors(p) if n in main_sea}
+    if not sources or not sinks:
+        return False
+    if not _sea_connected(main_sea, sources, sinks):
+        return False
+    return all(
+        _sea_connected(main_sea - {blocked}, sources - {blocked}, sinks - {blocked})
+        for blocked in main_sea
+    )
+
+
+def _sea_connected(sea: set[AxialCoord], sources: set[AxialCoord], sinks: set[AxialCoord]) -> bool:
+    """Plain BFS reachability from any hex in `sources` to any hex in
+    `sinks`, moving only through hexes in `sea`."""
+    frontier = list(sources & sea)
+    visited = set(frontier)
+    while frontier:
+        coord = frontier.pop()
+        if coord in sinks:
+            return True
+        for n in neighbors(coord):
+            if n in sea and n not in visited:
+                visited.add(n)
+                frontier.append(n)
+    return bool(visited & sinks)
+
+
+def has_non_homotopic_sea_paths(board: Board) -> bool:
+    """Whether the main sea has at least one island in it -- a land
+    component fully enclosed by sea, not touching the map's outer edge --
+    so a route between any two ports has a genuinely different
+    alternative: going around such an island one way can never be
+    continuously slid into going around it the other way (they wind
+    around the hole differently), the way any two routes through a
+    hole-free ("simply connected") sea always can be. With at least one
+    such hole, *every* pair of points in the same connected sea already
+    has infinitely many pairwise non-homotopic routes between them, so
+    this only needs checking once for the whole map, not per port pair --
+    a landmass that instead touches the map's edge doesn't count: treat
+    the finite generated map as a window onto an unbounded ocean, and a
+    landmass reaching that edge is a peninsula/mainland extending past
+    what's drawn, not a closed loop a route can wind around."""
+    main_sea = largest_sea_component(board)
+    for component in _land_components(board):
+        if _touches_board_edge(component, board):
+            continue
+        if any(n in main_sea for coord in component for n in neighbors(coord)):
+            return True
+    return False
+
+
+def _land_components(board: Board) -> list[set[AxialCoord]]:
+    """Every maximal connected group of LAND hexes on `board` (flood fill
+    over land-land adjacency -- the land-side mirror of
+    `largest_sea_component`'s sea-side one)."""
+    land_tiles = {c for c, t in board.tiles.items() if t.terrain == TerrainType.LAND}
+    seen: set[AxialCoord] = set()
+    components: list[set[AxialCoord]] = []
+    for start in land_tiles:
+        if start in seen:
+            continue
+        component: set[AxialCoord] = set()
+        stack = [start]
+        while stack:
+            coord = stack.pop()
+            if coord in component:
+                continue
+            component.add(coord)
+            for n in neighbors(coord):
+                if n in land_tiles and n not in component:
+                    stack.append(n)
+        seen |= component
+        components.append(component)
+    return components
+
+
+def _touches_board_edge(component: set[AxialCoord], board: Board) -> bool:
+    """Whether any hex in `component` has a neighbor coordinate that
+    isn't part of `board` at all -- i.e. the component reaches the edge
+    of the generated area, regardless of the board's exact offset-
+    coordinate shape (simpler and more robust than comparing against
+    `board.width`/`height` directly)."""
+    return any(n not in board.tiles for coord in component for n in neighbors(coord))
+
+
+def has_sea_route_coverage(board: Board, map_config: MapConfig) -> bool:
+    """Whether every hex in `largest_sea_component(board)` is within
+    `MapConfig.max_route_distance_fraction * max(board.width, board.
+    height)` real sea-route hexes of at least one of the (up to two)
+    shortest routes between the two sides' ports -- the single shortest
+    route, plus a second one forced around whichever island actually
+    gives the map its route diversity (see `has_non_homotopic_sea_paths`),
+    found by re-running the same search with the first route's own
+    interior blocked. Without this, a map can pass every other
+    playability condition while still burying a large stretch of open
+    ocean nowhere near anywhere the two sides could plausibly ever fight
+    -- user's own diagnosis of a real generated map (see the project's
+    own map-playability memory). A fraction of `board`'s own size rather
+    than a flat hex count, so this scales automatically instead of
+    needing its own per-map-size retuning -- see `MapConfig.max_route_
+    distance_fraction`. Deliberately reads size off `board` itself, not
+    `map_config` (in the real `generate_map` pipeline the two always
+    agree, since `board` is built directly from `map_config`, but a
+    hand-built `board` passed here standalone -- e.g. in tests -- might
+    not otherwise match whatever unrelated `map_config` happens to be
+    passed alongside it).
+
+    False outright if either side has no port bordering the main sea at
+    all (nothing to route between -- `_ports_have_sea_room`/`has_wide_
+    enough_sea_passage` already guard the real pipeline against this, but
+    this is independently callable and testable). Only the second route
+    can fail to exist (no real island, or its far side is otherwise
+    unreachable without the first route's own hexes) -- when that happens,
+    coverage is judged by the first route alone rather than rejecting the
+    map here too for a shortfall `has_non_homotopic_sea_paths` already
+    owns catching."""
+    main_sea = largest_sea_component(board)
+    sources = {n for p in board.ports_for(PLAYER_A) for n in neighbors(p) if n in main_sea}
+    sinks = {n for p in board.ports_for(PLAYER_B) for n in neighbors(p) if n in main_sea}
+    if not sources or not sinks:
+        return False
+    route1 = _shortest_sea_route(main_sea, sources, sinks)
+    if route1 is None:
+        return False
+    route2 = _shortest_sea_route(main_sea, sources, sinks, avoid=frozenset(route1) - sources - sinks)
+    route_hexes = set(route1) | (set(route2) if route2 is not None else set())
+
+    max_distance = map_config.max_route_distance_fraction * max(board.width, board.height)
+    distance_from_route = _multi_source_sea_distance(main_sea, route_hexes)
+    return all(distance_from_route[coord] <= max_distance for coord in main_sea)
+
+
+def _shortest_sea_route(
+    sea: set[AxialCoord],
+    sources: set[AxialCoord],
+    sinks: set[AxialCoord],
+    avoid: frozenset[AxialCoord] = frozenset(),
+) -> list[AxialCoord] | None:
+    """Shortest hex path (BFS, unweighted) from any hex in `sources` to any
+    hex in `sinks`, moving only through `sea` hexes not in `avoid` --
+    `sources`/`sinks` are always usable regardless of `avoid`, so blocking
+    a previously-found route's own interior (see `has_sea_route_coverage`,
+    forcing a second, differently-routed search) can never also block the
+    very ports that search still has to start and end at. None if no such
+    path exists."""
+    usable = (sea - avoid) | sources | sinks
+    parents: dict[AxialCoord, AxialCoord] = {}
+    frontier = list(sources & usable)
+    visited = set(frontier)
+    for start in frontier:
+        if start in sinks:
+            return [start]
+    while frontier:
+        next_frontier: list[AxialCoord] = []
+        for coord in frontier:
+            for n in neighbors(coord):
+                if n not in usable or n in visited:
+                    continue
+                visited.add(n)
+                parents[n] = coord
+                if n in sinks:
+                    path = [n]
+                    while path[-1] in parents:
+                        path.append(parents[path[-1]])
+                    path.reverse()
+                    return path
+                next_frontier.append(n)
+        frontier = next_frontier
+    return None
+
+
+def _multi_source_sea_distance(sea: set[AxialCoord], sources: set[AxialCoord]) -> dict[AxialCoord, int]:
+    """BFS distance (hex steps, moving only through `sea`) from the
+    nearest hex in `sources` to every hex in `sea` -- every hex in a
+    connected `sea` is reachable from any non-empty `sources` subset of it,
+    so (unlike `tla.ai.task_force.sea_distance_field`, which has to handle
+    a source outside the sea or a target sea disconnected from it) this
+    never needs a fallback for an unreachable hex."""
+    dist: dict[AxialCoord, int] = {s: 0 for s in sources}
+    frontier = list(dist)
+    while frontier:
+        next_frontier: list[AxialCoord] = []
+        for coord in frontier:
+            for n in neighbors(coord):
+                if n in sea and n not in dist:
+                    dist[n] = dist[coord] + 1
+                    next_frontier.append(n)
+        frontier = next_frontier
+    return dist

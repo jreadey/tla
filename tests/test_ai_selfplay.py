@@ -29,7 +29,17 @@ _SMALL_CONFIG = Config(
     fow=FowConfig(enabled=True),
 )
 
-_MAX_TURNS = 400
+# 600 was enough after port-defense landed (see above). Removing the old
+# scout-ahead-of-a-capital-ship prepass (tla.ai.policy._scout_prepass, now
+# gone -- replaced by _rearguard_target, an escort trailing behind instead
+# of scouting ahead) sped most seeds up noticeably (fewer stall-and-wait
+# turns), but seed 6 became a real outlier: a badly outnumbered survivor,
+# still holding one port defended just well enough (by the same port-
+# defense mechanism) to keep replenishing, drags the game out to turn 829
+# before the dominant side finally finishes it off. 1000 keeps comfortable
+# margin above that without chasing an arbitrarily large number for a
+# single seed's long tail.
+_MAX_TURNS = 1000
 
 
 def test_naive_policy_vs_itself_reaches_a_winner_without_raising():

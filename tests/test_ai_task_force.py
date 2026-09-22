@@ -5,8 +5,12 @@ from tla.ai.task_force import (
     GoalKind,
     TaskForce,
     TaskForceGoal,
+    _block_hex_toward_port,
+    _choose_blocker,
     _gather,
+    _pullback_waypoint,
     assign_goal,
+    compute_port_defense_directives,
     find_chokepoint,
     force_recapture_goal,
     form_task_forces,
@@ -18,6 +22,7 @@ from tla.ai.task_force import (
     record_task_force_progress,
     recruit_into_open_forces,
     repair_task_forces,
+    sea_distance_field,
     update_task_force_goals,
     update_task_force_stance,
 )
@@ -742,6 +747,7 @@ def test_retreat_preserves_goal_across_the_pullback_and_resumes_once_reinforced(
             task_force_stall_turns=3,
             task_force_min_size=1,
             task_force_max_retreat_turns=100,  # isolate from the dedicated safety-valve test above
+            retreat_cancel_port_distance=None,  # isolate from the dedicated distance-cancel tests
         ),
     )
     attacker = _ship(AxialCoord(9, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
@@ -1011,3 +1017,347 @@ def test_force_recapture_goal_is_a_noop_with_no_lost_ports_or_no_members():
     empty_force = TaskForce(id=2, owner=PLAYER_A, member_ids=set(), goal=goal)
     force_recapture_goal(empty_force, gs, {AxialCoord(5, 0)})
     assert empty_force.goal == goal
+
+
+def test_update_task_force_stance_resumes_when_close_enough_to_a_port_even_if_still_weaker():
+    board = _sea_board(radius=20)
+    home_port = AxialCoord(-8, 0)
+    board.tiles[home_port] = Tile(coord=home_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(-6, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # 2 hexes from home_port
+    config = Config(ai=AiConfig(retreat_cancel_port_distance=6, task_force_outnumbered_margin=4))
+    gs = _game_state(board, [ship], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0))
+    force = TaskForce(
+        id=1,
+        owner=PLAYER_A,
+        member_ids={1},
+        goal=goal,
+        retreating=True,
+        retreat_turns=1,
+        retreat_threat_power=(1000, 1000),  # never beatable by strength alone
+    )
+
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is False  # close enough to home to stand and fight anyway
+    assert force.retreat_threat_power is None
+    assert force.retreat_turns == 0
+    assert force.goal == goal
+
+
+def test_update_task_force_stance_keeps_retreating_when_too_far_from_a_port():
+    board = _sea_board(radius=20)
+    home_port = AxialCoord(-8, 0)
+    board.tiles[home_port] = Tile(coord=home_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # 8 hexes from home_port
+    config = Config(ai=AiConfig(retreat_cancel_port_distance=6, task_force_outnumbered_margin=4))
+    gs = _game_state(board, [ship], config=config)
+    force = TaskForce(
+        id=1,
+        owner=PLAYER_A,
+        member_ids={1},
+        goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0)),
+        retreating=True,
+        retreat_turns=1,
+        retreat_threat_power=(1000, 1000),
+    )
+
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is True  # still 8 hexes out -- past the 6-hex cutoff
+    assert force.retreat_turns == 2
+
+
+def test_update_task_force_stance_distance_cancel_disabled_when_none():
+    board = _sea_board(radius=20)
+    home_port = AxialCoord(-8, 0)
+    board.tiles[home_port] = Tile(coord=home_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(-7, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # 1 hex from home_port
+    config = Config(ai=AiConfig(retreat_cancel_port_distance=None))
+    gs = _game_state(board, [ship], config=config)
+    force = TaskForce(
+        id=1,
+        owner=PLAYER_A,
+        member_ids={1},
+        goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0)),
+        retreating=True,
+        retreat_turns=1,
+        retreat_threat_power=(1000, 1000),
+    )
+
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is True  # distance cancel is off -- only strength can end this
+
+
+def test_distance_resume_resets_progress_when_flag_enabled():
+    board = _sea_board(radius=20)
+    home_port = AxialCoord(-8, 0)
+    board.tiles[home_port] = Tile(coord=home_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(-6, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # 2 hexes from home_port
+    config = Config(
+        ai=AiConfig(
+            retreat_cancel_port_distance=6,
+            task_force_outnumbered_margin=4,
+            reset_progress_on_distance_resume=True,
+        )
+    )
+    gs = _game_state(board, [ship], config=config)
+    force = TaskForce(
+        id=1,
+        owner=PLAYER_A,
+        member_ids={1},
+        goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0)),
+        retreating=True,
+        retreat_turns=1,
+        retreat_threat_power=(1000, 1000),  # never beatable by strength
+        turns_since_progress=5,
+        best_progress_distance=3,
+    )
+
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is False  # resumed via distance, not strength
+    assert force.turns_since_progress == 0
+    assert force.best_progress_distance is None
+
+
+def test_distance_resume_preserves_progress_when_flag_disabled():
+    board = _sea_board(radius=20)
+    home_port = AxialCoord(-8, 0)
+    board.tiles[home_port] = Tile(coord=home_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(-6, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # 2 hexes from home_port
+    config = Config(
+        ai=AiConfig(
+            retreat_cancel_port_distance=6,
+            task_force_outnumbered_margin=4,
+            reset_progress_on_distance_resume=False,
+        )
+    )
+    gs = _game_state(board, [ship], config=config)
+    force = TaskForce(
+        id=1,
+        owner=PLAYER_A,
+        member_ids={1},
+        goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0)),
+        retreating=True,
+        retreat_turns=1,
+        retreat_threat_power=(1000, 1000),
+        turns_since_progress=5,
+        best_progress_distance=3,
+    )
+
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is False  # still resumed via distance
+    assert force.turns_since_progress == 5  # ...but progress tracking survives
+    assert force.best_progress_distance == 3
+
+
+def test_strength_resume_always_resets_progress_even_when_distance_flag_disabled():
+    board = _sea_board(radius=20)
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # (hp=6, damage=2)
+    config = Config(
+        ai=AiConfig(
+            retreat_cancel_port_distance=None,  # isolate from distance entirely
+            reset_progress_on_distance_resume=False,
+        )
+    )
+    gs = _game_state(board, [ship], config=config)
+    force = TaskForce(
+        id=1,
+        owner=PLAYER_A,
+        member_ids={1},
+        goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0)),
+        retreating=True,
+        retreat_turns=3,
+        retreat_threat_power=(1, 1),  # trivially weak -- easily beaten by strength
+        turns_since_progress=5,
+        best_progress_distance=3,
+    )
+
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is False  # resumed via strength
+    assert force.turns_since_progress == 0  # strength-based resume always resets
+    assert force.best_progress_distance is None
+
+
+def test_pullback_waypoint_caps_short_of_the_port():
+    board = _sea_board(radius=20)
+    port = AxialCoord(-10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship])
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1})
+
+    waypoint = _pullback_waypoint(force, gs, 3)
+
+    assert waypoint is not None
+    assert waypoint != port
+    assert distance(AxialCoord(0, 0), waypoint) == 3
+
+
+def test_pullback_waypoint_falls_through_to_the_port_when_already_closer():
+    board = _sea_board(radius=20)
+    port = AxialCoord(-2, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship])
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1})
+
+    waypoint = _pullback_waypoint(force, gs, 10)  # cap far larger than the real distance
+
+    assert waypoint == port
+
+
+def test_update_task_force_stance_snapshots_and_clears_retreat_waypoint():
+    board = _sea_board(radius=20)
+    port = AxialCoord(-10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    weak = _ship(AxialCoord(0, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    strong = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_B, 2, hp=100)
+    config = Config(
+        ai=AiConfig(
+            task_force_threat_radius=4,
+            task_force_outnumbered_margin=0,
+            retreat_pullback_hexes=3,
+            retreat_cancel_port_distance=None,
+        )
+    )
+    gs = _game_state(board, [weak, strong], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0)))
+
+    update_task_force_stance(gs, PLAYER_A, [force], {2: strong})  # triggers retreat
+
+    assert force.retreating is True
+    assert force.retreat_waypoint is not None
+    assert force.retreat_waypoint != port  # capped short, not the port itself
+
+    # Now make it trivially strong enough to resume via strength.
+    force.retreat_threat_power = (1, 1)
+    update_task_force_stance(gs, PLAYER_A, [force], {})
+
+    assert force.retreating is False
+    assert force.retreat_waypoint is None  # cleared on resume
+
+
+# -- port defense (see compute_port_defense_directives) --------------------
+
+
+def _port_board(port: AxialCoord, radius: int = 10) -> Board:
+    board = _sea_board(radius=radius)
+    board.tiles[port] = Tile(
+        coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A, port_controller=PLAYER_A
+    )
+    return board
+
+
+def test_compute_port_defense_directives_counterattacks_when_not_outmatched():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    defender = _ship(AxialCoord(2, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    threat = _ship(AxialCoord(4, 0), ShipKind.DESTROYER, PLAYER_B, 2)  # 4 hexes -- exactly the trigger radius
+    gs = _game_state(board, [defender, threat])
+
+    directives = compute_port_defense_directives(gs, PLAYER_A, {2: threat}, AiConfig())
+
+    assert len(directives) == 1
+    directive = directives[0]
+    assert directive.port == port
+    assert directive.threats == [threat]
+    assert directive.counterattack == [defender]
+    assert directive.block is None
+
+
+def test_compute_port_defense_directives_blocks_when_outmatched():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    weak = _ship(AxialCoord(2, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    sub = _ship(AxialCoord(2, 1), ShipKind.SUBMARINE, PLAYER_A, 2)
+    strong_threat = _ship(AxialCoord(4, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    gs = _game_state(board, [weak, sub, strong_threat])
+
+    directives = compute_port_defense_directives(gs, PLAYER_A, {3: strong_threat}, AiConfig())
+
+    assert len(directives) == 1
+    directive = directives[0]
+    assert directive.counterattack == []
+    assert directive.block is sub  # submarine preferred as the delaying picket
+    assert directive.block_hex is not None
+
+
+def test_compute_port_defense_directives_ignores_a_threat_past_the_trigger_radius():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    defender = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    far_threat = _ship(AxialCoord(9, 0), ShipKind.DESTROYER, PLAYER_B, 2)  # past the default radius of 4
+
+    directives = compute_port_defense_directives(
+        _game_state(board, [defender, far_threat]), PLAYER_A, {2: far_threat}, AiConfig()
+    )
+
+    assert directives == []
+
+
+def test_compute_port_defense_directives_ignores_a_responder_too_far_to_help():
+    port = AxialCoord(0, 0)
+    board = _port_board(port, radius=15)
+    far_defender = _ship(AxialCoord(12, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)  # past the default radius of 8
+    threat = _ship(AxialCoord(4, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+
+    directives = compute_port_defense_directives(
+        _game_state(board, [far_defender, threat]), PLAYER_A, {2: threat}, AiConfig()
+    )
+
+    assert directives == []
+
+
+def test_compute_port_defense_directives_does_not_double_claim_a_responder():
+    port_a = AxialCoord(0, 0)
+    port_b = AxialCoord(3, 0)
+    board = _sea_board(radius=15)
+    for port in (port_a, port_b):
+        board.tiles[port] = Tile(
+            coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A, port_controller=PLAYER_A
+        )
+    responder = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)  # in range of both ports
+    threat_a = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+    threat_b = _ship(AxialCoord(4, 0), ShipKind.DESTROYER, PLAYER_B, 3)
+    gs = _game_state(board, [responder, threat_a, threat_b])
+
+    directives = compute_port_defense_directives(gs, PLAYER_A, {2: threat_a, 3: threat_b}, AiConfig())
+
+    claimed_ids = [s.id for d in directives for s in (d.counterattack or ([d.block] if d.block else []))]
+    assert claimed_ids.count(1) == 1
+
+
+def test_choose_blocker_prefers_a_submarine_over_a_patrol_boat_over_anything_else():
+    sub = _ship(AxialCoord(0, 0), ShipKind.SUBMARINE, PLAYER_A, 1)
+    patrol = _ship(AxialCoord(0, 0), ShipKind.PATROL_BOAT, PLAYER_A, 2)
+    battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 3)
+
+    assert _choose_blocker([patrol, battleship, sub]) is sub
+    assert _choose_blocker([patrol, battleship]) is patrol
+    assert _choose_blocker([battleship]) is battleship
+
+
+def test_block_hex_toward_port_is_the_threats_own_next_step():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    threat = _ship(AxialCoord(3, 0), ShipKind.DESTROYER, PLAYER_B, 1)
+    gs = _game_state(board, [threat])
+    field = sea_distance_field(gs, port)
+
+    block_hex = _block_hex_toward_port([threat], port, field, gs)
+
+    # A genuine next step on the threat's own shortest route in -- adjacent
+    # to where it's actually standing. Not asserting it's strictly closer
+    # to `port` by straight-line distance: the port itself is land, so the
+    # path's real endpoint is whichever of its sea-adjacent neighbors
+    # _nearest_in's tie-break picks (see find_chokepoint's own use of the
+    # same helper), which isn't always the neighbor closest to the threat's
+    # approach direction.
+    assert block_hex is not None
+    assert block_hex != threat.position
+    assert distance(block_hex, threat.position) == 1
