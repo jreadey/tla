@@ -345,9 +345,16 @@ class ReplayView(arcade.View):
         self._dragging = False
         self._mouse_screen_pos = (0.0, 0.0)
         self._hovered_ship_id: int | None = None
+        # The hex currently under the cursor, if it's a real board tile and
+        # no ship is hovered there (see _update_hover/on_draw) -- lets a
+        # reader pin down exactly which hex an odd move/battle happened at
+        # without having to count hexes by eye. None off the board, or
+        # whenever a ship's own tooltip already covers that hex.
+        self._hovered_empty_hex: AxialCoord | None = None
 
         self._hud_text = arcade.Text("", 10, 0, arcade.color.WHITE, 13)
         self._tooltip_texts = [arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(4)]
+        self._hex_coord_text = arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12)
 
     # -- cursor / ship status -------------------------------------------------
 
@@ -497,6 +504,8 @@ class ReplayView(arcade.View):
             status = self._ship_status_at(hovered, self.cursor)
             if status is not None:
                 self._draw_hover_tooltip(hovered, status)
+        elif self._hovered_empty_hex is not None:
+            self._draw_hex_coord_tooltip(self._hovered_empty_hex)
 
     def _draw_tally(self) -> None:
         """Running HP dealt/taken and ships sunk/lost, both players, as of
@@ -640,6 +649,28 @@ class ReplayView(arcade.View):
             text_obj.y = top - TOOLTIP_PADDING - (i + 1) * TOOLTIP_LINE_HEIGHT + 4
             text_obj.draw()
 
+    def _draw_hex_coord_tooltip(self, hex_coord: AxialCoord) -> None:
+        """A small "(q, r)" label next to the cursor for whichever empty
+        board hex it's over -- see _update_hover. Same corner/flip-to-fit
+        placement as _draw_hover_tooltip, just one line and no player-color
+        accent bar (there's no owner to accent)."""
+        text = f"({hex_coord.q}, {hex_coord.r})"
+        width = TOOLTIP_PADDING * 2 + len(text) * 7 + 6
+        height = TOOLTIP_PADDING * 2 + TOOLTIP_LINE_HEIGHT
+        mouse_x, mouse_y = self._mouse_screen_pos
+        left = mouse_x + TOOLTIP_OFFSET
+        if left + width > self.window.width:
+            left = mouse_x - TOOLTIP_OFFSET - width
+        top = mouse_y + TOOLTIP_OFFSET + height
+        if top > self.window.height:
+            top = mouse_y - TOOLTIP_OFFSET
+
+        arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, TOOLTIP_BG_COLOR)
+        self._hex_coord_text.text = text
+        self._hex_coord_text.x = left + TOOLTIP_PADDING
+        self._hex_coord_text.y = top - TOOLTIP_PADDING - TOOLTIP_LINE_HEIGHT + 4
+        self._hex_coord_text.draw()
+
     # -- input -------------------------------------------------------------
 
     def on_resize(self, width: int, height: int) -> None:
@@ -763,6 +794,7 @@ class ReplayView(arcade.View):
                 found = history.id
                 break
         self._hovered_ship_id = found
+        self._hovered_empty_hex = hex_coord if found is None and hex_coord in self.board.tiles else None
 
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
         factor = 1.1 if scroll_y > 0 else (1 / 1.1 if scroll_y < 0 else 1.0)

@@ -166,24 +166,35 @@ class AiConfig:
     damaged_withdraw_fraction: float = 0.34
     # A carrier retreats toward its escorts once a visible enemy battleship,
     # cruiser, or submarine -- the kinds that can actually hurt a carrier in
-    # a fight, per tla.ai.policy._DANGEROUS_TO_CARRIER_KINDS -- comes within
-    # this many hexes of it; a destroyer or patrol boat alone doesn't
-    # trigger it. Modeled on a human player's own reported tactic ("retreat
-    # if a battleship/cruiser/submarine comes within four hexes"), but kept
-    # at 3 here: self-play on a map only modestly bigger than this radius
-    # showed 4 making the carrier "threatened" by nearly the whole board at
-    # once, freezing its advance rather than merely making it cautious --
-    # bump this in a specific deployment's own config once the map is big
-    # enough that 4 doesn't swallow it.
-    carrier_threat_radius: int = 3
+    # a fight, per tla.ai.policy._DANGEROUS_TO_CARRIER_KINDS -- could reach
+    # (and so attack) its hex on that enemy's own next turn; a destroyer or
+    # patrol boat alone doesn't trigger it. See tla.ai.policy.
+    # _enemy_reachable_next_turn for that reachability check -- a real one
+    # (terrain/other ships accounted for, each kind's own actual movement
+    # stat), not a flat hex-distance radius (an earlier version of this
+    # used one; abandoned after self-play showed no single radius working
+    # well across map/ship-movement scales -- too tight and it doesn't
+    # notice real threats, too loose and it freezes the carrier's advance
+    # entirely). Modeled on a human player's own reported tactic: advance
+    # a couple hexes at a time, and don't stop somewhere a dangerous enemy
+    # could reach and hit you on its own turn.
+    #
     # How many of its own movement points a carrier holds back each turn
     # when advancing toward a task-force goal, rather than spending its
     # full budget -- see tla.ai.policy._choose_carrier_destination. Same
-    # human tactic as carrier_threat_radius: advance a couple hexes at a
-    # time and re-scan (next turn, from the new position) rather than
-    # committing the full move every turn and having farther to fall back
-    # from once a threat does turn up.
-    carrier_advance_reserve: int = 2
+    # human tactic as above, described precisely: advance one hex, and if
+    # nothing dangerous has come into view, advance one more next turn --
+    # never committing more than a single hex per turn while blind, so a
+    # threat sitting just past the carrier's own vision (see FowConfig.
+    # port_and_carrier_visibility_radius) gets one more chance to be
+    # spotted before the carrier closes the rest of the gap itself. 3
+    # (leaving 1 of the carrier's 4 movement to actually spend) is that one
+    # hex; a real game (see the project's own carrier-formation memory)
+    # showed a 2-hex version of this same reserve let a carrier jump clean
+    # over a threat sitting one hex past its own vision, straight into
+    # that threat's own reach, without either side ever having seen the
+    # other first.
+    carrier_advance_reserve: int = 3
     # Seconds paced between each AI ship's move, so a human opponent can
     # watch an AI turn unfold instead of it resolving instantly.
     turn_pacing_seconds: float = 0.4
@@ -342,6 +353,24 @@ class AiConfig:
     # matching the user's own stated doctrine -- means "counterattack as
     # long as we're at least as strong," not strictly stronger.
     port_defense_margin: int = 0
+    # Carrier-defense doctrine (see tla.ai.task_force.compute_carrier_
+    # defense_directives), specified directly by the user after a real
+    # game showed the naive AI declining to engage a dangerous enemy
+    # converging on one of its own carriers, purely because the fight
+    # itself was an exact tie -- a mutual kill is still far better than
+    # losing an unescorted carrier for nothing next turn. No separate
+    # trigger radius here (unlike port defense's own): a carrier is
+    # "threatened" exactly when `tla.ai.task_force.enemy_reachable_next_
+    # turn` says a dangerous-kind enemy could reach its hex, the same
+    # real reachability check its own individual retreat already uses.
+    # Only a player's own ships within this many sea hexes of a
+    # threatened carrier are considered as candidate responders --
+    # anything farther is judged too far to arrive in time.
+    carrier_defense_response_radius: int = 8
+    # Same meaning as port_defense_margin, for carrier defense: 0 means
+    # "counterattack as long as we're at least as strong as the threat,"
+    # not strictly stronger.
+    carrier_defense_margin: int = 0
 
 
 @dataclass

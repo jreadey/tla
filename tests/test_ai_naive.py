@@ -13,7 +13,14 @@ from tla.ai.policy import (
     _step_toward,
     choose_task_force_destination,
 )
-from tla.ai.task_force import GoalKind, TaskForce, TaskForceGoal, compute_port_defense_directives
+from tla.ai.task_force import (
+    GoalKind,
+    TaskForce,
+    TaskForceGoal,
+    compute_carrier_defense_directives,
+    compute_port_defense_directives,
+    enemy_reachable_next_turn,
+)
 from tla.board import Board
 from tla.config import AiConfig, Config, FowConfig
 from tla.game_state import GameState
@@ -243,12 +250,13 @@ def test_carrier_never_initiates_an_attack():
 
 def test_carrier_falls_back_toward_its_escort_when_threatened():
     board = _sea_board()
-    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_threat_radius=5))
+    config = Config(fow=FowConfig(enabled=False))
     carrier_start, escort_start, enemy_start = AxialCoord(0, 0), AxialCoord(-3, 0), AxialCoord(2, 0)
     carrier = _ship(carrier_start, ShipKind.CARRIER, PLAYER_A, 1)
     escort = _ship(escort_start, ShipKind.DESTROYER, PLAYER_A, 2)
-    # A dangerous kind (_DANGEROUS_TO_CARRIER_KINDS) -- a destroyer alone
-    # wouldn't trigger this, see test_carrier_ignores_a_destroyer_nearby.
+    # A dangerous kind (_DANGEROUS_TO_CARRIER_KINDS) within its own
+    # movement (4) of the carrier's hex -- a destroyer alone wouldn't
+    # trigger this, see test_carrier_ignores_a_destroyer_nearby.
     enemy = _ship(enemy_start, ShipKind.CRUISER, PLAYER_B, 3)
     gs = _game_state(board, [carrier, escort, enemy], config=config)
 
@@ -263,11 +271,11 @@ def test_carrier_falls_back_toward_its_escort_when_threatened():
 
 def test_carrier_ignores_a_destroyer_nearby():
     board = _sea_board()
-    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_threat_radius=5))
+    config = Config(fow=FowConfig(enabled=False))
     carrier_start = AxialCoord(0, 0)
     carrier = _ship(carrier_start, ShipKind.CARRIER, PLAYER_A, 1)
-    # Within carrier_threat_radius, but not a kind the carrier's own
-    # threat-avoidance worries about -- see _DANGEROUS_TO_CARRIER_KINDS.
+    # Well within the destroyer's own reach, but not a kind the carrier's
+    # own threat-avoidance worries about -- see _DANGEROUS_TO_CARRIER_KINDS.
     enemy = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_B, 2)
     gs = _game_state(board, [carrier, enemy], config=config)
 
@@ -632,29 +640,29 @@ def test_carrier_destination_prefers_cohesion_over_the_goal_when_not_threatened(
     assert distance(destination, teammate.position) <= 4
 
 
-def test_carrier_advance_steers_around_a_visible_enemys_threat_radius():
+def test_carrier_advance_steers_around_a_visible_enemys_reach():
     board = _sea_board(radius=12)
     port = AxialCoord(10, 0)
     board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
     carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)  # movement 4
-    # Sits on the straight-line path to the port, but far enough away that
-    # the carrier's own immediate-threat check (carrier_threat_radius)
-    # never fires -- this is about the *destination* choice, not that
-    # reactive safety net. A dangerous kind (_DANGEROUS_TO_CARRIER_KINDS),
-    # since a destroyer wouldn't be avoided at all.
+    # Distance 5 from the carrier -- outside the cruiser's own movement (4),
+    # so the carrier's immediate-threat check never fires at its *current*
+    # hex; this is about the *destination* choice, not that reactive safety
+    # net. A dangerous kind (_DANGEROUS_TO_CARRIER_KINDS), since a destroyer
+    # wouldn't be avoided at all.
     enemy = _ship(AxialCoord(5, 0), ShipKind.CRUISER, PLAYER_B, 2)
     # carrier_advance_reserve zeroed to isolate danger-zone avoidance from
     # the separate cautious-advance cap (see the dedicated reserve tests).
-    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_threat_radius=2, carrier_advance_reserve=0))
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_advance_reserve=0))
     gs = _game_state(board, [carrier, enemy], config=config)
     goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
 
     destination = _choose_carrier_destination(carrier, gs, PLAYER_A, {2: enemy}, goal=goal)
 
-    # A plain step straight toward the port would land on (4, 0), only 1
-    # hex from the enemy -- well inside carrier_threat_radius.
+    # A plain step straight toward the port would land on (4, 0), well
+    # within the cruiser's own reach from (5, 0).
     assert destination is not None
-    assert distance(destination, enemy.position) > config.ai.carrier_threat_radius
+    assert destination not in enemy_reachable_next_turn(enemy, gs)
 
 
 # -- cautious carrier advance (see _carrier_cautious_max_steps) --------------
@@ -929,3 +937,42 @@ def test_plan_movement_blocks_with_a_submarine_when_outmatched():
     assert gs.ships[2].position != AxialCoord(1, 1)
     assert gs.ships[2].surfaced is False
     assert 1 in gs.ships and gs.ships[1].current_hp == 2  # patrol boat untouched by combat
+
+
+# -- carrier defense (see tla.ai.task_force.compute_carrier_defense_directives) --
+
+
+def test_plan_movement_carrier_defense_intercepts_a_tied_matchup():
+    # The exact scenario a real game (game44) showed the naive AI getting
+    # wrong: a dangerous enemy converging on an undefended carrier, with a
+    # friendly ship able to intercept it this turn -- but only at an exact
+    # matchup tie, which ordinary combat (_favorable_attack, `> 0` only)
+    # refuses to initiate. Carrier defense should take the fight anyway.
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    threat = _ship(AxialCoord(3, 0), ShipKind.CRUISER, PLAYER_B, 2)  # reachable to the carrier next turn
+    # Same kind/stats as the threat -- an exact matchup_score == 0 tie --
+    # and far enough from the carrier that only carrier defense, not any
+    # other doctrine, explains it engaging.
+    responder = _ship(AxialCoord(7, 0), ShipKind.CRUISER, PLAYER_A, 3)
+    gs = _game_state(_sea_board(radius=10), [carrier, threat, responder], config=Config(fow=FowConfig(enabled=False)))
+
+    _run(NaivePolicy(), gs, PLAYER_A)
+
+    assert len(gs.battle_log) >= 1
+    assert gs.battle_log[0].attacker_id == 3
+    assert gs.battle_log[0].defender_id == 2
+
+
+def test_plan_movement_carrier_defense_does_not_trigger_when_carrier_is_safe():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    responder = _ship(AxialCoord(7, 0), ShipKind.CRUISER, PLAYER_A, 3)
+    # Same tied matchup as above, but too far from the carrier (cruiser
+    # movement 4) to threaten it next turn -- no directive should fire.
+    distant_threat = _ship(AxialCoord(8, 0), ShipKind.CRUISER, PLAYER_B, 2)
+    gs = _game_state(
+        _sea_board(radius=12), [carrier, responder, distant_threat], config=Config(fow=FowConfig(enabled=False))
+    )
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {2: distant_threat}, gs.config.ai)
+
+    assert directives == []

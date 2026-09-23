@@ -244,7 +244,7 @@ def test_carrier_bonus_still_applies_against_a_surfaced_submarine():
     assert result.damage_to_defender == base_damage + 1
 
 
-def test_carrier_bonus_applies_to_another_carrier():
+def test_carrier_bonus_applies_from_a_supporting_carrier():
     board = _sea_board()
     attacking_carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
     defender = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 2)
@@ -254,10 +254,37 @@ def test_carrier_bonus_applies_to_another_carrier():
     result = resolve_round(attacking_carrier, defender, gs)
 
     base_damage = Config().ship_stats.stats[ShipKind.CARRIER].damage
-    # Both the attacking carrier and the supporting one are within range and
-    # count toward the bonus -- a carrier counting its own presence is
-    # existing, intentional behavior (see resolve_round's module docs).
-    assert result.damage_to_defender == base_damage + 2
+    # Only the *other*, supporting carrier counts -- see
+    # test_carrier_bonus_does_not_apply_to_the_attacking_carrier_itself.
+    assert result.damage_to_defender == base_damage + 1
+
+
+def test_carrier_bonus_does_not_apply_to_the_attacking_carrier_itself():
+    # A carrier's own presence never counts toward its own bonus -- air
+    # cover is support from *another* ship overhead, not a carrier somehow
+    # assisting its own attack. A lone carrier with no other carrier
+    # nearby fights at its plain damage stat, no bonus at all.
+    board = _sea_board()
+    attacking_carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+    gs = _game_state(board, [attacking_carrier, defender])
+
+    result = resolve_round(attacking_carrier, defender, gs)
+
+    assert result.damage_to_defender == Config().ship_stats.stats[ShipKind.CARRIER].damage
+
+
+def test_carrier_bonus_does_not_apply_to_a_defending_carrier_itself():
+    # Same rule, defender's role: the carrier being attacked doesn't count
+    # its own presence toward its own defensive bonus either.
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    defending_carrier = _ship(AxialCoord(1, 0), ShipKind.CARRIER, PLAYER_B, 2)
+    gs = _game_state(board, [attacker, defending_carrier])
+
+    result = resolve_round(attacker, defending_carrier, gs)
+
+    assert result.damage_to_attacker == Config().ship_stats.stats[ShipKind.DESTROYER].damage
 
 
 def test_run_battle_stops_on_retreat_leaving_both_ships_alive():

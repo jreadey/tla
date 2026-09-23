@@ -65,8 +65,12 @@ def carrier_bonus_for(
     `target` is a submerged submarine: air cover never helps against a
     submerged target, no matter which side has the carrier or which role
     (attacker/defender) the submerged sub is playing in this engagement.
-    Public so callers other than `resolve_round` -- e.g.
-    `tla.ai.scoring.matchup_score`, estimating an engagement before
+    A carrier itself never counts toward its own bonus -- air cover is
+    close air support from *another* ship overhead, not a carrier
+    somehow assisting its own attack -- so a lone carrier fighting with
+    no other friendly carrier nearby gets no bonus at all, only its plain
+    `damage`/`asw` stat. Public so callers other than `resolve_round` --
+    e.g. `tla.ai.scoring.matchup_score`, estimating an engagement before
     committing to it -- can reuse the exact same combat math rather than
     risking a duplicated, driftable copy of it."""
     if attacking_ship.kind not in AC_BONUS_ELIGIBLE_KINDS:
@@ -77,7 +81,8 @@ def carrier_bonus_for(
     count = sum(
         1
         for ship in game_state.ships.values()
-        if ship.owner == attacking_ship.owner
+        if ship.id != attacking_ship.id
+        and ship.owner == attacking_ship.owner
         and ship.kind == ShipKind.CARRIER
         and not ship.is_sunk
         and distance(ship.position, battle_hex) <= radius

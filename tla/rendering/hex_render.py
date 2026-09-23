@@ -172,6 +172,20 @@ def draw_hex_highlight(coord: AxialCoord, hex_size: float, color: tuple[int, int
     arcade.draw_polygon_filled(corners, color)
 
 
+def draw_sunk_crossbar(
+    coord: AxialCoord, hex_size: float, color: tuple[int, int, int] | tuple[int, int, int, int]
+) -> None:
+    """A crossed-out marker over `coord`, sized relative to `hex_size` --
+    e.g. a hex a ship sank at last turn (tla.rendering.game_view, which
+    also fades this out over several turns via a 4-tuple RGBA `color`'s
+    alpha channel rather than the plain RGB `replay_view.py` uses). Draws
+    in raw world space -- an active camera handles panning/viewport."""
+    cx, cy = axial_to_pixel(coord, hex_size)
+    r = hex_size * 0.35
+    arcade.draw_line(cx - r, cy - r, cx + r, cy + r, color, 3)
+    arcade.draw_line(cx - r, cy + r, cx + r, cy - r, color, 3)
+
+
 def draw_contour(segments: list[Segment]) -> None:
     """Draw precomputed coastline segments (see tla.elevation.marching_squares_segments).
 

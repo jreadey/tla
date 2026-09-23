@@ -5,11 +5,12 @@ from tla.ai.task_force import (
     GoalKind,
     TaskForce,
     TaskForceGoal,
-    _block_hex_toward_port,
+    _block_hex_toward,
     _choose_blocker,
     _gather,
     _pullback_waypoint,
     assign_goal,
+    compute_carrier_defense_directives,
     compute_port_defense_directives,
     find_chokepoint,
     force_recapture_goal,
@@ -403,7 +404,13 @@ def test_carrier_advances_toward_its_forces_goal_when_unthreatened():
     target_port = AxialCoord(10, 0)
     board.tiles[target_port] = Tile(coord=target_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
     carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
-    escort = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_A, 2)
+    # Off the carrier's own straight-line path to the port (not (1, 0)) --
+    # with the default carrier_advance_reserve now capping an unthreatened
+    # carrier to just 1 hex of movement, an escort sitting squarely on
+    # that single reachable step would block it outright (passing through
+    # a friendly hex needs 2 spare movement, not just 1 -- see
+    # movement._classify_step), which isn't what this test is about.
+    escort = _ship(AxialCoord(1, 1), ShipKind.DESTROYER, PLAYER_A, 2)
     gs = _game_state(board, [carrier, escort], config=Config(fow=FowConfig(enabled=False)))
     force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=TaskForceGoal(GoalKind.CAPTURE_PORT, target_port))
 
@@ -790,11 +797,13 @@ def test_carrier_retreats_with_its_force_when_outnumbered():
     board.tiles[home_port] = Tile(coord=home_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
     carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
     escort = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_A, 2)
-    # Distance 5 from the carrier -- outside the default carrier_threat_radius
-    # (3, its own *individual* threat check), but within task_force_threat_
-    # radius (6) used for the *force*-level outnumbered check, so a
-    # confirmed rally-point move here can only be explained by the force
-    # mechanism, not the carrier's pre-existing personal one.
+    # Distance 5 from the carrier -- outside the battleship's own movement
+    # (4), so it couldn't reach the carrier's hex next turn (its own
+    # *individual* threat check, see _enemy_reachable_next_turn), but
+    # within task_force_threat_radius (6) used for the *force*-level
+    # outnumbered check, so a confirmed rally-point move here can only be
+    # explained by the force mechanism, not the carrier's pre-existing
+    # personal one.
     strong_enemy = _ship(AxialCoord(5, 0), ShipKind.BATTLESHIP, PLAYER_B, 3, hp=100)
     config = Config(
         fow=FowConfig(enabled=False), ai=AiConfig(task_force_threat_radius=6, task_force_outnumbered_margin=0)
@@ -1342,14 +1351,14 @@ def test_choose_blocker_prefers_a_submarine_over_a_patrol_boat_over_anything_els
     assert _choose_blocker([battleship]) is battleship
 
 
-def test_block_hex_toward_port_is_the_threats_own_next_step():
+def test_block_hex_toward_is_the_threats_own_next_step():
     port = AxialCoord(0, 0)
     board = _port_board(port)
     threat = _ship(AxialCoord(3, 0), ShipKind.DESTROYER, PLAYER_B, 1)
     gs = _game_state(board, [threat])
     field = sea_distance_field(gs, port)
 
-    block_hex = _block_hex_toward_port([threat], port, field, gs)
+    block_hex = _block_hex_toward([threat], port, field, gs)
 
     # A genuine next step on the threat's own shortest route in -- adjacent
     # to where it's actually standing. Not asserting it's strictly closer
@@ -1361,3 +1370,114 @@ def test_block_hex_toward_port_is_the_threats_own_next_step():
     assert block_hex is not None
     assert block_hex != threat.position
     assert distance(block_hex, threat.position) == 1
+
+
+# -- carrier defense (see compute_carrier_defense_directives) --------------
+
+
+def test_compute_carrier_defense_directives_counterattacks_when_not_outmatched():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    # On the opposite side of the carrier from the threat's approach, so
+    # it doesn't incidentally block the threat's own path in (an
+    # enemy-occupied hex is a terminal step, not a passthrough).
+    responder = _ship(AxialCoord(-1, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    # A cruiser at hex-distance 4 -- exactly its own movement stat, so
+    # `enemy_reachable_next_turn` says it could reach the carrier's hex.
+    threat = _ship(AxialCoord(4, 0), ShipKind.CRUISER, PLAYER_B, 3)
+    gs = _game_state(_sea_board(radius=10), [carrier, responder, threat])
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {3: threat}, AiConfig())
+
+    assert len(directives) == 1
+    directive = directives[0]
+    assert directive.carrier is carrier
+    assert directive.threats == [threat]
+    assert directive.counterattack == [responder]
+    assert directive.block is None
+
+
+def test_compute_carrier_defense_directives_blocks_when_outmatched():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    weak_responder = _ship(AxialCoord(-1, 0), ShipKind.CRUISER, PLAYER_A, 2)
+    strong_threat = _ship(AxialCoord(4, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)  # movement 4 -- reachable
+    gs = _game_state(_sea_board(radius=10), [carrier, weak_responder, strong_threat])
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {3: strong_threat}, AiConfig())
+
+    assert len(directives) == 1
+    directive = directives[0]
+    assert directive.counterattack == []
+    assert directive.block is weak_responder  # only candidate responder
+    assert directive.block_hex is not None
+
+
+def test_compute_carrier_defense_directives_ignores_a_threat_that_cannot_reach_the_carrier():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    responder = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    # A battleship (movement 4) sitting 5 hexes off -- can't reach the
+    # carrier's hex next turn, so it isn't a threat at all here.
+    far_threat = _ship(AxialCoord(5, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    gs = _game_state(_sea_board(radius=10), [carrier, responder, far_threat])
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {3: far_threat}, AiConfig())
+
+    assert directives == []
+
+
+def test_compute_carrier_defense_directives_ignores_a_kind_not_dangerous_to_carriers():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    responder = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    # A destroyer well within reach, but destroyers aren't in
+    # DANGEROUS_TO_CARRIER_KINDS -- shouldn't trigger a directive at all.
+    destroyer = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_B, 3)
+    gs = _game_state(_sea_board(radius=10), [carrier, responder, destroyer])
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {3: destroyer}, AiConfig())
+
+    assert directives == []
+
+
+def test_compute_carrier_defense_directives_ignores_a_responder_too_far_to_help():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    # Past the default carrier_defense_response_radius of 8.
+    far_responder = _ship(AxialCoord(12, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(4, 0), ShipKind.CRUISER, PLAYER_B, 3)
+    gs = _game_state(_sea_board(radius=15), [carrier, far_responder, threat])
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {3: threat}, AiConfig())
+
+    assert directives == []
+
+
+def test_compute_carrier_defense_directives_does_not_double_claim_a_responder():
+    carrier_a = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    carrier_b = _ship(AxialCoord(3, 0), ShipKind.CARRIER, PLAYER_A, 2)
+    # Off the carriers' shared r=0 line -- sitting on it would block each
+    # threat's own shortest route in (an enemy-occupied hex is a terminal
+    # step, not a passthrough), which isn't what this test means to check.
+    responder = _ship(AxialCoord(1, -1), ShipKind.BATTLESHIP, PLAYER_A, 3)  # in range of both carriers
+    threat_a = _ship(AxialCoord(4, 0), ShipKind.CRUISER, PLAYER_B, 4)
+    threat_b = _ship(AxialCoord(7, 0), ShipKind.CRUISER, PLAYER_B, 5)
+    gs = _game_state(_sea_board(radius=15), [carrier_a, carrier_b, responder, threat_a, threat_b])
+
+    directives = compute_carrier_defense_directives(gs, PLAYER_A, {4: threat_a, 5: threat_b}, AiConfig())
+
+    claimed_ids = [s.id for d in directives for s in (d.counterattack or ([d.block] if d.block else []))]
+    assert claimed_ids.count(3) == 1
+
+
+def test_compute_carrier_defense_directives_honors_already_claimed():
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    # Off the threat's direct approach line -- see the double-claim test
+    # above for why (occupying it would block the threat's path outright).
+    only_responder = _ship(AxialCoord(-1, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(4, 0), ShipKind.CRUISER, PLAYER_B, 3)
+    gs = _game_state(_sea_board(radius=10), [carrier, only_responder, threat])
+
+    # Pretend port defense already claimed the only candidate responder
+    # this turn -- carrier defense should find nothing left to assign.
+    directives = compute_carrier_defense_directives(
+        gs, PLAYER_A, {3: threat}, AiConfig(), already_claimed=frozenset({2})
+    )
+
+    assert directives == []

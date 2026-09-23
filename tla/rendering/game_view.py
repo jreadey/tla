@@ -12,7 +12,7 @@ from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
 from tla.mapgen import filter_islet_contours
 from tla.fow import is_hidden, visible_hexes_for
-from tla.game_state import GameState, TurnPhase
+from tla.game_state import BattleLogEntry, GameState, TurnPhase
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
 from tla.movement import (
     begin_engagement,
@@ -32,6 +32,7 @@ from tla.rendering.hex_render import (
     draw_contour,
     draw_hex_highlight,
     draw_ships,
+    draw_sunk_crossbar,
 )
 from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import Ship, ShipKind
@@ -73,6 +74,21 @@ class Toast:
     remaining: float = 0.0
 
 
+@dataclass
+class SunkMark:
+    """One hex's crossbar (see `_draw_sunk_crossbars`) -- who sank there
+    (`owners`, for `_sunk_crossbar_color`) and how visible it still is.
+    `opacity` starts at 1.0 the turn it's created and fades by
+    `SUNK_MARK_FADE_PER_TURN` each subsequent turn boundary (see
+    `_dismiss_turn_report`) until it's removed entirely, rather than
+    staying at full visibility for one turn and then vanishing outright
+    -- user's own request, since a still-solid crossbar can make it hard
+    to tell what ship (if any) is actually sitting on that hex now."""
+
+    owners: set[PlayerId]
+    opacity: float = 1.0
+
+
 # Screen pixels/second for keyboard panning (divided by zoom so it always
 # feels like the same on-screen speed, not the same world-space speed).
 PAN_SPEED = 600.0
@@ -111,6 +127,19 @@ GAME_OVER_BG_COLOR = (10, 10, 10, 245)
 SUB_CONTACT_BG_COLOR = (40, 32, 5, 235)
 SUB_CONTACT_BORDER_COLOR = (230, 180, 40)
 SUB_CONTACT_TEXT_COLOR = arcade.color.WHITE
+
+ATTACK_HIGHLIGHT_COLOR = (255, 40, 40, 130)
+ATTACK_BG_COLOR = (40, 10, 10, 235)
+ATTACK_BORDER_COLOR = (220, 60, 60)
+ATTACK_TEXT_COLOR = arcade.color.WHITE
+
+# Black (not either PLAYER_COLORS entry) marks a hex where both sides lost a
+# ship this turn -- see _sunk_crossbar_color.
+MUTUAL_SUNK_CROSSBAR_COLOR = (20, 20, 20)
+# How much a SunkMark's opacity drops each turn boundary -- see
+# _dismiss_turn_report. 0.2 fades a mark out over 5 turns (full visibility
+# the turn it's created, then 80%/60%/40%/20% before it's gone).
+SUNK_MARK_FADE_PER_TURN = 0.2
 
 TOAST_SECONDS = 4.0
 TOAST_BG_COLOR = (20, 20, 20, 220)
@@ -219,6 +248,43 @@ class GameView(arcade.View):
         # _advance_ai_turn step rather than re-scanning entries already
         # handled.
         self._battle_log_watermark: int = 0
+        # Set the first time, during the AI's current half-turn draining,
+        # that one of the *watching human's own* ships (see
+        # _display_player) comes under attack -- the hex to highlight, and
+        # a "<attacker> attacks <your ship>!" message. Dismissed by any key
+        # press or click, like sunk_message/pending_sub_contact -- without
+        # this, a battle against one of your own ships could otherwise
+        # flash by during a paced AI turn along with everything else,
+        # leaving it unclear which of your ships even got hit. See
+        # _advance_ai_turn/_first_attack_on_display_player.
+        self.pending_attack_hex: AxialCoord | None = None
+        self.pending_attack_message: str | None = None
+        # Ship ids already paused-and-highlighted for coming under attack
+        # during the current half-turn's AI draining -- companion to
+        # _attack_toasted_ship_ids (a separate set: the toast fires for
+        # every battle, this only for one involving the display player's
+        # own ship), so a multi-round battle only pauses once. Reset in
+        # _maybe_start_ai_turn alongside _attack_toasted_ship_ids.
+        self._attack_paused_ship_ids: set[int] = set()
+        # Hexes where a ship was sunk, accumulated across both halves of
+        # the turn *in progress* (see _end_movement_phase, which reads
+        # game_state.battle_log -- half-turn-scoped -- into this before
+        # TurnManager.end_movement_phase clears it) -- mirrors TurnStats's
+        # own whole-turn accumulation window. Keyed by hex, valued by the
+        # owner(s) of whichever ship(s) sank there, so a hex where both
+        # sides lost a ship (not necessarily to each other, just the same
+        # hex sometime this turn) reads as a mutual loss -- see
+        # _sunk_crossbar_color.
+        self._current_turn_sunk: dict[AxialCoord, set[PlayerId]] = {}
+        # Merged in from _current_turn_sunk at the actual turn boundary
+        # (see _dismiss_turn_report) as fresh, full-opacity SunkMarks --
+        # what's actually drawn on the board (see on_draw/_draw_sunk_
+        # crossbars) so the player can see at a glance where losses
+        # happened without having to reopen the after-action report.
+        # Every existing mark also fades a little at that same boundary
+        # (SUNK_MARK_FADE_PER_TURN) and is dropped once fully faded,
+        # rather than the older single-turn snapshot this used to be.
+        self._sunk_marks: dict[AxialCoord, SunkMark] = {}
         # The empty friendly port currently showing its (read-only) production
         # panel, if any -- opened by clicking it, closed by clicking
         # elsewhere, Escape, or ending movement. There is nothing to choose
@@ -251,6 +317,7 @@ class GameView(arcade.View):
         self._sub_contact_text = arcade.Text(
             "", 0, 0, SUB_CONTACT_TEXT_COLOR, 16, anchor_x="center"
         )
+        self._attack_pause_text = arcade.Text("", 0, 0, ATTACK_TEXT_COLOR, 16, anchor_x="center")
         # Reused for up to this many simultaneously-visible toasts (spotted
         # or under-attack); any beyond that just don't get a slot until an
         # older one expires.
@@ -291,9 +358,10 @@ class GameView(arcade.View):
         # gs.battle_log was just cleared for this half-turn (see
         # tla.turn_manager.TurnManager.end_movement_phase) -- start
         # scanning it from the beginning, with a clean slate of which ships
-        # have already gotten an under-attack toast this half-turn.
+        # have already gotten an under-attack toast/pause this half-turn.
         self._battle_log_watermark = 0
         self._attack_toasted_ship_ids = set()
+        self._attack_paused_ship_ids = set()
 
     def _advance_ai_turn(self, delta_time: float) -> None:
         """Drain one step of `_ai_turn_iter` every `AiConfig.turn_pacing_
@@ -316,8 +384,16 @@ class GameView(arcade.View):
         just flash by unnoticed during a paced turn you're only half
         watching. Paused for as long as `sunk_message` is set; resumes
         automatically once the human dismisses it, since this is called
-        again every `on_update` tick regardless."""
-        if self.sunk_message is not None:
+        again every `on_update` tick regardless.
+
+        Failing that, if this step is the first attack against one of the
+        *watching human's own* ships, draining pauses and highlights that
+        hex instead (see `_first_attack_on_display_player`) -- same
+        reasoning as the sunk pause: during a paced AI turn you're only
+        half watching, it's otherwise easy to miss which of your ships
+        just came under fire until the outcome (or a sinking) is already
+        old news."""
+        if self.sunk_message is not None or self.pending_attack_hex is not None:
             return
         self._ai_pace_timer += delta_time
         pacing = self.game_state.config.ai.turn_pacing_seconds
@@ -330,26 +406,29 @@ class GameView(arcade.View):
                 self._ai_turn_iter = None
                 self._end_movement_phase()
                 return
-            self._toast_new_attacks()
+            entries = self.game_state.battle_log[self._battle_log_watermark :]
+            self._battle_log_watermark = len(self.game_state.battle_log)
+            self._toast_new_attacks(entries)
             sunk = [owner_kind for sid, owner_kind in before.items() if sid not in self.game_state.ships]
             if sunk:
                 self.sunk_message = self._sunk_message_for(sunk)
                 return
+            attack = self._first_attack_on_display_player(entries)
+            if attack is not None:
+                self.pending_attack_hex, self.pending_attack_message = attack
+                return
 
-    def _toast_new_attacks(self) -> None:
+    def _toast_new_attacks(self, entries: list[BattleLogEntry]) -> None:
         """Fire a one-time, non-blocking "<ship> attacks <ship>!" toast the
         first time each ship enters combat during the AI's current
         half-turn (as attacker or defender) -- a later round of the same,
         still-ongoing battle doesn't re-announce either ship (only skipped
         once BOTH ships in a round have already been toasted, so a ship
         that gets attacked again later by a *different* ship still gets a
-        fresh toast). Reads `game_state.battle_log` (see `tla.battle.
-        resolve_round`), which -- like `_battle_log_watermark` and
-        `_attack_toasted_ship_ids` themselves (see `_maybe_start_ai_turn`)
-        -- is cleared at the start of every half-turn, so this only ever
-        considers battles from the turn in progress."""
-        entries = self.game_state.battle_log[self._battle_log_watermark :]
-        self._battle_log_watermark = len(self.game_state.battle_log)
+        fresh toast). `entries` is the slice of `game_state.battle_log`
+        (see `tla.battle.resolve_round`) new since the last check -- see
+        `_advance_ai_turn`, the sole caller, which owns the watermark this
+        is read from."""
         for entry in entries:
             if entry.attacker_id in self._attack_toasted_ship_ids and entry.defender_id in self._attack_toasted_ship_ids:
                 continue
@@ -358,6 +437,29 @@ class GameView(arcade.View):
             attacker_label = self._label_for(entry.attacker_owner, entry.attacker_kind)
             defender_label = self._label_for(entry.defender_owner, entry.defender_kind)
             self._toasts.append(Toast(text=f"{attacker_label} attacks {defender_label}!", remaining=TOAST_SECONDS))
+
+    def _first_attack_on_display_player(self, entries: list[BattleLogEntry]) -> tuple[AxialCoord, str] | None:
+        """The (hex, message) for the first `entries` battle where the
+        *watching human's own* ship (see `_display_player`) is the
+        defender -- None if none qualify. Only the defender side, never
+        the attacker: during the AI's own turn only AI ships move, so any
+        battle it starts necessarily has an AI ship as attacker -- the
+        display player's ship, if involved at all, is always the one
+        getting hit. Deduplicated by `_attack_paused_ship_ids` the same
+        way `_toast_new_attacks` dedupes toasts, but tracked separately:
+        this only ever fires for the display player's own ship, a strict
+        subset of what gets toasted, so the two sets naturally diverge."""
+        display_player = self._display_player()
+        for entry in entries:
+            if entry.defender_owner != display_player:
+                continue
+            if entry.defender_id in self._attack_paused_ship_ids:
+                continue
+            self._attack_paused_ship_ids.add(entry.defender_id)
+            attacker_label = self._label_for(entry.attacker_owner, entry.attacker_kind)
+            defender_kind_label = entry.defender_kind.value.replace("_", " ").title()
+            return entry.battle_hex, f"{attacker_label} attacks your {defender_kind_label}!"
+        return None
 
     def _end_movement_phase(self) -> None:
         """End the current player's movement phase -- the shared path for
@@ -381,14 +483,50 @@ class GameView(arcade.View):
                 player=self.game_state.current_player,
                 task_forces=self.ai_policy.task_forces_for(PLAYER_A) + self.ai_policy.task_forces_for(PLAYER_B),
             )
+        # Same "before battle_log is cleared" reasoning as the replay write
+        # above -- see _record_turn_sunk_hexes.
+        self._record_turn_sunk_hexes()
         if self.game_state.phase == TurnPhase.MOVE_B:
             self.pending_turn_report = True
             return
         self.turn_manager.end_movement_phase()
         self._maybe_start_ai_turn()
 
+    def _record_turn_sunk_hexes(self) -> None:
+        """Merge every sinking in `game_state.battle_log` (half-turn-
+        scoped -- cleared by the `TurnManager.end_movement_phase` call
+        this always runs just before, in `_end_movement_phase`) into
+        `_current_turn_sunk`, keyed by hex and valued by the sunk ship's
+        owner. Called once per half-turn, so a full turn's worth (both
+        movement phases) accumulates before `_dismiss_turn_report` merges
+        it into `_sunk_marks` for display -- see that method and
+        `_draw_sunk_crossbars`."""
+        for entry in self.game_state.battle_log:
+            owners: set[PlayerId] = set()
+            if entry.attacker_sunk:
+                owners.add(entry.attacker_owner)
+            if entry.defender_sunk:
+                owners.add(entry.defender_owner)
+            if not owners:
+                continue
+            self._current_turn_sunk.setdefault(entry.battle_hex, set()).update(owners)
+
     def _dismiss_turn_report(self) -> None:
         self.pending_turn_report = False
+        # Every existing mark fades a step first -- including ones from
+        # the turn just ending, so a mark isn't visible at full strength
+        # for two turns in a row -- then what just accumulated in
+        # _current_turn_sunk (both halves of the turn now ending) is
+        # merged in as fresh, full-opacity marks, overwriting a fading
+        # mark at the same hex rather than compounding with it (a new
+        # sinking there is a new event, not a continuation of the old
+        # one). See _draw_sunk_crossbars for the actual drawing.
+        for mark in self._sunk_marks.values():
+            mark.opacity -= SUNK_MARK_FADE_PER_TURN
+        self._sunk_marks = {h: m for h, m in self._sunk_marks.items() if m.opacity > 0}
+        for hex_coord, owners in self._current_turn_sunk.items():
+            self._sunk_marks[hex_coord] = SunkMark(owners=owners)
+        self._current_turn_sunk = {}
         self.turn_manager.end_movement_phase()
         self._maybe_start_ai_turn()
 
@@ -433,6 +571,12 @@ class GameView(arcade.View):
             # ever happens with _ai_turn_iter already None, so this
             # ordering is safe for both cases.
             self.sunk_message = None
+            return
+        if self.pending_attack_hex is not None:
+            # Same ordering reasoning as sunk_message just above -- set
+            # during the AI's own turn with _ai_turn_iter still non-None.
+            self.pending_attack_hex = None
+            self.pending_attack_message = None
             return
         if self._ai_turn_iter is not None:
             return  # an AI seat's paced turn is playing out -- not the human's input to give
@@ -500,6 +644,10 @@ class GameView(arcade.View):
             # See the matching comment in on_key_press for why this must
             # be checked before the _ai_turn_iter guard.
             self.sunk_message = None
+            return
+        if self.pending_attack_hex is not None:
+            self.pending_attack_hex = None
+            self.pending_attack_message = None
             return
         if self._ai_turn_iter is not None:
             return  # an AI seat's paced turn is playing out -- not the human's input to give
@@ -902,7 +1050,10 @@ class GameView(arcade.View):
                 s for s in gs.ships.values()
                 if s.owner == self._display_player() or self._is_ship_visible(s, visible)
             ]
+        self._draw_sunk_crossbars()
         draw_ships(ships_to_draw, self.hex_size, current_player=gs.current_player)
+        if self.pending_attack_hex is not None:
+            draw_hex_highlight(self.pending_attack_hex, self.hex_size, ATTACK_HIGHLIGHT_COLOR)
 
         self.ui_camera.use()
         if self.game_state.winner is not None:
@@ -923,6 +1074,8 @@ class GameView(arcade.View):
             self._draw_port_panel()
         if self.sunk_message is not None:
             self._draw_sunk_overlay()
+        elif self.pending_attack_hex is not None:
+            self._draw_attack_pause_overlay()
         elif self.pending_turn_report:
             self._draw_turn_report()
         elif self.pending_sub_contact:
@@ -938,6 +1091,30 @@ class GameView(arcade.View):
             return
         points = [axial_to_pixel(coord, self.hex_size) for coord in self.drag_path]
         arcade.draw_line_strip(points, PATH_LINE_COLOR, 3)
+
+    def _draw_sunk_crossbars(self) -> None:
+        """A crossbar over every hex in `_sunk_marks` -- see
+        `_dismiss_turn_report`/`_record_turn_sunk_hexes` for how that's
+        populated and faded. Colored per `_sunk_crossbar_color`, alpha
+        scaled by the mark's own current `opacity`. Drawn *before*
+        `draw_ships` in `on_draw`, not after -- so a ship now sitting on a
+        hex that sank last turn (its own, if it recaptured the spot, or
+        an enemy's that moved in afterward) always renders on top of the
+        crossbar instead of the crossbar obscuring which ship is there."""
+        for hex_coord, mark in self._sunk_marks.items():
+            r, g, b = self._sunk_crossbar_color(mark.owners)
+            alpha = round(255 * mark.opacity)
+            draw_sunk_crossbar(hex_coord, self.hex_size, (r, g, b, alpha))
+
+    def _sunk_crossbar_color(self, owners: set[PlayerId]) -> tuple[int, int, int]:
+        """Whichever player's color a sunk-hex crossbar (see
+        `_draw_sunk_crossbars`) should use -- that player's own fixed
+        `PLAYER_COLORS` entry if only their ship(s) were lost there this
+        turn, or `MUTUAL_SUNK_CROSSBAR_COLOR` (black) if hexes sank for
+        both sides."""
+        if len(owners) > 1:
+            return MUTUAL_SUNK_CROSSBAR_COLOR
+        return PLAYER_COLORS[next(iter(owners))]
 
     def _draw_hud(self) -> None:
         gs = self.game_state
@@ -1100,6 +1277,21 @@ class GameView(arcade.View):
         self._sub_contact_text.x = self.window.width / 2
         self._sub_contact_text.y = top - height / 2 - 6
         self._sub_contact_text.draw()
+
+    def _draw_attack_pause_overlay(self) -> None:
+        display_text = f"{self.pending_attack_message}   (press any key to continue)"
+        width = min(self.window.width - 40, max(420, len(display_text) * 9 + 40))
+        height = 60
+        left = (self.window.width - width) / 2
+        top = self.window.height - 40
+
+        arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, ATTACK_BG_COLOR)
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, ATTACK_BORDER_COLOR)
+
+        self._attack_pause_text.text = display_text
+        self._attack_pause_text.x = self.window.width / 2
+        self._attack_pause_text.y = top - height / 2 - 6
+        self._attack_pause_text.draw()
 
     def _draw_toasts(self) -> None:
         """Stacked, non-blocking notifications (spotted-ship or
