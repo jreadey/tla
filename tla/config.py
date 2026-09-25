@@ -371,6 +371,29 @@ class AiConfig:
     # "counterattack as long as we're at least as strong as the threat,"
     # not strictly stronger.
     carrier_defense_margin: int = 0
+    # tla.ai.enemy_model.EnemyModel: a tracked enemy ship unseen for more
+    # than this many turns is folded back into its kind's pool (its
+    # individual position belief merged into the shared per-kind field,
+    # its own id-level tracking dropped) rather than keeping an
+    # ever-more-diffuse per-ship field alive forever. Bounds how many live
+    # per-ship fields a long game accumulates; purely a memory/performance
+    # knob, not a fairness one -- a folded-back ship's belief mass is
+    # preserved, just merged into a coarser bucket.
+    enemy_model_stale_turns: int = 10
+    # tla.ai.global_strategy.compute_posture: how much clearer an edge (in
+    # the same "rounds to kill" units tla.ai.task_force.outmatched already
+    # uses) than the default-0 local-tactical margins before the *global*
+    # force-balance assessment calls a player aggressive/defensive rather
+    # than neutral -- a global posture shift shouldn't flip on the same
+    # hair-trigger a single local fight does.
+    posture_margin: int = 2
+    # tla.ai.global_strategy.posture_adjusted_ai_config: how far
+    # task_force_outnumbered_margin/port_defense_margin/
+    # carrier_defense_margin move under a non-neutral posture (aggressive
+    # raises them, defensive lowers them, by this same amount for all
+    # three -- see that function's own docstring for why one shared delta
+    # applies uniformly). Deliberately modest to start.
+    posture_margin_shift: int = 1
 
 
 @dataclass

@@ -11,15 +11,24 @@ already-finished game.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 import arcade
 
+from tla.ai.belief_ordinal import turn_ordinal
+from tla.ai.hexfield import HexFieldGeometry
 from tla.board import Board
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
-from tla.rendering.hex_render import PLAYER_COLORS, _lighten, board_pixel_bounds, draw_board
+from tla.rendering.hex_render import PLAYER_COLORS, _lighten, board_pixel_bounds, draw_board, draw_hex_highlight
 from tla.rendering.ship_glyphs import draw_ship_glyph
 from tla.ship import ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, PlayerId, Tile, TerrainType
+
+if TYPE_CHECKING:
+    # Only for the type hint below -- never imported at runtime unless
+    # --belief was actually passed, so this viewer never needs h5py
+    # installed otherwise. See tla.ai.belief_store's own module docstring.
+    from tla.ai.belief_store import BeliefReader
 
 PAN_SPEED = 600.0
 MIN_ZOOM = 0.2
@@ -91,6 +100,47 @@ TALLY_WIDTH = 320.0
 TALLY_LINE_HEIGHT = 18.0
 TALLY_PADDING = 8.0
 TALLY_MARGIN = 10.0
+
+# Ship inventory panel, top-left (only drawn when a --belief file was
+# given -- see ReplayView.belief_reader/_draw_inventory_panel). A row for
+# a ship with no recorded belief data is dimmed and not clickable -- it's
+# roster-only, there's nothing to overlay for it; clicking one instead
+# sets ReplayView._inventory_status (see _handle_inventory_click) so that
+# doesn't just look like a dead click. Two small header controls (see
+# _inventory_button_rects): collapse/expand the row list, and clear the
+# current selection.
+INVENTORY_PANEL_MARGIN = 10.0
+INVENTORY_PANEL_WIDTH = 190.0
+INVENTORY_ROW_HEIGHT = 20.0
+INVENTORY_MAX_VISIBLE_ROWS = 14
+INVENTORY_HEADER_HEIGHT = 22.0
+INVENTORY_BG_COLOR = (25, 25, 25, 200)
+INVENTORY_ROW_SELECTED_COLOR = (70, 70, 95, 230)
+INVENTORY_ROW_TEXT_COLOR = arcade.color.WHITE
+INVENTORY_ROW_DIMMED_TEXT_COLOR = (110, 110, 110)
+INVENTORY_STATUS_COLOR = (230, 180, 80)
+INVENTORY_HEADER_BUTTON_SIZE = 16.0
+INVENTORY_HEADER_BUTTON_GAP = 4.0
+INVENTORY_HEADER_BUTTON_COLOR = (70, 70, 70, 230)
+
+# Belief-field heatmap overlay (see ReplayView._draw_belief_overlay) --
+# amber, kept visually distinct from the existing red attack-highlight
+# (tla.rendering.game_view.ATTACK_HIGHLIGHT_COLOR) and from the red/blue
+# player colors. The ship's own glyph, drawn normally right after this,
+# already marks its true position for the turn -- no separate "truth
+# marker" is needed for the believed-vs-actual comparison.
+BELIEF_HEATMAP_COLOR = (255, 176, 0)
+BELIEF_HEATMAP_MAX_ALPHA = 230
+# Every hex that clears BELIEF_HEATMAP_MIN_RELATIVE_MASS gets at least
+# this much alpha, even if its mass is only just above the threshold --
+# without a floor, most of a diffuse field's included cells end up close
+# to fully transparent (mass/peak near the threshold ratio), so the whole
+# overlay reads as a faint, easy-to-miss smudge rather than a clear patch.
+BELIEF_HEATMAP_MIN_ALPHA = 90
+# Skip drawing a hex whose mass is below this fraction of the field's own
+# peak -- keeps per-frame draw-call count bounded against a large board's
+# long, mostly-negligible diffusion tail.
+BELIEF_HEATMAP_MIN_RELATIVE_MASS = 0.03
 
 
 @dataclass
@@ -297,6 +347,25 @@ def _compute_tally(records: list[dict], cursor: int) -> _Tally:
     return tally
 
 
+def _record_ordinal(record: dict) -> int | None:
+    """`turn_ordinal` for `record` -- None for the "initial" record (no
+    `turn_number` at all, nothing belief-relevant could exist yet). Plain
+    `turn_number` alone can't tell "before this turn's move_a" from
+    "after this turn's move_b" (both share it), which matters here
+    because each side's own `EnemyModel` only updates belief during *its
+    own* half of a turn (see `turn_ordinal`'s own docstring) -- so this is
+    what actually lines up a viewed record with what had been written to
+    the belief store by that exact point in the game, not just which
+    turn it happened to share. A "final" record has a `turn_number` but
+    no `phase` (the game's over, both halves of that turn are long
+    resolved) -- treated as move_b, the most-resolved state for that
+    turn."""
+    turn = record.get("turn_number")
+    if turn is None:
+        return None
+    return turn_ordinal(turn, record.get("phase", "move_b") == "move_b")
+
+
 def _record_label(record: dict) -> str:
     record_type = record.get("type")
     if record_type == "initial":
@@ -310,7 +379,9 @@ def _record_label(record: dict) -> str:
 
 
 class ReplayView(arcade.View):
-    def __init__(self, records: list[dict], hex_size: float | None = None) -> None:
+    def __init__(
+        self, records: list[dict], hex_size: float | None = None, belief_reader: "BeliefReader | None" = None
+    ) -> None:
         super().__init__()
         if not records or records[0].get("type") != "initial":
             raise ValueError("replay records must start with an 'initial' record")
@@ -318,6 +389,24 @@ class ReplayView(arcade.View):
         self.board = _board_from_initial(records[0])
         self.hex_size = hex_size if hex_size is not None else self.board.hex_pixel_size
         self.ship_histories = _build_ship_histories(records)
+
+        # Ship inventory panel + belief heatmap overlay -- see
+        # _draw_inventory_panel/_draw_belief_overlay. belief_reader is
+        # None unless --belief was passed; the panel and overlay are both
+        # no-ops in that case. _belief_geometry is only ever used for its
+        # to_coord(row, col) -- the same board-derived geometry the field
+        # was diffused/written against (see tla.ai.hexfield).
+        self.belief_reader = belief_reader
+        self.selected_ship_id: int | None = None
+        self._inventory_scroll = 0
+        # Collapses just the row list (see _inventory_panel_geometry) --
+        # toggled by the header's collapse button, _inventory_button_rects.
+        self._inventory_collapsed = False
+        # Feedback for clicking a dimmed (no belief data) row -- see
+        # _handle_inventory_click. Cleared on any other inventory action,
+        # or on a click outside the panel entirely (on_mouse_press).
+        self._inventory_status: str | None = None
+        self._belief_geometry = HexFieldGeometry.from_board(self.board) if belief_reader is not None else None
 
         min_x, min_y, max_x, max_y = board_pixel_bounds(self.board, self.hex_size)
         self._board_pixel_bounds = (min_x, min_y, max_x, max_y)
@@ -353,7 +442,9 @@ class ReplayView(arcade.View):
         self._hovered_empty_hex: AxialCoord | None = None
 
         self._hud_text = arcade.Text("", 10, 0, arcade.color.WHITE, 13)
-        self._tooltip_texts = [arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(4)]
+        # 5, not 4 -- one extra line for a probability reading when a ship
+        # is selected (see _belief_probability_at/_draw_hover_tooltip).
+        self._tooltip_texts = [arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(5)]
         self._hex_coord_text = arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12)
 
     # -- cursor / ship status -------------------------------------------------
@@ -474,6 +565,7 @@ class ReplayView(arcade.View):
         self.clear()
         self.camera.use()
         draw_board(self.board, self.hex_size)
+        self._draw_belief_overlay()
 
         for history in self.ship_histories.values():
             points = self._path_points(history, self.cursor)
@@ -498,6 +590,7 @@ class ReplayView(arcade.View):
         self._hud_text.draw()
         self._draw_transport_controls()
         self._draw_tally()
+        self._draw_inventory_panel()
 
         hovered = self.ship_histories.get(self._hovered_ship_id) if self._hovered_ship_id is not None else None
         if hovered is not None:
@@ -528,6 +621,184 @@ class ReplayView(arcade.View):
                 line, left + TALLY_PADDING, top - TALLY_PADDING - (i + 1) * TALLY_LINE_HEIGHT + 4, PLAYER_COLORS[owner], 11
             )
             text_obj.draw()
+
+    # -- belief overlay / ship inventory -------------------------------------
+
+    def _draw_belief_overlay(self) -> None:
+        """Amber heatmap for `self.selected_ship_id`'s recorded belief
+        field as of the current cursor's turn -- world space, drawn right
+        after the board so ship glyphs/paths stay on top and legible. The
+        selected ship's own glyph (drawn normally, unconditionally, right
+        after this) already shows its true position for the turn -- that
+        *is* the "actual" half of the believed-vs-actual comparison, no
+        separate marker needed."""
+        if self.belief_reader is None or self.selected_ship_id is None:
+            return
+        ordinal = _record_ordinal(self.records[self.cursor])
+        if ordinal is None:
+            return  # the "initial" record -- nothing to show yet
+        field = self.belief_reader.field_as_of(self.selected_ship_id, ordinal)
+        if field is None:
+            return
+        peak = float(field.max())
+        if peak <= 0:
+            return
+        threshold = peak * BELIEF_HEATMAP_MIN_RELATIVE_MASS
+        alpha_span = BELIEF_HEATMAP_MAX_ALPHA - BELIEF_HEATMAP_MIN_ALPHA
+        rows, cols = field.shape
+        for row in range(rows):
+            for col in range(cols):
+                mass = field[row, col]
+                if mass <= threshold:
+                    continue
+                # A floor, not a pure mass/peak scale -- see
+                # BELIEF_HEATMAP_MIN_ALPHA's own comment: otherwise most
+                # included cells (mass just above threshold) end up
+                # nearly transparent and the whole overlay is easy to miss.
+                alpha = int(BELIEF_HEATMAP_MIN_ALPHA + alpha_span * min(1.0, mass / peak))
+                coord = self._belief_geometry.to_coord(row, col)
+                draw_hex_highlight(coord, self.hex_size, (*BELIEF_HEATMAP_COLOR, alpha))
+
+    def _inventory_rows(self) -> list[int]:
+        """Every ship id that ever appears in the replay, sorted by owner
+        then id -- self.ship_histories already covers the whole game, no
+        separate scan needed."""
+        return sorted(self.ship_histories, key=lambda sid: (self.ship_histories[sid].owner, sid))
+
+    def _inventory_panel_geometry(self) -> tuple[float, float, float, float]:
+        """(left, bottom, width, height), screen space -- top-left, below
+        the HUD label. Only meaningful when self.belief_reader is not
+        None (see _point_in_inventory_panel/on_mouse_press). Collapsed
+        (see _inventory_button_rects) means just the header -- no rows."""
+        if self._inventory_collapsed:
+            height = INVENTORY_HEADER_HEIGHT
+        else:
+            visible_rows = min(len(self._inventory_rows()), INVENTORY_MAX_VISIBLE_ROWS)
+            height = INVENTORY_HEADER_HEIGHT + visible_rows * INVENTORY_ROW_HEIGHT + INVENTORY_PANEL_MARGIN
+        top = self.window.height - 40
+        left = INVENTORY_PANEL_MARGIN
+        return left, top - height, INVENTORY_PANEL_WIDTH, height
+
+    def _point_in_inventory_panel(self, screen_x: float, screen_y: float) -> bool:
+        if self.belief_reader is None:
+            return False
+        left, bottom, width, height = self._inventory_panel_geometry()
+        return left <= screen_x <= left + width and bottom <= screen_y <= bottom + height
+
+    def _inventory_button_rects(self) -> dict[str, tuple[float, float, float, float]]:
+        """Small header controls, right-to-left from the panel's top-right
+        corner: 'collapse' (always present) and 'clear' (only while a ship
+        is selected -- nothing to clear otherwise)."""
+        left, bottom, width, height = self._inventory_panel_geometry()
+        top = bottom + height
+        size = INVENTORY_HEADER_BUTTON_SIZE
+        y = top - size - 3
+        rects = {"collapse": (left + width - size - 6, y, size, size)}
+        if self.selected_ship_id is not None:
+            x = rects["collapse"][0] - size - INVENTORY_HEADER_BUTTON_GAP
+            rects["clear"] = (x, y, size, size)
+        return rects
+
+    def _inventory_button_at(self, screen_x: float, screen_y: float) -> str | None:
+        if self.belief_reader is None:
+            return None
+        for name, (rx, ry, rw, rh) in self._inventory_button_rects().items():
+            if rx <= screen_x <= rx + rw and ry <= screen_y <= ry + rh:
+                return name
+        return None
+
+    def _inventory_row_at(self, screen_x: float, screen_y: float) -> int | None:
+        """Which ship id's row, if any, is under (screen_x, screen_y) --
+        None if the point is outside the panel entirely, over its header,
+        collapsed, or past the last row."""
+        if self._inventory_collapsed or not self._point_in_inventory_panel(screen_x, screen_y):
+            return None
+        _left, bottom, _width, height = self._inventory_panel_geometry()
+        top = bottom + height
+        header_bottom = top - INVENTORY_HEADER_HEIGHT
+        if screen_y > header_bottom:
+            return None
+        row_index = int((header_bottom - screen_y) // INVENTORY_ROW_HEIGHT) + self._inventory_scroll
+        rows = self._inventory_rows()
+        return rows[row_index] if 0 <= row_index < len(rows) else None
+
+    def _clear_ship_selection(self) -> None:
+        self.selected_ship_id = None
+        self._inventory_status = None
+
+    def _handle_inventory_click(self, ship_id: int) -> None:
+        if self.belief_reader is None:
+            return
+        if ship_id not in self.belief_reader.tracked_ship_ids():
+            # Roster-only row -- nothing to toggle, but say so instead of
+            # silently doing nothing (see _draw_inventory_status).
+            history = self.ship_histories[ship_id]
+            self._inventory_status = f"#{ship_id} {history.kind.value}: no belief data recorded"
+            return
+        self._inventory_status = None
+        self.selected_ship_id = None if self.selected_ship_id == ship_id else ship_id
+
+    def _belief_probability_at(self, hex_coord: AxialCoord) -> float | None:
+        """The selected ship's recorded belief mass at `hex_coord`, as of
+        the current cursor's turn -- None if nothing's selected, there's
+        no recorded data yet, or the hex is outside the belief field's
+        geometry (shouldn't happen for a real board hex, but guards a
+        stale/mismatched --belief file rather than raising)."""
+        if self.belief_reader is None or self.selected_ship_id is None:
+            return None
+        ordinal = _record_ordinal(self.records[self.cursor])
+        if ordinal is None:
+            return None
+        field = self.belief_reader.field_as_of(self.selected_ship_id, ordinal)
+        if field is None:
+            return None
+        row, col = self._belief_geometry.to_index(hex_coord)
+        if not self._belief_geometry.in_bounds(row, col):
+            return None
+        return float(field[row, col])
+
+    def _draw_inventory_panel(self) -> None:
+        if self.belief_reader is None:
+            return
+        left, bottom, width, height = self._inventory_panel_geometry()
+        top = bottom + height
+
+        arcade.draw_lbwh_rectangle_filled(left, bottom, width, height, INVENTORY_BG_COLOR)
+        arcade.Text("Ships (click to inspect)", left + 6, top - 16, arcade.color.WHITE, 11).draw()
+        self._draw_inventory_header_buttons()
+
+        if not self._inventory_collapsed:
+            rows = self._inventory_rows()
+            tracked = self.belief_reader.tracked_ship_ids()
+            visible_rows = min(len(rows), INVENTORY_MAX_VISIBLE_ROWS)
+            for i in range(visible_rows):
+                row_index = i + self._inventory_scroll
+                if row_index >= len(rows):
+                    break
+                ship_id = rows[row_index]
+                history = self.ship_histories[ship_id]
+                row_top = top - INVENTORY_HEADER_HEIGHT - i * INVENTORY_ROW_HEIGHT
+                row_bottom = row_top - INVENTORY_ROW_HEIGHT
+                if ship_id == self.selected_ship_id:
+                    arcade.draw_lbwh_rectangle_filled(
+                        left, row_bottom, width, INVENTORY_ROW_HEIGHT, INVENTORY_ROW_SELECTED_COLOR
+                    )
+                arcade.draw_lbwh_rectangle_filled(
+                    left + 4, row_bottom + 4, 10, INVENTORY_ROW_HEIGHT - 8, PLAYER_COLORS[history.owner]
+                )
+                has_belief = ship_id in tracked
+                text_color = INVENTORY_ROW_TEXT_COLOR if has_belief else INVENTORY_ROW_DIMMED_TEXT_COLOR
+                label = f"#{ship_id} {history.kind.value}"
+                arcade.Text(label, left + 20, row_bottom + 5, text_color, 10).draw()
+
+        if self._inventory_status is not None:
+            arcade.Text(self._inventory_status, left, bottom - 16, INVENTORY_STATUS_COLOR, 10).draw()
+
+    def _draw_inventory_header_buttons(self) -> None:
+        for name, (rx, ry, rw, rh) in self._inventory_button_rects().items():
+            arcade.draw_lbwh_rectangle_filled(rx, ry, rw, rh, INVENTORY_HEADER_BUTTON_COLOR)
+            glyph = "x" if name == "clear" else ("+" if self._inventory_collapsed else "-")
+            arcade.Text(glyph, rx + rw / 2 - 3, ry + 2, arcade.color.WHITE, 12).draw()
 
     # -- transport controls -------------------------------------------------
 
@@ -624,13 +895,16 @@ class ReplayView(arcade.View):
         arcade.draw_line(cx - r, cy + r, cx + r, cy - r, SUNK_MARKER_COLOR, 3)
 
     def _draw_hover_tooltip(self, history: _ShipHistory, status: tuple[AxialCoord, bool]) -> None:
-        _, sunk = status
+        position, sunk = status
         lines = [
             history.kind.value.replace("_", " ").title(),
             f"Player {'A' if history.owner == PLAYER_A else 'B'}, id {history.id}",
             f"HP: {history.hp[self.cursor if self.cursor in history.hp else history.last_index]}",
             "Sunk" if sunk else "Active",
         ]
+        probability = self._belief_probability_at(position)
+        if probability is not None:
+            lines.append(f"Belief P: {probability * 100:.1f}%")
         height = TOOLTIP_PADDING * 2 + TOOLTIP_LINE_HEIGHT * len(lines)
         mouse_x, mouse_y = self._mouse_screen_pos
         left = mouse_x + TOOLTIP_OFFSET
@@ -652,11 +926,17 @@ class ReplayView(arcade.View):
     def _draw_hex_coord_tooltip(self, hex_coord: AxialCoord) -> None:
         """A small "(q, r)" label next to the cursor for whichever empty
         board hex it's over -- see _update_hover. Same corner/flip-to-fit
-        placement as _draw_hover_tooltip, just one line and no player-color
-        accent bar (there's no owner to accent)."""
-        text = f"({hex_coord.q}, {hex_coord.r})"
-        width = TOOLTIP_PADDING * 2 + len(text) * 7 + 6
-        height = TOOLTIP_PADDING * 2 + TOOLTIP_LINE_HEIGHT
+        placement as _draw_hover_tooltip, no player-color accent bar
+        (there's no owner to accent). A second line with the selected
+        ship's believed probability at this hex is added when applicable
+        -- see _belief_probability_at."""
+        lines = [f"({hex_coord.q}, {hex_coord.r})"]
+        probability = self._belief_probability_at(hex_coord)
+        if probability is not None:
+            lines.append(f"Belief P: {probability * 100:.1f}%")
+
+        width = TOOLTIP_PADDING * 2 + max(len(line) for line in lines) * 7 + 6
+        height = TOOLTIP_PADDING * 2 + TOOLTIP_LINE_HEIGHT * len(lines)
         mouse_x, mouse_y = self._mouse_screen_pos
         left = mouse_x + TOOLTIP_OFFSET
         if left + width > self.window.width:
@@ -666,10 +946,12 @@ class ReplayView(arcade.View):
             top = mouse_y - TOOLTIP_OFFSET
 
         arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, TOOLTIP_BG_COLOR)
-        self._hex_coord_text.text = text
-        self._hex_coord_text.x = left + TOOLTIP_PADDING
-        self._hex_coord_text.y = top - TOOLTIP_PADDING - TOOLTIP_LINE_HEIGHT + 4
-        self._hex_coord_text.draw()
+        for i, line in enumerate(lines):
+            text_obj = self._hex_coord_text if i == 0 else self._tooltip_texts[i]
+            text_obj.text = line
+            text_obj.x = left + TOOLTIP_PADDING
+            text_obj.y = top - TOOLTIP_PADDING - (i + 1) * TOOLTIP_LINE_HEIGHT + 4
+            text_obj.draw()
 
     # -- input -------------------------------------------------------------
 
@@ -745,6 +1027,25 @@ class ReplayView(arcade.View):
 
     def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> None:
         if button == arcade.MOUSE_BUTTON_LEFT:
+            # Inventory panel takes priority over the board/transport
+            # controls, same dispatch order tla.rendering.game_view.
+            # GameView uses for its own port panel -- a click inside the
+            # panel (row, header button, or not) is absorbed here, never
+            # falls through.
+            action = self._inventory_button_at(x, y)
+            if action == "collapse":
+                self._inventory_collapsed = not self._inventory_collapsed
+                return
+            if action == "clear":
+                self._clear_ship_selection()
+                return
+            row_ship_id = self._inventory_row_at(x, y)
+            if row_ship_id is not None:
+                self._handle_inventory_click(row_ship_id)
+                return
+            if self._point_in_inventory_panel(x, y):
+                return
+            self._inventory_status = None  # clicking away dismisses the "no data" message
             self._handle_button_click(x, y)
         if button == arcade.MOUSE_BUTTON_RIGHT:
             self._dragging = True
@@ -797,6 +1098,12 @@ class ReplayView(arcade.View):
         self._hovered_empty_hex = hex_coord if found is None and hex_coord in self.board.tiles else None
 
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
+        if self._point_in_inventory_panel(x, y):
+            rows = self._inventory_rows()
+            visible_rows = min(len(rows), INVENTORY_MAX_VISIBLE_ROWS)
+            max_scroll = max(0, len(rows) - visible_rows)
+            self._inventory_scroll = max(0, min(max_scroll, self._inventory_scroll - int(scroll_y)))
+            return
         factor = 1.1 if scroll_y > 0 else (1 / 1.1 if scroll_y < 0 else 1.0)
         new_zoom = max(MIN_ZOOM, min(MAX_ZOOM, self.camera.zoom * factor))
         if new_zoom == self.camera.zoom:

@@ -38,6 +38,15 @@ def main() -> None:
         help="Write a post-game replay log (JSON Lines) to this path as the game is played. "
         "Omit for no replay logging. See replay_viewer.py to review one afterward.",
     )
+    parser.add_argument(
+        "--belief",
+        type=str,
+        default=None,
+        help="Write the AI's position-belief field for each tracked enemy ship to this HDF5 path as it "
+        "diffuses. Omit for no belief logging. Requires the 'hdf5' extra (pip install -e .[hdf5]). "
+        "Pass alongside --replay -- this path gets saved in the replay log, so replay_gui.py <replay> "
+        "alone finds it automatically, no need to pass it again.",
+    )
     args = parser.parse_args()
 
     config = Config.load(args.config)
@@ -64,7 +73,7 @@ def main() -> None:
     print(f"Map size: {config.map.width}x{config.map.height} hexes (fit to your screen)")
 
     game_state = new_game(config, seed)
-    run(game_state, replay_path=args.replay, seed=seed)
+    run(game_state, replay_path=args.replay, enemy_belief_path=args.belief, seed=seed)
 
 
 if __name__ == "__main__":

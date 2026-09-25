@@ -6,11 +6,18 @@ requires-python = ">=3.12"
 dependencies = [
     "arcade>=3.3,<4",
     "noise>=1.2,<2",
+    "numpy>=1.26,<3",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<10",
+]
+# Only needed for tla.ai.belief_store.BeliefStore -- optional HDF5 dump of
+# EnemyModel position-belief fields for offline inspection. Nothing else in
+# the game imports h5py, so a normal install/play doesn't need it.
+hdf5 = [
+    "h5py>=3.10,<4",
 ]
 
 [tool.setuptools.packages.find]

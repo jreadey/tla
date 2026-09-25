@@ -19,6 +19,17 @@ exact carrier-assist contribution, round-by-round damage -- instead of
 reconstructed after the fact from ship position/HP snapshots. Read
 directly off `game_state`, unlike `task_forces` -- no separate param, and
 never empty-by-omission the way `task_forces` can be.
+
+`write_half_turn`/`write_final` also optionally record each AI-controlled
+side's global-layer posture (see `tla.ai.global_strategy` and
+`tla.ai.policy.NaivePolicy.posture_snapshot_for`) -- the posture value
+itself plus the exact `(own, believed-enemy)` `(hp, damage)` totals it was
+computed from. This exists because reconstructing that belief after the
+fact from the rest of the replay log is lossy (the log doesn't capture
+each port's internal production-queue state, so a reconstructed
+`EnemyModel` can badly undercount a growing enemy fleet) -- logging it
+directly avoids that reconstruction entirely. Same opt-in shape as
+`task_forces`: omit for a human-only game or a caller that doesn't care.
 """
 
 from __future__ import annotations
@@ -122,6 +133,15 @@ def _config_dict(config: Config) -> dict:
     return data
 
 
+def _posture_dict(posture: dict[PlayerId, dict]) -> dict:
+    """`posture` is `{player: NaivePolicy.posture_snapshot_for(player)}`,
+    pre-filtered by the caller to drop `None` entries (players that
+    haven't had `plan_movement` called for them yet, or aren't
+    AI-controlled) -- this just stringifies the keys the same way
+    `_turn_stats_dict` does."""
+    return {str(player): snapshot for player, snapshot in posture.items()}
+
+
 def _ports(game_state: GameState) -> list[dict]:
     return [_port_dict(tile) for tile in game_state.board.tiles.values() if tile.is_port]
 
@@ -164,12 +184,19 @@ class ReplayWriter:
         self._file.write(json.dumps(record) + "\n")
         self._file.flush()
 
-    def write_initial(self, game_state: GameState, *, seed: int | None = None) -> None:
+    def write_initial(
+        self, game_state: GameState, *, seed: int | None = None, belief_path: str | None = None
+    ) -> None:
+        """`belief_path` (as given on the command line, not resolved) is
+        just carried along for `replay_gui.py` to auto-locate the paired
+        HDF5 belief file (see `tla.ai.belief_store`) without needing it
+        passed again explicitly -- None if `--belief` wasn't used."""
         board = game_state.board
         self._write(
             {
                 "type": "initial",
                 "seed": seed,
+                "belief_path": belief_path,
                 "config": _config_dict(game_state.config),
                 "board": {
                     "width": board.width,
@@ -188,6 +215,7 @@ class ReplayWriter:
         phase: TurnPhase,
         player: PlayerId,
         task_forces: list[TaskForce] | None = None,
+        posture: dict[PlayerId, dict] | None = None,
     ) -> None:
         self._write(
             {
@@ -201,10 +229,17 @@ class ReplayWriter:
                 "battle_log": [_battle_log_entry_dict(e) for e in game_state.battle_log],
                 "move_log": [_move_log_entry_dict(e) for e in game_state.move_log],
                 "task_forces": [_task_force_dict(f) for f in (task_forces or [])],
+                "posture": _posture_dict(posture or {}),
             }
         )
 
-    def write_final(self, game_state: GameState, *, task_forces: list[TaskForce] | None = None) -> None:
+    def write_final(
+        self,
+        game_state: GameState,
+        *,
+        task_forces: list[TaskForce] | None = None,
+        posture: dict[PlayerId, dict] | None = None,
+    ) -> None:
         """No-op if already finalized -- safe to call speculatively (e.g.
         every frame once the winner is set) without writing duplicate
         records or writing to a closed file."""
@@ -221,6 +256,7 @@ class ReplayWriter:
                 "battle_log": [_battle_log_entry_dict(e) for e in game_state.battle_log],
                 "move_log": [_move_log_entry_dict(e) for e in game_state.move_log],
                 "task_forces": [_task_force_dict(f) for f in (task_forces or [])],
+                "posture": _posture_dict(posture or {}),
             }
         )
         self.finalized = True

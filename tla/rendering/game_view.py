@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Iterator
 
 import arcade
@@ -169,6 +171,7 @@ class GameView(arcade.View):
         hex_size: float | None = None,
         *,
         replay_path: str | None = None,
+        enemy_belief_path: str | None = None,
         seed: int | None = None,
     ) -> None:
         super().__init__()
@@ -190,14 +193,21 @@ class GameView(arcade.View):
         self.ui_camera = arcade.Camera2D()
 
         self.turn_manager = TurnManager(game_state)
-        # AI opponent: NaivePolicy is stateless, so one instance covers
-        # whichever seat(s) game_state.config.player_kinds marks "ai" (see
-        # main.py's --ai flag). _ai_turn_iter is the in-progress
-        # plan_movement generator being drained one ship per
-        # AiConfig.turn_pacing_seconds by on_update, so a human opponent
-        # can watch the AI's turn unfold rather than it resolving
-        # instantly; None means no AI turn is currently running.
-        self.ai_policy = NaivePolicy()
+        # AI opponent: one NaivePolicy instance covers whichever seat(s)
+        # game_state.config.player_kinds marks "ai" (see main.py's --ai
+        # flag) -- it must be the same instance for the whole game, since
+        # it remembers each player's task forces and enemy-fleet belief
+        # across turns (see tla.ai.policy.NaivePolicy's own docstring).
+        # _ai_turn_iter is the in-progress plan_movement generator being
+        # drained one ship per AiConfig.turn_pacing_seconds by on_update,
+        # so a human opponent can watch the AI's turn unfold rather than
+        # it resolving instantly; None means no AI turn is currently
+        # running. enemy_belief_path is None unless --belief was passed,
+        # in which case the AI's position-belief field for each tracked
+        # enemy ship is dumped to HDF5 as it diffuses (see
+        # tla.ai.belief_store) -- closed alongside the replay writer at
+        # game end, in on_draw below.
+        self.ai_policy = NaivePolicy(enemy_belief_path=enemy_belief_path)
         self._ai_turn_iter: Iterator[None] | None = None
         self._ai_pace_timer: float = 0.0
         # Post-game replay logging (see tla.replay) -- None unless
@@ -207,7 +217,21 @@ class GameView(arcade.View):
         self.replay_writer: ReplayWriter | None = None
         if replay_path is not None:
             self.replay_writer = ReplayWriter(replay_path)
-            self.replay_writer.write_initial(game_state, seed=seed)
+            # Saved *relative to replay_path's own directory*, not as
+            # given on the command line -- replay_gui.py resolves it the
+            # same way at read time (against wherever the .jsonl actually
+            # is then, not the original cwd), so the pair keeps resolving
+            # correctly even if both files are later moved/archived
+            # together. Saving the raw --belief string instead would
+            # double up the directory when both flags share a common
+            # parent (e.g. --replay logs/g.jsonl --belief logs/g.h5 ->
+            # naively resolving "logs/g.h5" against "logs/" gives
+            # "logs/logs/g.h5"). See ReplayWriter.write_initial's own
+            # docstring.
+            saved_belief_path = None
+            if enemy_belief_path is not None:
+                saved_belief_path = os.path.relpath(enemy_belief_path, start=Path(replay_path).parent)
+            self.replay_writer.write_initial(game_state, seed=seed, belief_path=saved_belief_path)
         # An in-progress drag: the ship being moved, the exact route drawn
         # so far (starting with its current hex), and a background "how far
         # could I go" hint computed once at drag-start.
@@ -461,6 +485,17 @@ class GameView(arcade.View):
             return entry.battle_hex, f"{attacker_label} attacks your {defender_kind_label}!"
         return None
 
+    def _posture_snapshot(self) -> dict[PlayerId, dict]:
+        """Both players' current global-layer posture (see
+        `tla.ai.global_strategy`), for `ReplayWriter.write_half_turn`/
+        `write_final`'s optional `posture` param -- filters out `None`
+        (a human-controlled or not-yet-planned-for player), the same
+        omit-if-absent shape `task_forces` already uses there."""
+        snapshots = {
+            player: self.ai_policy.posture_snapshot_for(player) for player in (PLAYER_A, PLAYER_B)
+        }
+        return {player: snapshot for player, snapshot in snapshots.items() if snapshot is not None}
+
     def _end_movement_phase(self) -> None:
         """End the current player's movement phase -- the shared path for
         both the human's Enter key and an AI's turn finishing. If this is
@@ -482,6 +517,7 @@ class GameView(arcade.View):
                 phase=self.game_state.phase,
                 player=self.game_state.current_player,
                 task_forces=self.ai_policy.task_forces_for(PLAYER_A) + self.ai_policy.task_forces_for(PLAYER_B),
+                posture=self._posture_snapshot(),
             )
         # Same "before battle_log is cleared" reasoning as the replay write
         # above -- see _record_turn_sunk_hexes.
@@ -1066,7 +1102,9 @@ class GameView(arcade.View):
                 self.replay_writer.write_final(
                     self.game_state,
                     task_forces=self.ai_policy.task_forces_for(PLAYER_A) + self.ai_policy.task_forces_for(PLAYER_B),
+                    posture=self._posture_snapshot(),
                 )
+            self.ai_policy.close_enemy_belief_store()  # no-op unless --belief was passed; idempotent
             self._draw_game_over_overlay()
             return
         self._draw_hud()

@@ -11,6 +11,7 @@ from tla.replay import (
     _config_dict,
     _move_log_entry_dict,
     _port_dict,
+    _posture_dict,
     _ship_dict,
     _task_force_dict,
     _tile_dict,
@@ -166,7 +167,19 @@ def test_write_initial_produces_one_parseable_record(tmp_path):
     assert record["seed"] == 42
     assert len(record["ships"]) == 2
     assert len(record["board"]["tiles"]) == 2
+    assert record["belief_path"] is None  # default -- see the belief_path-specific test below
     json.dumps(record)  # sanity: config round-tripped cleanly too
+
+
+def test_write_initial_saves_the_belief_path_when_given(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+
+    writer.write_initial(gs, seed=42, belief_path="logs/game.h5")
+
+    record = json.loads(path.read_text().splitlines()[0])
+    assert record["belief_path"] == "logs/game.h5"
 
 
 def test_write_half_turn_captures_current_state(tmp_path):
@@ -203,6 +216,62 @@ def test_write_half_turn_includes_task_forces_when_given(tmp_path):
     record = json.loads(path.read_text().splitlines()[1])
     assert len(record["task_forces"]) == 1
     assert record["task_forces"][0]["goal"] == {"kind": "capture_port", "target": [0, 0]}
+
+
+def test_posture_dict_stringifies_player_keys():
+    data = _posture_dict(
+        {
+            PLAYER_A: {"posture": "aggressive", "own_hp": 12, "own_damage": 4},
+            PLAYER_B: {"posture": "defensive", "own_hp": 3, "own_damage": 1},
+        }
+    )
+
+    assert data == {
+        "1": {"posture": "aggressive", "own_hp": 12, "own_damage": 4},
+        "2": {"posture": "defensive", "own_hp": 3, "own_damage": 1},
+    }
+
+
+def test_write_half_turn_includes_posture_when_given(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+    writer.write_initial(gs)
+
+    writer.write_half_turn(
+        gs,
+        phase=TurnPhase.MOVE_A,
+        player=PLAYER_A,
+        posture={PLAYER_A: {"posture": "neutral", "own_hp": 5, "own_damage": 2}},
+    )
+
+    record = json.loads(path.read_text().splitlines()[1])
+    assert record["posture"] == {"1": {"posture": "neutral", "own_hp": 5, "own_damage": 2}}
+
+
+def test_write_half_turn_posture_empty_when_omitted(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+    writer.write_initial(gs)
+
+    writer.write_half_turn(gs, phase=TurnPhase.MOVE_A, player=PLAYER_A)
+
+    record = json.loads(path.read_text().splitlines()[1])
+    assert record["posture"] == {}
+
+
+def test_write_final_includes_posture_when_given(tmp_path):
+    gs = _game_state()
+    path = tmp_path / "replay.jsonl"
+    writer = ReplayWriter(path)
+    writer.write_initial(gs)
+    gs.winner = PLAYER_A
+
+    writer.write_final(gs, posture={PLAYER_B: {"posture": "defensive", "own_hp": 1, "own_damage": 1}})
+
+    final_record = json.loads(path.read_text().splitlines()[1])
+    assert final_record["posture"] == {"2": {"posture": "defensive", "own_hp": 1, "own_damage": 1}}
 
 
 def test_write_final_is_idempotent_and_closes_file(tmp_path):

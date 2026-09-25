@@ -13,6 +13,7 @@ from tla.ai.policy import (
     _step_toward,
     choose_task_force_destination,
 )
+from tla.ai.global_strategy import Posture
 from tla.ai.task_force import (
     GoalKind,
     TaskForce,
@@ -22,7 +23,7 @@ from tla.ai.task_force import (
     enemy_reachable_next_turn,
 )
 from tla.board import Board
-from tla.config import AiConfig, Config, FowConfig
+from tla.config import AiConfig, Config, FleetConfig, FowConfig
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, distance, hexes_in_range
 from tla.ship import Ship, ShipKind
@@ -976,3 +977,125 @@ def test_plan_movement_carrier_defense_does_not_trigger_when_carrier_is_safe():
     directives = compute_carrier_defense_directives(gs, PLAYER_A, {2: distant_threat}, gs.config.ai)
 
     assert directives == []
+
+
+# -- cross-model belief reconciliation (see NaivePolicy._reconcile_defender_belief) --
+# Regression tests for a real gap a replay review caught: EnemyModel could
+# only ever observe combat where it was the attacker (game_state.battle_log
+# has a half-turn lifecycle, gone by the time the defending side's own model
+# next runs) -- so an enemy ship that attacked one of our ships was never
+# recorded as sighted, even though being attacked obviously reveals the
+# attacker. NaivePolicy owns both players' models, so it can hand each
+# half-turn's battle_log to the *other* player's model too, before the game
+# loop clears it.
+
+
+def test_being_attacked_reveals_the_attacker_to_the_defenders_own_model():
+    from tla.game_state import BattleLogEntry
+
+    board = _sea_board(radius=10)
+    gs = _game_state(board, [], config=Config(fow=FowConfig(enabled=True)))
+    gs.battle_log.append(
+        BattleLogEntry(
+            attacker_id=7, attacker_kind=ShipKind.SUBMARINE, attacker_owner=PLAYER_A,
+            defender_id=2, defender_kind=ShipKind.BATTLESHIP, defender_owner=PLAYER_B,
+            battle_hex=AxialCoord(3, 0), damage_to_defender=1, damage_to_attacker=1,
+            attacker_carrier_bonus=0, defender_carrier_bonus=0,
+            defender_hp_after=11, attacker_hp_after=3, defender_sunk=False, attacker_sunk=False,
+        )
+    )
+    policy = NaivePolicy()
+
+    # Player B's own plan_movement/begin_turn has never been called at all
+    # -- yet its EnemyModel should already know about the attacking
+    # submarine, purely from having been attacked by it.
+    policy._reconcile_defender_belief(gs, PLAYER_A)
+
+    b_model = policy.enemy_model_for(PLAYER_B)
+    assert b_model is not None
+    assert 7 in b_model.tracked_ships()
+    tracked = b_model.tracked_ships()[7]
+    assert tracked.kind == ShipKind.SUBMARINE
+    assert tracked.last_seen_position == AxialCoord(3, 0)
+    assert tracked.last_known_hp == 3
+
+
+def test_an_attacker_that_dies_in_the_exchange_is_recorded_sunk_by_the_defenders_model():
+    from tla.game_state import BattleLogEntry
+
+    board = _sea_board(radius=10)
+    config = Config(fow=FowConfig(enabled=True), fleet=FleetConfig(counts={ShipKind.SUBMARINE: 1}))
+    gs = _game_state(board, [], config=config)
+    policy = NaivePolicy()
+    # Seed B's model so the submarine starts out merely "somewhere in the
+    # pool", to also confirm the pool count drops correctly on this path.
+    b_model = policy._enemy_model_for(gs, PLAYER_B)
+    assert b_model.alive_count(ShipKind.SUBMARINE) == 1
+
+    gs.battle_log.append(
+        BattleLogEntry(
+            attacker_id=7, attacker_kind=ShipKind.SUBMARINE, attacker_owner=PLAYER_A,
+            defender_id=2, defender_kind=ShipKind.BATTLESHIP, defender_owner=PLAYER_B,
+            battle_hex=AxialCoord(3, 0), damage_to_defender=1, damage_to_attacker=4,
+            attacker_carrier_bonus=0, defender_carrier_bonus=0,
+            defender_hp_after=11, attacker_hp_after=0, defender_sunk=False, attacker_sunk=True,
+        )
+    )
+
+    policy._reconcile_defender_belief(gs, PLAYER_A)
+
+    assert 7 not in b_model.tracked_ships()
+    assert b_model.alive_count(ShipKind.SUBMARINE) == 0
+
+
+# -- global layer: posture shifts engagement margins (see tla.ai.global_strategy) --
+
+
+def test_plan_movement_shifts_engagement_margins_by_posture_without_compounding():
+    board = _sea_board(radius=10)
+    # Heavily outmatch the enemy's whole believed fleet (one patrol boat,
+    # never sighted) with three of our own battleships -- should read as
+    # clearly AGGRESSIVE.
+    own_ships = [_ship(AxialCoord(i, 0), ShipKind.BATTLESHIP, PLAYER_A, i + 1) for i in range(3)]
+    config = Config(fow=FowConfig(enabled=True), fleet=FleetConfig(counts={ShipKind.PATROL_BOAT: 1}))
+    gs = _game_state(board, own_ships, config=config)
+    policy = NaivePolicy()
+    base_margin = gs.config.ai.task_force_outnumbered_margin
+    shift = gs.config.ai.posture_margin_shift
+
+    _run(policy, gs, PLAYER_A)
+
+    assert policy.posture_for(PLAYER_A) == Posture.AGGRESSIVE
+    assert gs.config.ai.task_force_outnumbered_margin == base_margin + shift
+    assert gs.config.ai.port_defense_margin == shift
+    assert gs.config.ai.carrier_defense_margin == shift
+
+    # A second call for the same player, same imbalance -- the shift must
+    # not compound onto itself turn after turn.
+    _run(policy, gs, PLAYER_A)
+
+    assert policy.posture_for(PLAYER_A) == Posture.AGGRESSIVE
+    assert gs.config.ai.task_force_outnumbered_margin == base_margin + shift
+
+
+def test_posture_snapshot_for_reports_posture_and_its_own_believed_enemy_inputs():
+    board = _sea_board(radius=10)
+    own_ships = [_ship(AxialCoord(i, 0), ShipKind.BATTLESHIP, PLAYER_A, i + 1) for i in range(3)]
+    config = Config(fow=FowConfig(enabled=True), fleet=FleetConfig(counts={ShipKind.PATROL_BOAT: 1}))
+    gs = _game_state(board, own_ships, config=config)
+    policy = NaivePolicy()
+
+    assert policy.posture_snapshot_for(PLAYER_A) is None  # nothing planned for yet
+
+    _run(policy, gs, PLAYER_A)
+
+    stats = Config().ship_stats.stats
+    battleship_hp, battleship_dmg = stats[ShipKind.BATTLESHIP].hp, stats[ShipKind.BATTLESHIP].damage
+    patrol_hp, patrol_dmg = stats[ShipKind.PATROL_BOAT].hp, stats[ShipKind.PATROL_BOAT].damage
+    assert policy.posture_snapshot_for(PLAYER_A) == {
+        "posture": "aggressive",
+        "own_hp": battleship_hp * 3,
+        "own_damage": battleship_dmg * 3,
+        "believed_enemy_hp": patrol_hp,
+        "believed_enemy_damage": patrol_dmg,
+    }

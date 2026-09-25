@@ -68,7 +68,13 @@ def _disable_native_macos_fullscreen(window: arcade.Window) -> None:
     )
 
 
-def run(game_state: GameState, *, replay_path: str | None = None, seed: int | None = None) -> None:
+def run(
+    game_state: GameState,
+    *,
+    replay_path: str | None = None,
+    enemy_belief_path: str | None = None,
+    seed: int | None = None,
+) -> None:
     board = game_state.board
     natural_min_x, natural_min_y, natural_max_x, natural_max_y = board_pixel_bounds(
         board, board.hex_pixel_size
@@ -91,5 +97,5 @@ def run(game_state: GameState, *, replay_path: str | None = None, seed: int | No
     # buttons) off-screen. Pyglet's own default placement centers correctly.
     window = arcade.Window(width, height, "tla - Navy Strategy", resizable=True)
     _disable_native_macos_fullscreen(window)
-    window.show_view(GameView(game_state, replay_path=replay_path, seed=seed))
+    window.show_view(GameView(game_state, replay_path=replay_path, enemy_belief_path=enemy_belief_path, seed=seed))
     arcade.run()
