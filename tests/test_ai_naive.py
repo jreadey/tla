@@ -1099,3 +1099,39 @@ def test_posture_snapshot_for_reports_posture_and_its_own_believed_enemy_inputs(
         "believed_enemy_hp": patrol_hp,
         "believed_enemy_damage": patrol_dmg,
     }
+
+
+def test_plan_movement_assigns_a_defend_port_goal_under_sustained_defensive_pressure():
+    port = AxialCoord(0, 0)
+    board = _port_board(port, radius=12)
+    ship = _ship(AxialCoord(2, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)  # weak -- posture should read DEFENSIVE
+    gs = _game_state(
+        board,
+        [ship],
+        config=Config(
+            fow=FowConfig(enabled=False),
+            fleet=FleetConfig(counts={ShipKind.BATTLESHIP: 3, ShipKind.SUBMARINE: 1}),
+            ai=AiConfig(task_force_min_size=1, posture_port_threat_mass_trigger=0.5),
+        ),
+    )
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1})
+    policy = NaivePolicy()
+    policy._task_forces[PLAYER_A] = [force]
+    policy._next_force_id = 2
+    # A believed submerged submarine right by the port -- deliberately a
+    # submarine (not a battleship): the port's own vision radius (default
+    # 4) equals port_defense_trigger_radius, so a non-submarine belief
+    # this close would be immediately falsified/excluded by our own real
+    # vision (correctly -- see EnemyModel's vision-exclusion diffusion).
+    # A submerged sub stays undetected by ordinary vision (tla.fow.
+    # is_hidden), so its belief survives -- exactly the case this feature
+    # exists for: a threat compute_port_defense_directives' visible-enemy
+    # check could never see coming either.
+    model = policy._enemy_model_for(gs, PLAYER_A)
+    model._resolve(99, ShipKind.SUBMARINE, AxialCoord(1, 0), 4, turn=1, surfaced=False)
+    model._ensure_fields_for_unseen({})
+
+    _run(policy, gs, PLAYER_A)
+
+    assert policy.posture_for(PLAYER_A) == Posture.DEFENSIVE
+    assert force.goal == TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port)

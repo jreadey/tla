@@ -394,6 +394,14 @@ class AiConfig:
     # three -- see that function's own docstring for why one shared delta
     # applies uniformly). Deliberately modest to start.
     posture_margin_shift: int = 1
+    # tla.ai.task_force.apply_defensive_port_priority: believed dangerous-
+    # kind mass (tla.ai.enemy_model.EnemyModel.mass_near units -- roughly
+    # one full tracked ship's worth of probability) within
+    # port_defense_trigger_radius of a controlled port needed before a
+    # DEFENSIVE-posture force gets redirected to defend it. Reuses that
+    # same radius -- same "how far out is this port's business" meaning
+    # already established for the visible-enemy port-defense directive.
+    posture_port_threat_mass_trigger: float = 1.0
 
 
 @dataclass

@@ -97,6 +97,7 @@ def _make_view(records, cursor=0) -> ReplayView:
     view._play_timer = 0.0
     view._held_pan_keys = set()
     view._step_animation = None
+    view.belief_reader = None  # no --belief file -- _set_cursor's scroll-clamp step is a no-op
     return view
 
 
@@ -202,6 +203,105 @@ def test_ship_status_at_reflects_alive_then_sunk():
     assert view._ship_status_at(destroyer, 1) == (AxialCoord(0, 0), False)
     assert view._ship_status_at(patrol_boat, 0) == (AxialCoord(2, 0), False)
     assert view._ship_status_at(patrol_boat, 1) == (AxialCoord(2, 0), True)  # sunk -- last known position
+
+
+def test_inventory_rows_excludes_a_ship_once_it_sinks():
+    initial = _initial_record()
+    after_battle = _half_turn([_ship(1, "destroyer", PLAYER_A, (0, 0))], [])  # ship 2 gone -- sunk
+    records = [initial, after_battle]
+    view = ReplayView.__new__(ReplayView)
+    view.records = records
+    view.ship_histories = _build_ship_histories(records)
+
+    view.cursor = 0
+    assert view._inventory_rows() == [1, 2]
+
+    view.cursor = 1
+    assert view._inventory_rows() == [1]  # sunk ship 2 dropped off the list
+
+
+def test_inventory_rows_excludes_a_ship_not_yet_produced():
+    initial = _initial_record()
+    produced = _half_turn(
+        [_ship(1, "destroyer", PLAYER_A, (0, 0)), _ship(2, "patrol_boat", PLAYER_B, (2, 0)), _ship(3, "cruiser", PLAYER_A, (1, 1))],
+        [],
+    )
+    records = [initial, produced]
+    view = ReplayView.__new__(ReplayView)
+    view.records = records
+    view.ship_histories = _build_ship_histories(records)
+
+    view.cursor = 0
+    assert view._inventory_rows() == [1, 2]  # ship 3 doesn't exist yet
+
+    view.cursor = 1
+    assert view._inventory_rows() == [1, 3, 2]  # sorted by owner then id -- both PLAYER_A ships come first
+
+
+class _IdentityCamera:
+    """A stand-in for arcade.Camera2D -- unproject is the identity, so
+    screen coordinates passed to _update_hover can be picked directly as
+    a target hex's own pixel center (see axial_to_pixel) without needing a
+    real camera/GL context in a headless test."""
+
+    def unproject(self, screen_pos):
+        return screen_pos
+
+
+def _hover_view(records, cursor) -> ReplayView:
+    view = ReplayView.__new__(ReplayView)
+    view.records = records
+    view.board = _board_from_initial(records[0])
+    view.ship_histories = _build_ship_histories(records)
+    view.hex_size = 18.0
+    view.cursor = cursor
+    view.camera = _IdentityCamera()
+    return view
+
+
+def test_update_hover_prefers_an_active_ship_over_a_sunk_one_sharing_a_hex():
+    initial = _initial_record()  # ship 1 at (0,0), ship 2 at (2,0)
+    # Ship 1 sinks in place at (0,0); ship 2 survives and moves onto that
+    # same now-vacant hex.
+    after = _half_turn([_ship(2, "patrol_boat", PLAYER_B, (0, 0), hp=2)], [])
+    records = [initial, after]
+    view = _hover_view(records, cursor=1)
+
+    x, y = axial_to_pixel(AxialCoord(0, 0), view.hex_size)
+    view._update_hover(x, y)
+
+    assert view._hovered_ship_id == 2  # the active occupant, not the sunk destroyer
+
+
+def test_update_hover_falls_back_to_a_sunk_ship_when_nothing_active_is_there():
+    initial = _initial_record()
+    after = _half_turn([_ship(2, "patrol_boat", PLAYER_B, (2, 0), hp=2)], [])  # ship 1 gone -- sunk at (0,0)
+    records = [initial, after]
+    view = _hover_view(records, cursor=1)
+
+    x, y = axial_to_pixel(AxialCoord(0, 0), view.hex_size)
+    view._update_hover(x, y)
+
+    assert view._hovered_ship_id == 1  # still inspectable where it died
+
+
+def test_set_cursor_clamps_inventory_scroll_when_the_row_count_shrinks():
+    from tla.rendering.replay_view import INVENTORY_MAX_VISIBLE_ROWS
+
+    initial = _initial_record()
+    initial["ships"] = [_ship(i, "patrol_boat", PLAYER_A, (i, 0)) for i in range(1, INVENTORY_MAX_VISIBLE_ROWS + 3)]
+    # Only ships 1 and 2 survive into this record -- the rest sunk.
+    after = _half_turn(
+        [_ship(1, "patrol_boat", PLAYER_A, (1, 0)), _ship(2, "patrol_boat", PLAYER_A, (2, 0))], []
+    )
+    records = [initial, after]
+    view = _make_view(records, cursor=0)
+    view.belief_reader = object()  # any non-None stand-in -- _set_cursor only checks it's not None
+    view._inventory_scroll = 10  # deep into the original, longer list
+
+    view._set_cursor(1)
+
+    assert view._inventory_scroll == 0  # only 2 rows left now -- nothing to scroll to
 
 
 def test_path_points_only_includes_positions_up_to_the_cursor():

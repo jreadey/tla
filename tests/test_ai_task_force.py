@@ -1,5 +1,7 @@
 from collections import Counter
 
+from tla.ai.enemy_model import EnemyModel
+from tla.ai.global_strategy import Posture
 from tla.ai.policy import NaivePolicy
 from tla.ai.task_force import (
     GoalKind,
@@ -9,6 +11,7 @@ from tla.ai.task_force import (
     _choose_blocker,
     _gather,
     _pullback_waypoint,
+    apply_defensive_port_priority,
     assign_goal,
     compute_carrier_defense_directives,
     compute_port_defense_directives,
@@ -28,7 +31,7 @@ from tla.ai.task_force import (
     update_task_force_stance,
 )
 from tla.board import Board
-from tla.config import AiConfig, Config, FowConfig
+from tla.config import AiConfig, Config, FleetConfig, FowConfig
 from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, distance, hexes_in_range, neighbors
 from tla.ship import Ship, ShipKind
@@ -1339,6 +1342,122 @@ def test_compute_port_defense_directives_does_not_double_claim_a_responder():
 
     claimed_ids = [s.id for d in directives for s in (d.counterattack or ([d.block] if d.block else []))]
     assert claimed_ids.count(1) == 1
+
+
+def _believed_threat_model(gs: GameState, near: AxialCoord) -> EnemyModel:
+    """An EnemyModel for PLAYER_A (tracking PLAYER_B) with a single
+    resolved-then-unseen enemy battleship at `near` -- a ~1.0 point-mass
+    belief field there, the same construction test_ai_global_strategy.py's
+    own rank_port_threats test uses. `gs`'s fleet must be empty
+    (FleetConfig(counts={})) for callers that need this to be the *only*
+    source of believed mass on the board."""
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+    model._resolve(99, ShipKind.BATTLESHIP, near, 12, turn=1)
+    model._ensure_fields_for_unseen({})
+    return model
+
+
+def test_apply_defensive_port_priority_assigns_the_nearest_eligible_force_to_the_threatened_port():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship], config=Config(fleet=FleetConfig(counts={})))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1})
+    model = _believed_threat_model(gs, AxialCoord(1, 0))
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert force.goal == TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port)
+
+
+def test_apply_defensive_port_priority_does_not_abandon_an_active_capture_port_goal():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship], config=Config(fleet=FleetConfig(counts={})))
+    original_goal = TaskForceGoal(kind=GoalKind.CAPTURE_PORT, target=AxialCoord(5, 5))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=original_goal)
+    model = _believed_threat_model(gs, AxialCoord(1, 0))
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert force.goal == original_goal  # left untouched -- no eligible force to redirect
+
+
+def test_apply_defensive_port_priority_skips_a_retreating_force():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship], config=Config(fleet=FleetConfig(counts={})))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, retreating=True)
+    model = _believed_threat_model(gs, AxialCoord(1, 0))
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert force.goal is None
+
+
+def test_apply_defensive_port_priority_is_stable_and_does_not_thrash_between_forces():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    defending_ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    closer_idle_ship = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_A, 2)  # nearer, but not already assigned
+    gs = _game_state(board, [defending_ship, closer_idle_ship], config=Config(fleet=FleetConfig(counts={})))
+    defender = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port))
+    idle = TaskForce(id=2, owner=PLAYER_A, member_ids={2})
+    model = _believed_threat_model(gs, AxialCoord(1, 0))
+
+    apply_defensive_port_priority([defender, idle], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert defender.goal == TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port)  # unchanged
+    assert idle.goal is None  # not pulled in -- the port already has a defender
+
+
+def test_apply_defensive_port_priority_releases_the_goal_once_posture_leaves_defensive():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship], config=Config(fleet=FleetConfig(counts={})))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port))
+    model = _believed_threat_model(gs, AxialCoord(1, 0))  # threat still present
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.NEUTRAL, AiConfig())
+
+    assert force.goal is None
+
+
+def test_apply_defensive_port_priority_releases_the_goal_once_the_threat_mass_drops_below_trigger():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    gs = _game_state(board, [ship], config=Config(fleet=FleetConfig(counts={})))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port))
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)  # no sighting resolved -- zero believed mass anywhere
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert force.goal is None
+
+
+def test_apply_defensive_port_priority_is_a_no_op_with_no_controlled_ports_or_forces():
+    board = _sea_board()
+    gs = _game_state(board, [], config=Config(fleet=FleetConfig(counts={})))
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    apply_defensive_port_priority([], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())  # must not raise
+
+
+def test_update_task_force_goals_never_clears_a_defend_port_goal_as_stalled():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    ship = _ship(port, ShipKind.DESTROYER, PLAYER_A, 1)  # sitting right at the port -- 0 distance, can't "improve"
+    gs = _game_state(board, [ship], config=Config(ai=AiConfig(task_force_stall_turns=1)))
+    goal = TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=goal, turns_since_progress=5, best_progress_distance=0)
+
+    update_task_force_goals(gs, PLAYER_A, [force])
+
+    assert force.goal == goal  # untouched -- DEFEND_PORT is exempt from the stall-clear branch
 
 
 def test_choose_blocker_prefers_a_submarine_over_a_patrol_boat_over_anything_else():

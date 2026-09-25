@@ -468,6 +468,15 @@ class ReplayView(arcade.View):
         self.cursor = new_index
         _apply_port_state(self.board, self.records[self.cursor])
         self.tally = _compute_tally(self.records, self.cursor)
+        if self.belief_reader is not None:
+            # The inventory list (see _inventory_rows) now shrinks and
+            # grows with the cursor -- ships sink out of it, so a scroll
+            # offset from a longer list earlier in the replay can end up
+            # past the end of a shorter one now, showing a blank panel
+            # until manually rescrolled.
+            rows = self._inventory_rows()
+            max_scroll = max(0, len(rows) - min(len(rows), INVENTORY_MAX_VISIBLE_ROWS))
+            self._inventory_scroll = max(0, min(self._inventory_scroll, max_scroll))
 
     def _start_step_animation(self, new_index: int) -> None:
         queue = _step_animation_queue(self.records[new_index])
@@ -660,10 +669,19 @@ class ReplayView(arcade.View):
                 draw_hex_highlight(coord, self.hex_size, (*BELIEF_HEATMAP_COLOR, alpha))
 
     def _inventory_rows(self) -> list[int]:
-        """Every ship id that ever appears in the replay, sorted by owner
-        then id -- self.ship_histories already covers the whole game, no
-        separate scan needed."""
-        return sorted(self.ship_histories, key=lambda sid: (self.ship_histories[sid].owner, sid))
+        """Every ship id currently afloat as of `self.cursor` -- produced
+        by this point in the replay (see `_ship_status_at`) and not yet
+        sunk -- sorted by owner then id. A ship drops off the list the
+        instant it's sunk rather than lingering in it for the rest of the
+        replay; recomputed fresh on every call (cheap, and the cursor
+        changes constantly), so the list always matches "still afloat
+        right now" as you step through."""
+        alive_ids = [
+            sid
+            for sid, history in self.ship_histories.items()
+            if (status := self._ship_status_at(history, self.cursor)) is not None and not status[1]
+        ]
+        return sorted(alive_ids, key=lambda sid: (self.ship_histories[sid].owner, sid))
 
     def _inventory_panel_geometry(self) -> tuple[float, float, float, float]:
         """(left, bottom, width, height), screen space -- top-left, below
@@ -1085,15 +1103,27 @@ class ReplayView(arcade.View):
         self._update_hover(x, y)
 
     def _update_hover(self, screen_x: float, screen_y: float) -> None:
+        """A sunk ship's marker stays drawn at its last position for the
+        rest of the replay (see `_ship_status_at`), so that hex can end up
+        shared with a later, unrelated ship that's actually there now --
+        an active occupant always wins the tooltip over a historical sunk
+        one; a sunk-only hex still shows that ship, so hovering where a
+        ship died still works when nothing's currently there."""
         self._mouse_screen_pos = (screen_x, screen_y)
         world = self.camera.unproject((screen_x, screen_y))
         hex_coord = pixel_to_axial(world[0], world[1], self.hex_size)
-        found: int | None = None
+        active_match: int | None = None
+        sunk_match: int | None = None
         for history in self.ship_histories.values():
             status = self._ship_status_at(history, self.cursor)
-            if status is not None and status[0] == hex_coord:
-                found = history.id
+            if status is None or status[0] != hex_coord:
+                continue
+            if status[1]:
+                sunk_match = sunk_match if sunk_match is not None else history.id
+            else:
+                active_match = history.id
                 break
+        found = active_match if active_match is not None else sunk_match
         self._hovered_ship_id = found
         self._hovered_empty_hex = hex_coord if found is None and hex_coord in self.board.tiles else None
 
