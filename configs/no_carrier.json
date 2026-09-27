@@ -1,0 +1,29 @@
+{
+  "_comment": "Same as dev.json, but with carriers removed entirely -- no carrier in the starting fleet, and production never builds one -- to see how the AI performs without the carrier-assist mechanic (carrier bonus, carrier-defense doctrine, carrier cohesion/caution heuristics) as a complicating factor.",
+  "map": {
+    "width": 20,
+    "height": 12,
+    "noise_scale": 6.0,
+    "sea_level": 0.15
+  },
+  "ports": {
+    "ports_per_player": 2,
+    "min_port_spacing": 2
+  },
+  "fleet": {
+    "battleship": 1,
+    "carrier": 0,
+    "cruiser": 1,
+    "destroyer": 1,
+    "submarine": 1,
+    "patrol_boat": 1
+  },
+  "production": {
+    "build_order": ["battleship", "cruiser", "destroyer", "submarine", "patrol_boat"]
+  },
+  "ai": {
+    "task_force_max_size": 6,
+    "task_force_gather_radius": 8,
+    "task_force_max_separation": 4
+  }
+}

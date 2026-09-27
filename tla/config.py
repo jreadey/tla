@@ -195,6 +195,54 @@ class AiConfig:
     # that threat's own reach, without either side ever having seen the
     # other first.
     carrier_advance_reserve: int = 3
+    # tla.ai.policy._carrier_scouting_advance: master switch for hex-by-
+    # hex carrier scouting, replacing carrier_advance_reserve/_carrier_
+    # cautious_max_steps above for any carrier that isn't threatened,
+    # retreating, or needing a cohesion correction this turn (see
+    # _carrier_scouting_eligible) -- every other carrier still goes
+    # through the unchanged flat-reserve path regardless of this flag.
+    # Instead of committing a single capped multi-hex move blind, the
+    # carrier takes one real hex at a time and rechecks DANGEROUS_TO_
+    # CARRIER_KINDS reachability against freshly recomputed vision after
+    # each hop (a real position change genuinely reveals more of the
+    # board -- FowConfig.port_and_carrier_visibility_radius moves with
+    # the ship), falling back exactly one hop if a hop turns out unsafe.
+    # This also naturally avoids the exact failure the flat reserve above
+    # was raised to 3 (from 2) to prevent -- jumping a multi-hex move
+    # clean over a threat sitting just past the carrier's own vision,
+    # straight into that threat's reach, with neither side ever having
+    # seen the other first -- since a hop-by-hop advance re-derives
+    # danger_hexes from fresh vision before choosing *each* next hex, not
+    # once before the whole move. A real replay review (game61) found
+    # the flat reserve throttling a carrier to 1 hex/turn even through a
+    # completely fog-blind opening with nothing dangerous anywhere
+    # nearby. Default **False**, deliberately -- a bare AiConfig() (no
+    # task_force_max_separation set) showed a real stall (seed 3 of
+    # tests/test_ai_selfplay.py's own regression seeds, never reached a
+    # winner in 1000 turns): an unbounded carrier could outrun its own
+    # combat-bogged force with nothing to rein it back in (see
+    # _carrier_scouting_eligible's cohesion check, a no-op whenever
+    # max_separation is unset). Under configs/dev.json's actual settings
+    # (max_separation=4, the cohesion cap present), a head-to-head
+    # self-play sweep across seeds 1/2/3/4/6 showed no stalls and
+    # faster-or-equal turns-to-winner on 4 of 5 (e.g. seed 6: 627 -> 315
+    # turns), same winner either way -- confirmed worth enabling, but only
+    # together with a real max_separation, so it's turned on in configs/
+    # dev.json itself (next to that setting) rather than defaulted here,
+    # where nothing guarantees the two travel together.
+    carrier_scouting_enabled: bool = False
+    # tla.ai.policy._carrier_scouting_advance: how many of a scouting
+    # carrier's own movement points stay unspent as a guaranteed one-hex
+    # retreat "escape hatch" -- retreating costs a real movement point
+    # same as any other move (tla.movement.move_ship has no special-cased
+    # undo anywhere in this codebase), so a carrier that spent its entire
+    # budget advancing and only then discovered a threat on the final hop
+    # would otherwise have nothing left to fall back with. 1 is the
+    # minimum that guarantees an affordable retreat from any hop actually
+    # taken -- deliberately much smaller than carrier_advance_reserve,
+    # since the safety here comes from verifying each hop's real vision,
+    # not from staying artificially close to the last known-clear hex.
+    carrier_scout_retreat_reserve: int = 1
     # Seconds paced between each AI ship's move, so a human opponent can
     # watch an AI turn unfold instead of it resolving instantly.
     turn_pacing_seconds: float = 0.4
@@ -380,6 +428,17 @@ class AiConfig:
     # knob, not a fairness one -- a folded-back ship's belief mass is
     # preserved, just merged into a coarser bucket.
     enemy_model_stale_turns: int = 10
+    # tla.ai.enemy_model.EnemyModel._diffuse_all: whether a never-
+    # individually-sighted ship's belief (KindPool.field only --
+    # TrackedShip.field, a ship we've actually seen before, keeps plain
+    # isotropic diffusion regardless; we know less about a total
+    # stranger's intent than a ship whose real last heading we observed)
+    # diffuses biased toward this player's own currently most-threatened
+    # controlled port at max speed, instead of spreading evenly in every
+    # direction -- "assume an unsighted new arrival is heading somewhere
+    # on purpose." Same total believed mass either way, just reshaped.
+    # False reverts every KindPool to the original pure random walk.
+    enemy_model_directional_diffusion: bool = True
     # tla.ai.global_strategy.compute_posture: how much clearer an edge (in
     # the same "rounds to kill" units tla.ai.task_force.outmatched already
     # uses) than the default-0 local-tactical margins before the *global*
@@ -394,14 +453,108 @@ class AiConfig:
     # three -- see that function's own docstring for why one shared delta
     # applies uniformly). Deliberately modest to start.
     posture_margin_shift: int = 1
-    # tla.ai.task_force.apply_defensive_port_priority: believed dangerous-
-    # kind mass (tla.ai.enemy_model.EnemyModel.mass_near units -- roughly
-    # one full tracked ship's worth of probability) within
-    # port_defense_trigger_radius of a controlled port needed before a
-    # DEFENSIVE-posture force gets redirected to defend it. Reuses that
-    # same radius -- same "how far out is this port's business" meaning
-    # already established for the visible-enemy port-defense directive.
-    posture_port_threat_mass_trigger: float = 1.0
+    # tla.ai.tactics.action_value: weight applied to a target's own damage
+    # stat when a candidate attack is predicted to secure its kill this
+    # turn -- concretely operationalizes "finishing off a target is worth
+    # exactly the future damage-per-round it stops dealing," not an
+    # arbitrary flat bonus (a real user complaint: two half-damaged
+    # survivors both still hit back next turn, a sunk ship never does).
+    # 1.0 means this term enters action_value on the same raw-damage-stat
+    # scale matchup_score's own race already uses -- a starting point for
+    # self-play tuning, not a settled value.
+    tactics_kill_weight: float = 1.0
+    # tla.ai.tactics.secure_kills_pass: caps how many of the player's own
+    # ships get chained onto one joint-kill target when no single one can
+    # solo-secure it -- bounds that pass's cost (O(group_size^2) per
+    # target) and stops it from over-committing the whole fleet to one
+    # kill at the expense of every other ship's turn. One less than
+    # task_force_max_size (4) -- a full 4-ship pile-on is already an
+    # extreme case better left to the ordinary per-ship loop's emergent
+    # behavior than to this deliberately narrow coordination pass.
+    tactics_max_focus_fire_group: int = 3
+    # Master switch for tla.ai.tactics (the kill-prioritization pass and
+    # action_value-based target ranking) -- False reverts to the prior
+    # matchup_score-only behavior. Purely so self-play tuning/regression
+    # can A/B the two directly.
+    tactics_enabled: bool = True
+    # tla.ai.policy: whether a task force's submarine participates in
+    # cohesion (_cohesion_destination) and shared pacing (_compute_force_
+    # pace/_choose_destination) the same as any other member, instead of
+    # being unconditionally exempt from both. Ship.max_movement already
+    # gives a submarine the right budget for whichever state it's in (full
+    # speed surfaced, a crawl submerged), so this alone makes a force
+    # travel normally with a surfaced sub and deliberately slow to the
+    # sub's pace once it submerges near a visible enemy -- the user's own
+    # tested doctrine: keep the sub in formation so an attacking enemy is
+    # likely to end up fighting the one ship that barely takes damage,
+    # not picking off the fleet's real firepower. False restores the
+    # prior unconditional exemption -- found via replay review after a
+    # lone submarine, with no cohesion holding it back, raced several
+    # hexes ahead of its own task force and was picked off alone.
+    submarine_task_force_cohesion: bool = True
+    # tla.ai.task_force.apply_defensive_port_priority: how far (sea
+    # hexes, real route) an active CAPTURE_PORT force is allowed to be
+    # recalled from to instead go defend a threatened controlled port --
+    # only considered at all when no free (goal-less or BLOCKADE) force
+    # is available, so an offense in progress is never abandoned for a
+    # threat that's too far to actually get back to in time. Same default
+    # and "close enough to matter" scale as port_defense_response_radius,
+    # expressed directly in hexes rather than an estimated turn count --
+    # this codebase's other distance knobs (port_defense_trigger_radius,
+    # retreat_pullback_hexes) work the same way, none of them model a
+    # specific force's own pace either.
+    defend_port_recall_max_distance: int = 8
+    # tla.ai.policy._weighted_damage: extra value credited to a carrier
+    # beyond its own modest damage stat (2), reflecting the assist bonus
+    # it grants nearby eligible ships (or removes from the enemy's side
+    # when it's the one sunk) -- so a carrier-losing trade scores clearly
+    # worse than its bare attack stat would suggest, and sinking an enemy
+    # carrier scores clearly better.
+    carrier_assist_value: float = 2.5
+    # tla.ai.task_force.update_task_force_stance's third retreat trigger:
+    # tla.ai.policy._project_engagement_value's score must be at least
+    # this before a force commits to its normal advance this turn --
+    # below it, retreat instead. Same "how much tolerance before
+    # bailing" shape as damaged_withdraw_fraction (0.34); negative means
+    # some net loss is still tolerated (this is about avoiding a clearly
+    # bad trade, not requiring a guaranteed win) -- a starting point for
+    # self-play tuning like every other threshold introduced this
+    # session.
+    min_engagement_value: float = -0.25
+    # tla.ai.policy._project_engagement_value: whether a force's at-risk
+    # assessment also treats a believed-but-never-sighted enemy
+    # concentration (tla.ai.enemy_model.EnemyModel.expected_strength_near,
+    # around a member's *projected* end-of-turn position) as a threat, the
+    # same way a visible enemy that could reach and secure-kill that
+    # position already is -- extends "should this force retreat/hold
+    # instead of advancing" to account for fog, not just what's currently
+    # on screen. False restores the prior visible-enemies-only at_risk
+    # assessment.
+    probable_threat_engagement_enabled: bool = True
+    # tla.ai.policy._project_engagement_value: radius (straight-line sea
+    # hexes -- expected_strength_near/mass_near are hexes_in_range-based,
+    # not a real sea-route reachability check the way
+    # enemy_reachable_next_turn is for the visible half of this same
+    # function) around a member's projected position to sum believed
+    # enemy damage over, when probable_threat_engagement_enabled. 6 -- the
+    # fastest ship kind's (patrol boat) movement stat -- is a defensible
+    # upper bound on how far whatever's actually out there could have
+    # closed in one turn, even though any single believed contributor
+    # might be slower.
+    probable_threat_radius: int = 6
+    # tla.ai.policy._reevaluate_strategy_on_new_sightings: whether a task
+    # force's AGGRESSIVE/ADVANCE/HOLD/RETREAT pick and retreat-stance check
+    # (normally computed once per turn, off whatever's visible before that
+    # turn's own ships have moved) gets re-run whenever a ship sighted
+    # later in the same turn -- revealed by the fleet's own ships advancing
+    # and their vision moving with them -- wasn't accounted for in the
+    # original pick. A real replay review (game61, turn 6) found a force
+    # advance blindly past 2 newly-revealed enemy battleships mid-turn with
+    # no mechanism to reconsider until the turn after. Default False
+    # pending self-play comparison -- flip once confirmed no worse, same
+    # caution as carrier_scouting_enabled after its own self-play
+    # regression this session.
+    reevaluate_strategy_on_new_sighting: bool = False
 
 
 @dataclass

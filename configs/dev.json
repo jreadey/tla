@@ -20,6 +20,7 @@
   "ai": {
     "task_force_max_size": 6,
     "task_force_gather_radius": 8,
-    "task_force_max_separation": 4
+    "task_force_max_separation": 4,
+    "carrier_scouting_enabled": true
   }
 }

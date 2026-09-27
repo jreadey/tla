@@ -1,7 +1,13 @@
 import math
 from dataclasses import replace
 
-from tla.ai.scoring import best_reachable_attack, matchup_score, nearest_enemy, nearest_uncontrolled_port
+from tla.ai.scoring import (
+    best_reachable_attack,
+    matchup_score,
+    nearest_enemy,
+    nearest_uncontrolled_port,
+    reachable_attack_candidates,
+)
 from tla.board import Board
 from tla.config import Config, ShipStatsConfig
 from tla.game_state import GameState
@@ -131,6 +137,43 @@ def test_matchup_score_includes_the_carrier_bonus():
     assert score_with_carrier > score_no_carrier
 
 
+def test_matchup_score_includes_the_defenders_carrier_bonus_from_the_attackers_far_side():
+    """Regression test for a real bug found via replay review: the
+    attacker approaches from *outside* the defender's own carrier-bonus
+    radius, but combat always actually happens at the defender's
+    (stationary) position -- effective_damage used to derive the battle
+    hex implicitly from its own second argument's position, which meant
+    computing the *return-fire* direction (defender -> attacker) used
+    the attacker's current, pre-approach position instead of the real
+    battle location, silently dropping the defender's own nearby-carrier
+    bonus whenever the attacker started outside that radius. A real AI
+    battleship approaching from a distance engaged what it scored as a
+    favorable fight against a carrier-escorted defender and died in a
+    fight that was actually much closer once the defender's real,
+    boosted return fire applied. defender hp is set high so rounds_to_
+    kill_them (unaffected by this bug) stays fixed across both cases,
+    isolating the effect on rounds_to_kill_me (the attacker's own
+    survival), which is exactly the direction the bug used to miscount."""
+    board = _sea_board(radius=10)
+    attacker = _ship(AxialCoord(-5, 0), ShipKind.BATTLESHIP, PLAYER_A, 1, hp=9)  # far outside the carrier's radius
+    defender = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_B, 2, hp=100)
+    gs_no_carrier = _game_state(board, [attacker, defender])
+    score_no_carrier = matchup_score(attacker, defender, gs_no_carrier)
+
+    defenders_carrier = _ship(AxialCoord(1, 0), ShipKind.CARRIER, PLAYER_B, 3)  # right next to the defender
+    gs_with_carrier = _game_state(
+        board,
+        [
+            _ship(AxialCoord(-5, 0), ShipKind.BATTLESHIP, PLAYER_A, 1, hp=9),
+            _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_B, 2, hp=100),
+            defenders_carrier,
+        ],
+    )
+    score_with_carrier = matchup_score(gs_with_carrier.ships[1], gs_with_carrier.ships[2], gs_with_carrier)
+
+    assert score_with_carrier < score_no_carrier
+
+
 def test_matchup_score_carrier_bonus_does_not_apply_against_a_submerged_submarine():
     board = _sea_board()
     battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
@@ -217,3 +260,25 @@ def test_best_reachable_attack_picks_the_more_favorable_of_two_targets():
     gs = _game_state(board, [attacker, weak, strong])
 
     assert best_reachable_attack(attacker, gs, {2: weak, 3: strong}) == AxialCoord(1, 0)
+
+
+def test_reachable_attack_candidates_returns_every_reachable_enemy_not_just_the_best():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    weak = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)
+    strong = _ship(AxialCoord(-1, 0), ShipKind.BATTLESHIP, PLAYER_B, 3, hp=100)
+    gs = _game_state(board, [attacker, weak, strong])
+
+    candidates = reachable_attack_candidates(attacker, gs, {2: weak, 3: strong})
+
+    assert {coord for coord, _cost in candidates} == {AxialCoord(1, 0), AxialCoord(-1, 0)}
+
+
+def test_reachable_attack_candidates_empty_when_nothing_reachable():
+    board = _sea_board()
+    attacker = _ship(AxialCoord(0, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    attacker.movement_remaining = 1
+    enemy = _ship(AxialCoord(5, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+    gs = _game_state(board, [attacker, enemy])
+
+    assert reachable_attack_candidates(attacker, gs, {2: enemy}) == []

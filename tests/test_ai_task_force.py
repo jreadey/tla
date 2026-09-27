@@ -377,6 +377,13 @@ def test_stall_detection_reassigns_a_force_camping_next_to_a_fight_it_cannot_win
             # combined-mechanism case, and test_update_task_force_stance_*
             # for retreat in isolation.
             task_force_threat_radius=0,
+            # Same reasoning, for the third retreat trigger (tla.ai.
+            # policy._project_engagement_value): a lone patrol boat that
+            # can't touch a hp=100 battleship would also score a clearly
+            # bad projected engagement and retreat immediately, freezing
+            # progress-tracking (record_task_force_progress skips a
+            # retreating force) before stall detection ever gets a turn.
+            min_engagement_value=-1000.0,
         ),
     )
     attacker = _ship(AxialCoord(4, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)  # weak, adjacent to the port
@@ -620,6 +627,72 @@ def test_update_task_force_stance_triggers_retreat_when_newly_outnumbered():
     assert force.retreat_turns == 0
     assert force.retreat_threat_power == (100, 4)  # strong's own (hp, damage), snapshotted
     assert force.goal == goal  # untouched -- only the stance changed
+
+
+def test_update_task_force_stance_triggers_retreat_from_should_retreat_verdict():
+    # Not outnumbered by group_power (is_outnumbered would say fine), but
+    # a should_retreat_by_force verdict of True (e.g. _pick_strategy_for_
+    # force's RETREAT verdict) should still trigger retreat -- the user's
+    # own "don't advance into a losing battle" request, now generalized
+    # into a real multi-candidate strategy choice upstream.
+    board = _sea_board()
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    weak_enemy = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)
+    config = Config(ai=AiConfig(task_force_threat_radius=0))
+    gs = _game_state(board, [ship, weak_enemy], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=goal)
+
+    update_task_force_stance(gs, PLAYER_A, [force], {2: weak_enemy}, {1: True})
+
+    assert force.retreating is True
+    assert force.goal == goal  # untouched -- only the stance changed
+
+
+def test_update_task_force_stance_does_not_retreat_when_should_retreat_is_false():
+    board = _sea_board()
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    weak_enemy = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)
+    config = Config(ai=AiConfig(task_force_threat_radius=0))
+    gs = _game_state(board, [ship, weak_enemy], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=goal)
+
+    update_task_force_stance(gs, PLAYER_A, [force], {2: weak_enemy}, {1: False})
+
+    assert force.retreating is False
+
+
+def test_update_task_force_stance_ignores_missing_should_retreat_entries():
+    # A force id absent from should_retreat_by_force (e.g. it was skipped
+    # upstream because it's already retreating) must default to False, not
+    # spuriously trigger retreat on its own.
+    board = _sea_board()
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    config = Config(ai=AiConfig(task_force_threat_radius=0))
+    gs = _game_state(board, [ship], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=goal)
+
+    update_task_force_stance(gs, PLAYER_A, [force], {}, {})
+
+    assert force.retreating is False
+
+
+def test_update_task_force_stance_outnumbered_still_fires_without_should_retreat_values():
+    # should_retreat_by_force omitted entirely (defaults to None) must
+    # not suppress the existing is_outnumbered trigger.
+    board = _sea_board()
+    weak = _ship(AxialCoord(0, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    strong = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_B, 2, hp=100)
+    config = Config(ai=AiConfig(task_force_threat_radius=4, task_force_outnumbered_margin=0))
+    gs = _game_state(board, [weak, strong], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(5, 0))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=goal)
+
+    update_task_force_stance(gs, PLAYER_A, [force], {2: strong})
+
+    assert force.retreating is True
 
 
 def test_update_task_force_stance_keeps_retreating_while_still_weaker_than_the_snapshot():
@@ -1370,10 +1443,24 @@ def test_apply_defensive_port_priority_assigns_the_nearest_eligible_force_to_the
     assert force.goal == TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port)
 
 
-def test_apply_defensive_port_priority_does_not_abandon_an_active_capture_port_goal():
+def test_apply_defensive_port_priority_does_not_recall_a_capture_port_force_beyond_recall_distance():
+    port = AxialCoord(0, 0)
+    board = _port_board(port, radius=20)
+    far_ship = _ship(AxialCoord(15, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # well beyond the default recall distance
+    gs = _game_state(board, [far_ship], config=Config(fleet=FleetConfig(counts={})))
+    original_goal = TaskForceGoal(kind=GoalKind.CAPTURE_PORT, target=AxialCoord(19, 19))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=original_goal)
+    model = _believed_threat_model(gs, AxialCoord(1, 0))
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert force.goal == original_goal  # too far to get back in time -- left untouched
+
+
+def test_apply_defensive_port_priority_recalls_a_capture_port_force_within_recall_distance():
     port = AxialCoord(0, 0)
     board = _port_board(port)
-    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # within the default recall distance
     gs = _game_state(board, [ship], config=Config(fleet=FleetConfig(counts={})))
     original_goal = TaskForceGoal(kind=GoalKind.CAPTURE_PORT, target=AxialCoord(5, 5))
     force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=original_goal)
@@ -1381,7 +1468,9 @@ def test_apply_defensive_port_priority_does_not_abandon_an_active_capture_port_g
 
     apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
 
-    assert force.goal == original_goal  # left untouched -- no eligible force to redirect
+    # No free (goal-less/BLOCKADE) force exists, but this one is close
+    # enough to be worth recalling -- unlike the far-away case above.
+    assert force.goal == TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port)
 
 
 def test_apply_defensive_port_priority_skips_a_retreating_force():
@@ -1405,7 +1494,15 @@ def test_apply_defensive_port_priority_is_stable_and_does_not_thrash_between_for
     gs = _game_state(board, [defending_ship, closer_idle_ship], config=Config(fleet=FleetConfig(counts={})))
     defender = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, goal=TaskForceGoal(kind=GoalKind.DEFEND_PORT, target=port))
     idle = TaskForce(id=2, owner=PLAYER_A, member_ids={2})
-    model = _believed_threat_model(gs, AxialCoord(1, 0))
+    # A single battleship's worth of threat wouldn't outmatch these two
+    # ships combined (that's the point of the new danger accounting) --
+    # use two, strong enough that the port is still genuinely in danger,
+    # so this test actually exercises stability rather than "no longer
+    # threatened at all."
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+    model._resolve(97, ShipKind.BATTLESHIP, AxialCoord(1, 0), 12, turn=1)
+    model._resolve(98, ShipKind.BATTLESHIP, AxialCoord(1, 0), 12, turn=1)
+    model._ensure_fields_for_unseen({})
 
     apply_defensive_port_priority([defender, idle], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
 
@@ -1426,7 +1523,7 @@ def test_apply_defensive_port_priority_releases_the_goal_once_posture_leaves_def
     assert force.goal is None
 
 
-def test_apply_defensive_port_priority_releases_the_goal_once_the_threat_mass_drops_below_trigger():
+def test_apply_defensive_port_priority_releases_the_goal_once_no_longer_outmatched():
     port = AxialCoord(0, 0)
     board = _port_board(port)
     ship = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 1)
@@ -1437,6 +1534,22 @@ def test_apply_defensive_port_priority_releases_the_goal_once_the_threat_mass_dr
     apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
 
     assert force.goal is None
+
+
+def test_apply_defensive_port_priority_existing_nearby_defenders_suppress_the_trigger():
+    # The user's own example: a threat shouldn't touch anything if
+    # what's already stationed nearby can clearly handle it.
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    cruiser1 = _ship(AxialCoord(2, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    cruiser2 = _ship(AxialCoord(2, 1), ShipKind.CRUISER, PLAYER_A, 2)
+    gs = _game_state(board, [cruiser1, cruiser2], config=Config(fleet=FleetConfig(counts={})))
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})  # idle -- would otherwise be eligible
+    model = _believed_threat_model(gs, AxialCoord(1, 0))  # a single battleship
+
+    apply_defensive_port_priority([force], gs, PLAYER_A, model, Posture.DEFENSIVE, AiConfig())
+
+    assert force.goal is None  # two cruisers already comfortably beat one battleship -- nothing to do
 
 
 def test_apply_defensive_port_priority_is_a_no_op_with_no_controlled_ports_or_forces():

@@ -1,12 +1,12 @@
 import random
 
 from tla.ai.enemy_model import EnemyModel, _initial_candidate_hexes
-from tla.ai.hexfield import HexField, HexFieldGeometry
+from tla.ai.hexfield import HexField, HexFieldGeometry, _UNREACHABLE_DISTANCE
 from tla.board import Board
 from tla.config import AiConfig, Config, FleetConfig, FowConfig, ProductionConfig
 from tla.fleet_setup import _pick_start_hex
 from tla.game_state import BattleLogEntry, GameState, PortProduction
-from tla.hexgrid import AxialCoord, hexes_in_range
+from tla.hexgrid import AxialCoord, distance, hexes_in_range
 from tla.mapgen import largest_sea_component
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
@@ -403,3 +403,267 @@ def test_diffusion_spread_scales_with_movement_stat():
     far_hex = AxialCoord(6, 0)
     assert fast.mass_near(far_hex, 0) > 0
     assert slow.mass_near(far_hex, 0) == 0
+
+
+def test_distance_grid_to_matches_open_sea_hex_distance():
+    board = _sea_board()
+    geo = HexFieldGeometry.from_board(board)
+    target = AxialCoord(6, 0)
+
+    grid = geo.distance_grid_to(target)
+
+    for coord in [AxialCoord(0, 0), AxialCoord(-3, 2), AxialCoord(6, -4)]:
+        row, col = geo.to_index(coord)
+        assert grid[row, col] == distance(coord, target)
+
+
+def test_distance_grid_to_routes_around_land_wall():
+    board, _land_cells = _land_wall_board()
+    geo = HexFieldGeometry.from_board(board)
+    target = AxialCoord(6, 0)
+    origin = AxialCoord(0, 0)
+
+    grid = geo.distance_grid_to(target)
+
+    row, col = geo.to_index(origin)
+    # A solid wall sits directly between the two -- the real sea route is
+    # strictly longer than the straight-line distance the wall blocks.
+    assert grid[row, col] > distance(origin, target)
+
+
+def test_distance_grid_to_unreachable_sentinel_for_disconnected_pocket():
+    board = _sea_board()
+    pocket = AxialCoord(-9, 0)
+    # Wall the pocket off completely from the rest of the sea.
+    for n in [AxialCoord(-8, 0), AxialCoord(-8, -1), AxialCoord(-9, 1), AxialCoord(-9, -1), AxialCoord(-10, 0), AxialCoord(-10, 1)]:
+        if n in board.tiles:
+            board.tiles[n] = Tile(coord=n, terrain=TerrainType.LAND)
+    geo = HexFieldGeometry.from_board(board)
+
+    grid = geo.distance_grid_to(AxialCoord(6, 0))
+
+    row, col = geo.to_index(pocket)
+    assert geo.sea_mask[row, col]  # still a legal sea hex, just cut off
+    assert grid[row, col] == _UNREACHABLE_DISTANCE
+
+
+def test_diffuse_step_with_bias_leans_toward_target():
+    board = _sea_board()
+    geo = HexFieldGeometry.from_board(board)
+    target = AxialCoord(6, 0)
+    grid = geo.distance_grid_to(target)
+
+    biased = HexField(geo)
+    biased.set_point_mass(AxialCoord(0, 0))
+    unbiased = HexField(geo)
+    unbiased.set_point_mass(AxialCoord(0, 0))
+
+    for _ in range(6):
+        biased.diffuse_step(bias_distance_grid=grid)
+        unbiased.diffuse_step()
+
+    assert biased.mass_near(target, 0) > unbiased.mass_near(target, 0)
+
+
+def test_diffuse_step_with_bias_conserves_mass_around_land_wall():
+    board, land_cells = _land_wall_board()
+    geo = HexFieldGeometry.from_board(board)
+    grid = geo.distance_grid_to(AxialCoord(6, 0))
+    field = HexField(geo)
+    field.set_point_mass(AxialCoord(0, 0))
+
+    for _ in range(15):
+        field.diffuse_step(bias_distance_grid=grid)
+        assert abs(field.total_mass() - 1.0) < 1e-9
+
+    occupied = field.as_dict()
+    assert not (set(occupied) & land_cells)
+
+
+def test_diffuse_step_with_bias_falls_back_to_isotropic_when_unreachable():
+    board = _sea_board()
+    geo = HexFieldGeometry.from_board(board)
+    # An all-unreachable grid (target out of bounds) means no cell ever has
+    # a "progress" neighbor -- every step must fall back to today's plain
+    # isotropic split, matching an unbiased run exactly.
+    unreachable_grid = geo.distance_grid_to(AxialCoord(9999, 9999))
+
+    biased = HexField(geo)
+    biased.set_point_mass(AxialCoord(0, 0))
+    unbiased = HexField(geo)
+    unbiased.set_point_mass(AxialCoord(0, 0))
+
+    for _ in range(4):
+        biased.diffuse_step(bias_distance_grid=unreachable_grid)
+        unbiased.diffuse_step()
+
+    assert (biased.values == unbiased.values).all()
+
+
+# -- expected_strength_near --------------------------------------------------
+
+
+def test_expected_strength_near_includes_a_resolved_ship_within_radius():
+    board = _sea_board()
+    config = Config(fleet=FleetConfig(counts={}))
+    gs = _game_state(board, [], config=config)
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    model._resolve(7, ShipKind.BATTLESHIP, AxialCoord(1, 0), 9, turn=1)
+    model._ensure_fields_for_unseen({})  # currently unseen -- point mass at (1, 0)
+
+    stats = Config().ship_stats.stats[ShipKind.BATTLESHIP]
+    hp, damage = model.expected_strength_near(AxialCoord(0, 0), radius=4)
+
+    assert hp == 9  # last-known hp, not full stats hp
+    assert damage == stats.damage
+
+
+def test_expected_strength_near_scales_a_kind_pool_by_its_expected_count():
+    board = _sea_board()
+    config = Config(fleet=FleetConfig(counts={ShipKind.CRUISER: 4}))
+    gs = _game_state(board, [], config=config)
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    pool = model._pool_for(ShipKind.CRUISER)
+    pool.count = 4
+    pool.field.set_point_mass(AxialCoord(0, 0))
+    pool.field.renormalize_to(4)  # 4 expected ships, all at (0, 0)
+
+    stats = Config().ship_stats.stats[ShipKind.CRUISER]
+    hp, damage = model.expected_strength_near(AxialCoord(0, 0), radius=0)
+
+    assert hp == 4 * stats.hp
+    assert damage == 4 * stats.damage
+
+
+def test_expected_strength_near_respects_the_kinds_filter():
+    board = _sea_board()
+    config = Config(fleet=FleetConfig(counts={}))
+    gs = _game_state(board, [], config=config)
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    model._resolve(7, ShipKind.PATROL_BOAT, AxialCoord(0, 0), 2, turn=1)
+    model._ensure_fields_for_unseen({})
+
+    hp, damage = model.expected_strength_near(
+        AxialCoord(0, 0), radius=4, kinds=frozenset({ShipKind.BATTLESHIP, ShipKind.CRUISER})
+    )
+
+    assert (hp, damage) == (0, 0)  # patrol boat filtered out
+
+
+def test_expected_strength_near_is_zero_far_from_everything():
+    board = _sea_board()
+    config = Config(fleet=FleetConfig(counts={}))
+    gs = _game_state(board, [], config=config)
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    model._resolve(7, ShipKind.BATTLESHIP, AxialCoord(9, 0), 12, turn=1)
+    model._ensure_fields_for_unseen({})
+
+    assert model.expected_strength_near(AxialCoord(0, 0), radius=1) == (0, 0)
+
+
+# -- directional diffusion toward a threatened own port ----------------------
+
+
+def _two_port_board() -> Board:
+    board = _sea_board(radius=30)
+    board.tiles[_PORT_NEAR] = Tile(
+        coord=_PORT_NEAR, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A, port_controller=PLAYER_A
+    )
+    board.tiles[_PORT_FAR] = Tile(
+        coord=_PORT_FAR, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A, port_controller=PLAYER_A
+    )
+    return board
+
+
+_PORT_NEAR = AxialCoord(-20, 0)
+_PORT_FAR = AxialCoord(20, 0)
+
+
+def _model_with_threat_and_test_pool(ai_config: AiConfig) -> tuple[EnemyModel, GameState]:
+    """A model belonging to PLAYER_A (reasoning about PLAYER_B) with two of
+    PLAYER_A's own controlled ports -- _PORT_NEAR already showing believed
+    PLAYER_B mass nearby (seeded directly, standing in for e.g. a real
+    sighting or a diffused-in production ship), _PORT_FAR with none -- plus
+    a fresh, never-sighted PATROL_BOAT pool seeded at the origin, exactly
+    equidistant (20 hexes) from both ports, so any lean after diffusion is
+    attributable only to the threat-mass bias, not starting proximity."""
+    board = _two_port_board()
+    config = Config(fow=FowConfig(enabled=True), fleet=FleetConfig(counts={}), ai=ai_config)
+    gs = GameState(config=config, board=board, ships={})
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    threat_pool = model._pool_for(ShipKind.CRUISER)
+    threat_pool.count = 3
+    threat_pool.field.set_point_mass(AxialCoord(-19, 0), 3.0)
+
+    test_pool = model._pool_for(ShipKind.PATROL_BOAT)
+    test_pool.count = 1
+    test_pool.field.set_point_mass(AxialCoord(0, 0), 1.0)
+
+    return model, gs
+
+
+def test_kind_pool_diffusion_leans_toward_most_threatened_own_port():
+    model, gs = _model_with_threat_and_test_pool(AiConfig(enemy_model_directional_diffusion=True))
+    assert model._most_threatened_own_port(gs) == _PORT_NEAR
+
+    gs.turn_number = 2
+    model._diffuse_all(gs)
+
+    test_pool = model.kind_pools()[ShipKind.PATROL_BOAT]
+    assert abs(test_pool.field.total_mass() - 1.0) < 1e-9
+    # A straight, unobstructed line toward _PORT_NEAR has exactly one
+    # "progress" direction at every step, so with no stay share retained
+    # (see HexField.diffuse_step's bias_distance_grid docstring) the whole
+    # mass lands on one exact hex after 6 (patrol boat's movement) steps --
+    # a strong, precise signal that the bias is real, not just a vague lean.
+    assert test_pool.field.mass_near(AxialCoord(-6, 0), 0) == 1.0
+    assert test_pool.field.mass_near(_PORT_FAR, 20) == 0.0  # nothing drifted the other way
+
+
+def test_directional_diffusion_disabled_matches_prior_isotropic_behavior():
+    model, gs = _model_with_threat_and_test_pool(AiConfig(enemy_model_directional_diffusion=False))
+
+    gs.turn_number = 2
+    model._diffuse_all(gs)
+
+    test_pool = model.kind_pools()[ShipKind.PATROL_BOAT]
+    # A parallel, hand-run isotropic HexField (today's exact prior
+    # behavior) started from the same point mass, same number of steps.
+    reference = HexField(model._geometry)
+    reference.set_point_mass(AxialCoord(0, 0))
+    for _ in range(6):
+        reference.diffuse_step()
+
+    assert (test_pool.field.values == reference.values).all()
+
+
+def test_directional_diffusion_only_affects_pools_not_tracked_ships():
+    model, gs = _model_with_threat_and_test_pool(AiConfig(enemy_model_directional_diffusion=True))
+    model._resolve(99, ShipKind.PATROL_BOAT, AxialCoord(0, 0), 2, turn=1)
+    model._ensure_fields_for_unseen({})  # now out of sight -- gets a diffusing field
+
+    gs.turn_number = 2
+    model._diffuse_all(gs)
+
+    tracked = model.tracked_ships()[99]
+    # The pool (never individually sighted) concentrates on the biased
+    # target exactly as in the test above; the tracked ship -- resolved,
+    # so its intent is deliberately not assumed -- stays spread across
+    # several hexes the plain isotropic walk would reach instead of
+    # collapsing onto one.
+    assert len(tracked.field.as_dict()) > 1
+    assert tracked.field.mass_near(AxialCoord(-6, 0), 0) < tracked.field.total_mass()
+
+
+def test_most_threatened_own_port_none_with_no_controlled_ports():
+    board = _sea_board()
+    config = Config(fow=FowConfig(enabled=True), fleet=FleetConfig(counts={}))
+    gs = GameState(config=config, board=board, ships={})
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    assert model._most_threatened_own_port(gs) is None
