@@ -32,6 +32,10 @@ class Tile:
     # occupied by anyone) means "same as port_owner" -- see
     # tla.tile.Tile.port_display_owner.
     port_controller: PlayerId | None = None
+    # Cosmetic only -- assigned once at map generation (see
+    # tla.mapgen._place_ports), shown in the hover tooltip
+    # (tla.rendering.game_view). None for a non-port tile.
+    port_name: str | None = None
 
     @property
     def port_display_owner(self) -> PlayerId | None:

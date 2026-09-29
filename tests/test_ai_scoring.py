@@ -7,6 +7,7 @@ from tla.ai.scoring import (
     nearest_enemy,
     nearest_uncontrolled_port,
     reachable_attack_candidates,
+    worth_a_tie,
 )
 from tla.board import Board
 from tla.config import Config, ShipStatsConfig
@@ -193,6 +194,38 @@ def test_matchup_score_carrier_bonus_does_not_apply_against_a_submerged_submarin
     score_with_carrier = matchup_score(gs_with_carrier.ships[1], gs_with_carrier.ships[2], gs_with_carrier)
 
     assert score_with_carrier == score_no_carrier
+
+
+# -- worth_a_tie -------------------------------------------------------
+
+
+def test_worth_a_tie_when_trading_up_in_value():
+    board = _sea_board()
+    cruiser = _ship(AxialCoord(0, 0), ShipKind.CRUISER, PLAYER_A, 1)  # cost 7
+    carrier = _ship(AxialCoord(1, 0), ShipKind.CARRIER, PLAYER_B, 2)  # cost 10
+    gs = _game_state(board, [cruiser, carrier])
+
+    assert worth_a_tie(cruiser, carrier, gs) is True
+
+
+def test_not_worth_a_tie_when_trading_down_in_value():
+    board = _sea_board()
+    destroyer = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)  # cost 4
+    patrol_boat = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)  # cost 1
+    gs = _game_state(board, [destroyer, patrol_boat])
+
+    assert worth_a_tie(destroyer, patrol_boat, gs) is False
+
+
+def test_not_worth_a_tie_at_equal_value():
+    # An even-cost mirror matchup is a neutral trade, not a worthwhile
+    # one -- needs the target to cost strictly more.
+    board = _sea_board()
+    a = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    b = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+    gs = _game_state(board, [a, b])
+
+    assert worth_a_tie(a, b, gs) is False
 
 
 def test_nearest_enemy_picks_the_closest_and_breaks_ties_by_id():

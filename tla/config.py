@@ -161,9 +161,6 @@ class AiConfig:
     """Tuning knobs for tla.ai.NaivePolicy -- see that module for how each
     is used."""
 
-    # Retreat from an otherwise-winning battle once the attacker's own HP
-    # fraction drops below this, to avoid a follow-up ambush.
-    damaged_withdraw_fraction: float = 0.34
     # A carrier retreats toward its escorts once a visible enemy battleship,
     # cruiser, or submarine -- the kinds that can actually hurt a carrier in
     # a fight, per tla.ai.policy._DANGEROUS_TO_CARRIER_KINDS -- could reach
@@ -243,6 +240,69 @@ class AiConfig:
     # since the safety here comes from verifying each hop's real vision,
     # not from staying artificially close to the last known-clear hex.
     carrier_scout_retreat_reserve: int = 1
+    # tla.ai.policy._carrier_formation_destination: master switch for a
+    # carrier's task-force-goal advance to actively seek a position that
+    # maximizes how many of its force's projected AC-bonus-eligible
+    # escorts (battleship/cruiser/destroyer) end this turn within
+    # CombatConfig.ac_bonus_radius of it, instead of simply advancing
+    # straight toward the goal (_carrier_cautious_step_toward, the prior
+    # and still-default behavior). Among positions tied on coverage,
+    # prefers one no DANGEROUS_TO_CARRIER_KINDS enemy could reach next
+    # turn -- credited even against a screen that will only exist once
+    # escorts finish their own move this turn -- falling back to the
+    # least-exposed coverage-tied position rather than refusing to move.
+    # Remaining ties favor whichever position best matches the force's
+    # Strategy this turn.
+    #
+    # Born from a replay review (game62): the human attacker's carriers
+    # had 2-3 of 3 in ac_bonus_radius of each fight, the AI defender's
+    # only 1-2 of 3 (one entirely uninvolved) -- reworking the same
+    # battle with the AI's carriers hypothetically repositioned for
+    # coverage turned a 3-ships-lost-for-1 rout into a roughly even
+    # trade.
+    #
+    # Default False, pending the same kind of self-play validation
+    # carrier_scouting_enabled required -- in particular a bare
+    # AiConfig() (no task_force_max_separation set) self-play check, not
+    # just a configs/dev.json-flavored one: that flag alone looked
+    # stall-free and clearly beneficial under dev.json's separation cap
+    # but stalled a real seed without one, since an unconstrained carrier
+    # had nothing reining it back to its own force. This flag changes
+    # carrier positioning in a similarly unconstrained way and needs the
+    # identical check before any default or configs/dev.json flip.
+    carrier_formation_optimization_enabled: bool = False
+    # tla.ai.policy._carrier_screen_destination: master switch for a
+    # standing screen between each of a force's carriers and any nearby
+    # enemy of the matching weight class -- an own battleship/cruiser
+    # screens an enemy battleship/cruiser within carrier_heavy_screen_
+    # radius, an own destroyer/submarine screens an enemy (surfaced)
+    # destroyer/submarine within carrier_light_screen_radius -- rather
+    # than leaving escort positioning to whatever a reactive pass (port/
+    # carrier defense) happens to produce.
+    #
+    # Born from a replay review (game65): compute_carrier_defense_
+    # directives swept nearly the AI's whole fleet into ad hoc "close the
+    # distance on the threat" duty the instant one enemy battleship came
+    # within range of a carrier -- each ship moving independently, no
+    # coordination -- which is how a destroyer ended up exposed in front
+    # while two battleships ended up too far away to matter, and all
+    # three of the AI's carriers (moving last, since nearly everyone else
+    # had already been claimed) got caught with zero real screen and lost
+    # two of three in one turn. User's own doctrine, from direct
+    # playtesting.
+    #
+    # Default False, pending the same self-play validation every prior
+    # carrier-positioning flag this session has required -- in particular
+    # a bare AiConfig() check, not just a configs/dev.json-flavored one.
+    carrier_screen_enabled: bool = False
+    # Radius (plain hex distance from the carrier) within which a visible
+    # enemy battleship or cruiser counts as needing a heavy screen -- see
+    # carrier_screen_enabled.
+    carrier_heavy_screen_radius: int = 4
+    # Radius (plain hex distance from the carrier) within which a visible,
+    # surfaced enemy destroyer or submarine counts as needing a light
+    # screen -- see carrier_screen_enabled.
+    carrier_light_screen_radius: int = 3
     # Seconds paced between each AI ship's move, so a human opponent can
     # watch an AI turn unfold instead of it resolving instantly.
     turn_pacing_seconds: float = 0.4
@@ -419,6 +479,41 @@ class AiConfig:
     # "counterattack as long as we're at least as strong as the threat,"
     # not strictly stronger.
     carrier_defense_margin: int = 0
+    # Consecutive turns a single ship can be assigned a port/carrier-
+    # defense counterattack directive without actually landing an attack
+    # (tla.ai.policy._port_defense_destination/_carrier_defense_
+    # destination's own favorable/tie-tolerant checks both declining,
+    # every turn, leaving only the close-the-distance fallback) before it
+    # gives up on this defense response and reverts to ordinary movement
+    # for a turn -- letting the group's *other* responders continue
+    # unaffected (this is one ship's own giving-up, not the group's
+    # counterattack-vs-block decision, which tla.ai.task_force.
+    # compute_port_defense_directives/compute_carrier_defense_directives
+    # still make once, fresh, every turn).
+    #
+    # Fixes a real bug found via replay review: a losing counterattacker
+    # used to be walked straight onto the threat's own hex regardless of
+    # its own matchup (see _step_toward's `avoid` fix in the same two
+    # functions) -- an unconditional, if self-destructive, attack. Once
+    # that was fixed to correctly decline the fight instead, self-play
+    # showed the *new* failure mode this guards against: nothing told the
+    # ship to stop perpetually shadowing a threat it will never be able
+    # to beat, so it could camp there indefinitely -- unlike a task
+    # force's own goal, which already has exactly this kind of stall
+    # detection (task_force_stall_turns). Smaller than task_force_stall_
+    # turns (8) since camping next to a live danger is worse than
+    # stalling on a goal far from one; giving up quickly just hands the
+    # ship back to its task force's own (already-tested) stall handling.
+    #
+    # Counted per ship, not per directive/threat -- see NaivePolicy's own
+    # tracking: the count resets to 0 the instant the ship lands a real
+    # attack, and is dropped entirely (not just reset) the first turn the
+    # ship isn't a counterattack candidate at all, so an old count can
+    # never quietly carry over and pre-exclude a ship from a later,
+    # unrelated threat. A block-role responder (a deliberate, expected-
+    # loss sacrifice, not a repeatedly-declined fight) is never tracked
+    # here at all.
+    defense_stall_turns: int = 3
     # tla.ai.enemy_model.EnemyModel: a tracked enemy ship unseen for more
     # than this many turns is folded back into its kind's pool (its
     # individual position belief merged into the shared per-kind field,
@@ -514,12 +609,10 @@ class AiConfig:
     # tla.ai.task_force.update_task_force_stance's third retreat trigger:
     # tla.ai.policy._project_engagement_value's score must be at least
     # this before a force commits to its normal advance this turn --
-    # below it, retreat instead. Same "how much tolerance before
-    # bailing" shape as damaged_withdraw_fraction (0.34); negative means
-    # some net loss is still tolerated (this is about avoiding a clearly
-    # bad trade, not requiring a guaranteed win) -- a starting point for
-    # self-play tuning like every other threshold introduced this
-    # session.
+    # below it, retreat instead. Negative means some net loss is still
+    # tolerated (this is about avoiding a clearly bad trade, not
+    # requiring a guaranteed win) -- a starting point for self-play
+    # tuning like every other threshold introduced this session.
     min_engagement_value: float = -0.25
     # tla.ai.policy._project_engagement_value: whether a force's at-risk
     # assessment also treats a believed-but-never-sighted enemy

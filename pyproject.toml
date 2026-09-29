@@ -22,3 +22,19 @@ hdf5 = [
 
 [tool.setuptools.packages.find]
 include = ["tla*"]
+
+[tool.pytest.ini_options]
+# A handful of tests (@pytest.mark.slow) dominate the suite's wall-clock
+# time: the two full self-play games in test_ai_selfplay.py (real AI-vs-AI
+# games out to thousands of turns each) and two large-map generation
+# sweeps in test_mapgen.py (several seeds at map sizes big enough to need
+# a raised max_generation_attempts) -- together ~15-20 min, vs. seconds
+# for the other 600+ tests. Run `pytest` day to day for fast feedback on
+# every change, and `pytest -m slow` (or `pytest -m ""` for literally
+# everything) before considering a change to AI behavior or map
+# generation actually done -- same rigor this project has always required
+# for those, just no longer paid on every unrelated edit too.
+addopts = "-m 'not slow'"
+markers = [
+    "slow: full self-play games / large map-generation sweeps -- run explicitly (`pytest -m slow`), not on every edit",
+]

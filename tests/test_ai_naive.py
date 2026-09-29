@@ -1,6 +1,7 @@
 from dataclasses import replace
 
 from tla import movement
+from tla.ai import scoring
 from tla.ai.enemy_model import EnemyModel
 from tla.ai.policy import (
     NaivePolicy,
@@ -8,7 +9,10 @@ from tla.ai.policy import (
     _carrier_bonus_cohesion_destination,
     _carrier_cautious_max_steps,
     _carrier_dangerous_threat_hexes,
+    _carrier_formation_destination,
     _carrier_reaching_threat,
+    _carrier_defense_destination,
+    _carrier_screen_destination,
     _carrier_scouting_advance,
     _carrier_scouting_eligible,
     _choose_carrier_destination,
@@ -19,6 +23,7 @@ from tla.ai.policy import (
     _make_way_for_scout,
     _maybe_toggle_submarine,
     _pick_strategy_for_force,
+    _port_defense_destination,
     _project_engagement_value,
     _rearguard_target,
     _reevaluate_strategy_on_new_sightings,
@@ -29,7 +34,9 @@ from tla.ai.policy import (
 )
 from tla.ai.global_strategy import Posture
 from tla.ai.task_force import (
+    CarrierDefenseDirective,
     GoalKind,
+    PortDefenseDirective,
     TaskForce,
     TaskForceGoal,
     compute_carrier_defense_directives,
@@ -42,6 +49,7 @@ from tla.game_state import GameState
 from tla.hexgrid import AxialCoord, distance, hexes_in_range, neighbors
 from tla.ship import Ship, ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
+from tla.turn_manager import start_movement_phase
 
 
 def _sea_board(radius: int = 8) -> Board:
@@ -144,22 +152,68 @@ def test_ai_attacks_a_clearly_favorable_target():
     assert 2 not in gs.ships  # the patrol boat was sunk
 
 
-def test_ai_retreats_mid_battle_once_badly_damaged():
-    # Two destroyers, attacker at full HP vs an already-damaged defender --
-    # a clearly favorable race (matchup_score > 0), so the attack actually
-    # starts. A near-90% damaged-withdraw threshold then pulls the attacker
-    # out after the very first round purely because of its own HP loss,
-    # independent of the race still looking favorable.
+def test_ai_presses_a_winning_fight_to_the_kill_despite_ending_very_low():
+    # Battleship (dmg4, max hp12) starting at hp7 vs a full-hp cruiser
+    # (dmg3, hp8) -- a clearly favorable race (matchup_score == +1: the
+    # attacker outlasts the defender by exactly one round), but round 1
+    # alone (4 dmg dealt, 3 taken) already drops the attacker to 4/12 --
+    # under the old, removed damaged_withdraw_fraction (0.34) floor this
+    # would have retreated right there with the defender still alive.
+    # decide_battle no longer has that floor: it presses on and secures
+    # the kill, ending at 1 HP.
     board = _sea_board()
-    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(damaged_withdraw_fraction=0.9))
-    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
-    defender = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 2, hp=4)
-    gs = _game_state(board, [attacker, defender], config=config)
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1, hp=7)
+    defender = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_B, 2)
+    gs = _game_state(board, [attacker, defender], config=Config(fow=FowConfig(enabled=False)))
 
     _run(NaivePolicy(), gs, PLAYER_A)
 
-    assert 1 in gs.ships
-    assert gs.ships[1].position == AxialCoord(0, 0)  # retreated to its approach hex
+    assert 2 not in gs.ships  # the cruiser was sunk
+    assert 1 in gs.ships and gs.ships[1].current_hp == 1  # attacker survived, badly hurt
+
+
+def test_decide_battle_stays_in_a_winning_fight_despite_low_hp():
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1, hp=2)  # 17% of max -- very low
+    defender = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2, hp=2)
+    board = _sea_board()
+    gs = _game_state(board, [attacker, defender], config=Config(fow=FowConfig(enabled=False)))
+    assert scoring.matchup_score(attacker, defender, gs) > 0  # confirm this really is a clean win
+
+    assert NaivePolicy().decide_battle(attacker, defender, gs) == "stay"
+
+
+def test_decide_battle_retreats_once_the_race_turns_unfavorable():
+    attacker = _ship(AxialCoord(0, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    defender = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_B, 2)
+    board = _sea_board()
+    gs = _game_state(board, [attacker, defender], config=Config(fow=FowConfig(enabled=False)))
+
+    assert NaivePolicy().decide_battle(attacker, defender, gs) == "retreat"
+
+
+def test_decide_battle_retreats_on_a_non_worthwhile_tie():
+    # Destroyer (cost 4) vs patrol boat (cost 1) at HP levels that make it
+    # an exact race tie -- trading a cost-4 destroyer for a cost-1 patrol
+    # boat isn't worth it even at even odds.
+    attacker = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1, hp=2)
+    defender = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2, hp=4)
+    board = _sea_board()
+    gs = _game_state(board, [attacker, defender], config=Config(fow=FowConfig(enabled=False)))
+    assert scoring.matchup_score(attacker, defender, gs) == 0  # confirm this really is a tie
+
+    assert NaivePolicy().decide_battle(attacker, defender, gs) == "retreat"
+
+
+def test_decide_battle_stays_on_a_worthwhile_tie():
+    # Cruiser (cost 7) vs battleship (cost 10) at HP levels that make it an
+    # exact tie -- worth taking even at 1-for-1.
+    attacker = _ship(AxialCoord(0, 0), ShipKind.CRUISER, PLAYER_A, 1, hp=4)
+    defender = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_B, 2, hp=3)
+    board = _sea_board()
+    gs = _game_state(board, [attacker, defender], config=Config(fow=FowConfig(enabled=False)))
+    assert scoring.matchup_score(attacker, defender, gs) == 0  # confirm this really is a tie
+
+    assert NaivePolicy().decide_battle(attacker, defender, gs) == "stay"
 
 
 def test_ai_respects_fog_of_war_and_ignores_a_ship_it_cannot_see():
@@ -332,6 +386,62 @@ def test_task_force_declines_a_favorable_target_backed_by_a_bigger_force():
     destination = choose_task_force_destination(destroyer, goal, gs, {2: bait, 3: backup}, force)
 
     assert destination != bait.position
+
+
+def test_task_force_ignores_a_distant_force_mate_when_judging_backup():
+    # Real bug (game64 turn 5): attacker_group used to be the ship's whole
+    # task force by membership alone, regardless of distance -- so a
+    # teammate racing to catch up from far away (see task_force_max_
+    # separation's own straggler doctrine) counted its full strength as
+    # "available support" for a fight breaking out right now elsewhere.
+    # Same shape as the test above (an easy-looking 1v1 with real backup),
+    # but the force now has a second, distant member strong enough to flip
+    # group_power's own verdict from outmatched to not-outmatched if
+    # wrongly included -- confirmed by construction: destroyer alone is
+    # (6, 2) vs backup+bait's (102, 5) -- outmatched; destroyer plus this
+    # teammate is (106, 6) -- not outmatched. The attack must still be
+    # declined: the teammate is 10 hexes away, well past task_force_
+    # threat_radius (4), so it isn't real backup for this fight.
+    board = _sea_board()
+    destroyer = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    bait = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)
+    backup = _ship(AxialCoord(2, 0), ShipKind.BATTLESHIP, PLAYER_B, 3, hp=100)
+    distant_teammate = _ship(AxialCoord(10, 0), ShipKind.BATTLESHIP, PLAYER_A, 4, hp=100)
+    port = AxialCoord(6, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    config = Config(
+        fow=FowConfig(enabled=False), ai=AiConfig(task_force_threat_radius=4, task_force_outnumbered_margin=0)
+    )
+    gs = _game_state(board, [destroyer, bait, backup, distant_teammate], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 4})
+    goal = TaskForceGoal(kind=GoalKind.CAPTURE_PORT, target=port)
+
+    destination = choose_task_force_destination(destroyer, goal, gs, {2: bait, 3: backup}, force)
+
+    assert destination != bait.position
+
+
+def test_task_force_counts_a_force_mate_once_it_is_actually_close_enough():
+    # Same setup as above, but the teammate is now within task_force_
+    # threat_radius (4) of the fight -- real, timely backup, not a
+    # straggler. It should be counted, tipping the fight back to "safe."
+    board = _sea_board()
+    destroyer = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
+    bait = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)
+    backup = _ship(AxialCoord(2, 0), ShipKind.BATTLESHIP, PLAYER_B, 3, hp=100)
+    close_teammate = _ship(AxialCoord(1, 3), ShipKind.BATTLESHIP, PLAYER_A, 4, hp=100)  # 3 hexes from bait
+    port = AxialCoord(6, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    config = Config(
+        fow=FowConfig(enabled=False), ai=AiConfig(task_force_threat_radius=4, task_force_outnumbered_margin=0)
+    )
+    gs = _game_state(board, [destroyer, bait, backup, close_teammate], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 4})
+    goal = TaskForceGoal(kind=GoalKind.CAPTURE_PORT, target=port)
+
+    destination = choose_task_force_destination(destroyer, goal, gs, {2: bait, 3: backup}, force)
+
+    assert destination == bait.position
 
 
 def test_task_force_still_attacks_a_favorable_target_with_no_backup():
@@ -768,6 +878,78 @@ def test_cohesion_destination_excludes_enemy_occupied_hexes():
     assert _cohesion_destination(ship, force, gs, port, enemy_hexes) is None
 
 
+def test_cohesion_destination_a_fresh_straggler_does_not_anchor_the_established_group_back():
+    # The user's own reported doctrine, and a real replay-observed problem
+    # (game63 turn 3): a freshly produced ship recruited into an already-
+    # advanced force used to count as a full anchor from the moment it
+    # joined, symmetrically pulling the *whole* advanced formation back
+    # toward it -- even though it had only just spawned at a home port far
+    # behind. Two established members already within range of each other
+    # (a real "task force"); a third, brand-new member sits far away, at
+    # roughly the force's own home port. The established pair should not
+    # be pulled toward it.
+    board = _sea_board(radius=12)
+    port = AxialCoord(10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    vanguard = _ship(AxialCoord(6, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    escort = _ship(AxialCoord(4, 0), ShipKind.DESTROYER, PLAYER_A, 2)  # 2 hexes from vanguard -- established pair
+    fresh_recruit = _ship(AxialCoord(-10, 0), ShipKind.BATTLESHIP, PLAYER_A, 3)  # just spawned, far behind
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(task_force_max_separation=4))
+    gs = _game_state(board, [vanguard, escort, fresh_recruit], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2, 3})
+
+    # Neither established member should be pulled toward the straggler --
+    # None (no correction needed) since each is already within range of
+    # its one established peer.
+    assert _cohesion_destination(vanguard, force, gs, port, frozenset()) is None
+    assert _cohesion_destination(escort, force, gs, port, frozenset()) is None
+
+
+def test_cohesion_destination_a_fresh_straggler_still_steams_to_catch_up():
+    # Same scenario as above, from the straggler's own side: it should
+    # still be pulled toward the established pair (matching the user's
+    # "steams at max speed to join the TF" half of the doctrine) -- only
+    # the reverse direction (established anchoring back onto it) is what
+    # changed.
+    board = _sea_board(radius=12)
+    port = AxialCoord(10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    vanguard = _ship(AxialCoord(6, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    escort = _ship(AxialCoord(4, 0), ShipKind.DESTROYER, PLAYER_A, 2)
+    fresh_recruit = _ship(AxialCoord(-10, 0), ShipKind.BATTLESHIP, PLAYER_A, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(task_force_max_separation=4))
+    gs = _game_state(board, [vanguard, escort, fresh_recruit], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2, 3})
+
+    destination = _cohesion_destination(fresh_recruit, force, gs, port, frozenset())
+
+    assert destination is not None
+    assert distance(destination, fresh_recruit.position) > 0  # actually moved toward the pair
+
+
+def test_cohesion_destination_a_recruit_becomes_a_full_anchor_once_it_catches_up():
+    # Once the straggler has actually closed to within task_force_max_
+    # separation of the established group, it's no longer a special case
+    # -- it becomes a normal anchor like anyone else, same as before this
+    # fix for a force where everyone's already close together.
+    board = _sea_board(radius=12)
+    port = AxialCoord(10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    vanguard = _ship(AxialCoord(6, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    escort = _ship(AxialCoord(4, 0), ShipKind.DESTROYER, PLAYER_A, 2)
+    caught_up_recruit = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_A, 3)  # within 4 of escort now
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(task_force_max_separation=4))
+    gs = _game_state(board, [vanguard, escort, caught_up_recruit], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2, 3})
+
+    # vanguard (6,0) is 5 hexes from caught_up_recruit (1,0) -- now over
+    # the cap against its newly-established peer, so it should correct.
+    destination = _cohesion_destination(vanguard, force, gs, port, frozenset())
+
+    assert destination is not None
+    assert distance(destination, caught_up_recruit.position) <= 4
+
+
 def test_task_force_destination_prefers_cohesion_over_the_goal():
     board = _sea_board(radius=12)
     port = AxialCoord(10, 0)
@@ -872,6 +1054,232 @@ def test_carrier_advance_toward_a_goal_holds_back_the_reserve():
     # without the reserve this would reach the carrier's own full 4.
     assert destination is not None
     assert distance(AxialCoord(0, 0), destination) == 2
+
+
+# -- carrier formation optimization (see _carrier_formation_destination) -----
+# FowConfig(enabled=True) throughout, matching carrier scouting below --
+# escort reachability/screening genuinely depends on real vision.
+
+
+def test_carrier_formation_prefers_more_covered_hex_over_fewer():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    # Both already "resolved" (real, fixed positions) -- a hex near (1, 0)
+    # is within ac_bonus_radius (2) of both; hexes elsewhere reach at most one.
+    bb1 = _ship(AxialCoord(2, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    bb2 = _ship(AxialCoord(2, -1), ShipKind.BATTLESHIP, PLAYER_A, 3)
+    gs = _game_state(board, [carrier, bb1, bb2], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2, 3}, goal=goal)
+    resolved = frozenset({2, 3})
+    cautious_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+
+    dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {}, goal, resolved, 4, Strategy.ADVANCE, cautious_steps, frozenset(), frozenset()
+    )
+
+    radius = gs.config.combat.ac_bonus_radius
+    assert dest is not None
+    assert distance(dest, bb1.position) <= radius
+    assert distance(dest, bb2.position) <= radius
+
+
+def test_carrier_formation_uses_escorts_honestly_projected_positions():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    # Not resolved -- its own ordinary goal-directed dry run moves it from
+    # its current position (west of the carrier) toward the goal (east),
+    # landing on the *opposite* side of the carrier from where it started.
+    bb1 = _ship(AxialCoord(-3, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    gs = _game_state(board, [carrier, bb1], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+    cautious_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+
+    projected = choose_task_force_destination(bb1, goal, gs, {}, force, max_steps=4, strategy=Strategy.ADVANCE)
+    dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {}, goal, frozenset(), 4, Strategy.ADVANCE, cautious_steps, frozenset(), frozenset()
+    )
+
+    radius = gs.config.combat.ac_bonus_radius
+    assert dest is not None
+    assert distance(dest, projected) <= radius  # covers where the escort WILL be
+    assert distance(dest, bb1.position) > radius  # not where it currently sits
+
+
+def test_carrier_formation_already_resolved_escort_uses_its_real_position():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    bb1 = _ship(AxialCoord(-3, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    gs = _game_state(board, [carrier, bb1], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+    cautious_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+
+    # Marked resolved -- already moved for real this turn (e.g. via an
+    # earlier pass). Its own ordinary dry run would send it east, but that
+    # move will never actually happen -- coverage must be scored against
+    # its real, current (unresolved-dry-run-ignoring) position instead.
+    dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {}, goal, frozenset({2}), 4, Strategy.ADVANCE, cautious_steps, frozenset(), frozenset()
+    )
+
+    radius = gs.config.combat.ac_bonus_radius
+    assert dest is not None
+    assert distance(dest, bb1.position) <= radius
+
+
+def test_carrier_formation_prefers_screened_hex_over_equally_covered_exposed_hex():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    bb1 = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    # A cruiser (DANGEROUS_TO_CARRIER_KINDS) that can reach (1, -1) and
+    # (0, -1) -- both coverage-tied candidates of bb1 -- but not (-1, 0),
+    # an equally coverage-tied candidate on the far side.
+    enemy = _ship(AxialCoord(4, -4), ShipKind.CRUISER, PLAYER_B, 3)
+    gs = _game_state(board, [carrier, bb1, enemy], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+    cautious_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+
+    dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {3: enemy}, goal, frozenset({2}), 4, Strategy.ADVANCE, cautious_steps,
+        frozenset(), frozenset(),
+    )
+
+    assert dest == AxialCoord(-1, 0)
+
+
+def test_carrier_formation_falls_back_gracefully_when_nothing_is_screened():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    bb1 = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    # Close enough to reach every coverage-tied candidate around bb1 --
+    # nothing this turn is actually screened.
+    enemy = _ship(AxialCoord(-2, -2), ShipKind.CRUISER, PLAYER_B, 3)
+    gs = _game_state(board, [carrier, bb1, enemy], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+    cautious_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+
+    dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {3: enemy}, goal, frozenset({2}), 4, Strategy.ADVANCE, cautious_steps,
+        frozenset(), frozenset(),
+    )
+
+    # Never strands the ship -- still returns a real, coverage-maximizing
+    # candidate rather than None or a coverage-losing retreat in place.
+    radius = gs.config.combat.ac_bonus_radius
+    assert dest is not None
+    assert distance(dest, bb1.position) <= radius
+
+
+def test_carrier_formation_strategy_tiebreak_advance_vs_hold():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    bb1 = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    gs = _game_state(board, [carrier, bb1], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+    resolved = frozenset({2})
+
+    advance_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+    advance_dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {}, goal, resolved, 4, Strategy.ADVANCE, advance_steps, frozenset(), frozenset()
+    )
+    # ADVANCE breaks the coverage tie toward the goal (east) over the ship's
+    # own starting position.
+    assert advance_dest is not None
+    assert advance_dest != carrier.position
+
+    hold_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=0)
+    assert hold_steps == 0
+    hold_dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {}, goal, resolved, 0, Strategy.HOLD, hold_steps, frozenset(), frozenset()
+    )
+    # HOLD's max_steps=0 floors cautious_steps at 0, which structurally
+    # collapses the candidate set to just the ship's own current position.
+    assert hold_dest == carrier.position
+
+
+def test_carrier_formation_returns_none_without_a_living_ac_bonus_eligible_escort():
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    sub = _ship(AxialCoord(0, 1), ShipKind.SUBMARINE, PLAYER_A, 2)  # not AC_BONUS_ELIGIBLE_KINDS
+    gs = _game_state(board, [carrier, sub], config=Config(fow=FowConfig(enabled=True)))
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+    cautious_steps = _carrier_cautious_max_steps(carrier, gs, max_steps=4)
+
+    dest = _carrier_formation_destination(
+        carrier, force, gs, PLAYER_A, {}, goal, frozenset(), 4, Strategy.ADVANCE, cautious_steps, frozenset(), frozenset()
+    )
+
+    assert dest is None
+
+
+def test_carrier_formation_disabled_reproduces_the_flat_reserve_pipeline():
+    # Regression pin: with the flag off (the default), _choose_carrier_
+    # destination's own output is completely unaffected by anything above
+    # -- a force whose formation optimization would clearly prefer a
+    # different hex still gets the plain cautious advance.
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    bb1 = _ship(AxialCoord(2, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    bb2 = _ship(AxialCoord(2, -1), ShipKind.BATTLESHIP, PLAYER_A, 3)
+    config = Config(
+        fow=FowConfig(enabled=True), ai=AiConfig(carrier_advance_reserve=2, carrier_formation_optimization_enabled=False)
+    )
+    gs = _game_state(board, [carrier, bb1, bb2], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2, 3}, goal=goal)
+
+    destination = _choose_carrier_destination(carrier, gs, PLAYER_A, {}, goal=goal, force=force)
+
+    # Plain cautious advance toward the goal (east), same as _choose_
+    # carrier_destination's own existing reserve test -- not the
+    # formation-optimized pick near (1, 0) the tests above show it would
+    # otherwise prefer.
+    assert destination is not None
+    assert distance(AxialCoord(0, 0), destination) == 2
+
+
+def test_carrier_formation_ignored_by_a_scouting_eligible_carrier():
+    # A carrier eligible for hex-by-hex scouting is claimed by that
+    # earlier pass and never reaches _choose_carrier_destination's plain-
+    # advance branch at all -- confirm the eligibility check itself
+    # doesn't even look at carrier_formation_optimization_enabled, so
+    # turning this flag on can't change whether a carrier scouts.
+    board = _sea_board(radius=20)
+    port = AxialCoord(20, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    bb1 = _ship(AxialCoord(2, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    config = Config(
+        fow=FowConfig(enabled=True),
+        ai=AiConfig(carrier_scouting_enabled=True, carrier_formation_optimization_enabled=True),
+    )
+    gs = _game_state(board, [carrier, bb1], config=config)
+    goal = TaskForceGoal(GoalKind.CAPTURE_PORT, port)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=goal)
+
+    assert _carrier_scouting_eligible(carrier, gs, force, Strategy.ADVANCE, {}) is True
 
 
 # -- carrier scouting advance (see _carrier_scouting_advance) ----------------
@@ -1070,6 +1478,190 @@ def test_carrier_scouting_disabled_reproduces_the_flat_reserve_pipeline():
 
     assert destination is not None
     assert distance(AxialCoord(0, 0), destination) == 2
+
+
+# -- carrier screening (see _carrier_screen_destination) ---------------------
+# FowConfig(enabled=False) throughout so visible_enemies can be handed in
+# directly rather than needing real vision.
+
+
+def test_carrier_screen_is_none_when_disabled():
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_bb = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=False))
+    gs = _game_state(board, [carrier, own_bb, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    assert _carrier_screen_destination(own_bb, force, gs, frozenset(), {3: threat}) is None
+
+
+def test_carrier_screen_is_none_without_a_living_carrier():
+    board = _sea_board(radius=12)
+    own_bb = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [own_bb, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={2})
+
+    assert _carrier_screen_destination(own_bb, force, gs, frozenset(), {3: threat}) is None
+
+
+def test_carrier_screen_is_none_for_a_kind_that_does_not_screen():
+    # A patrol boat is neither a heavy nor a light screener -- always None,
+    # regardless of what's nearby.
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    patrol = _ship(AxialCoord(0, 1), ShipKind.PATROL_BOAT, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, patrol, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    assert _carrier_screen_destination(patrol, force, gs, frozenset(), {3: threat}) is None
+
+
+def test_carrier_screen_is_none_for_a_destroyer_against_a_heavy_threat():
+    # Kind-matched only -- a destroyer never screens a battleship/cruiser
+    # threat, even though it's an eligible *light* screener in general.
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_dd = _ship(AxialCoord(0, 1), ShipKind.DESTROYER, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_dd, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    assert _carrier_screen_destination(own_dd, force, gs, frozenset(), {3: threat}) is None
+
+
+def test_carrier_screen_is_none_when_the_threat_is_outside_radius():
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_bb = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    far_threat = _ship(AxialCoord(6, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)  # 6 hexes -- past the default radius 4
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_bb, far_threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    assert _carrier_screen_destination(own_bb, force, gs, frozenset(), {3: far_threat}) is None
+
+
+def test_carrier_screen_redirects_a_battleship_toward_a_heavy_threats_block_hex():
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_bb = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)  # 3 hexes from carrier -- within radius 4
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_bb, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    destination = _carrier_screen_destination(own_bb, force, gs, frozenset(), {3: threat})
+
+    # Ends up genuinely between the carrier and the threat -- closer to
+    # the threat than the carrier is.
+    assert destination is not None
+    assert distance(destination, threat.position) < distance(carrier.position, threat.position)
+
+
+def test_carrier_screen_stays_in_ac_bonus_range_when_the_route_offers_it():
+    # game65 turn 2, reproduced: a threat right at the heavy-screen radius
+    # boundary (4 hexes). The old plain next-step block put the screen
+    # three hexes from its own carrier -- outside ac_bonus_radius (2) --
+    # even though later points on the exact same route stayed within it.
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_ca = _ship(AxialCoord(0, 1), ShipKind.CRUISER, PLAYER_A, 2)
+    threat = _ship(AxialCoord(4, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)  # 4 hexes -- right at radius 4
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_ca, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    destination = _carrier_screen_destination(own_ca, force, gs, frozenset(), {3: threat})
+
+    assert destination is not None
+    assert distance(destination, carrier.position) <= gs.config.combat.ac_bonus_radius
+
+
+def test_carrier_screen_is_none_when_already_screened_by_a_different_ship():
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    existing_screen = _ship(AxialCoord(2, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)  # already in front
+    candidate = _ship(AxialCoord(-3, 0), ShipKind.CRUISER, PLAYER_A, 4)  # a second eligible ship, elsewhere
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, existing_screen, candidate, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2, 4})
+
+    assert _carrier_screen_destination(candidate, force, gs, frozenset(), {3: threat}) is None
+
+
+def test_carrier_screen_redirects_a_destroyer_toward_a_light_threats_block_hex():
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_dd = _ship(AxialCoord(0, 1), ShipKind.DESTROYER, PLAYER_A, 2)
+    threat = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_B, 3)  # 2 hexes -- within default radius 3
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_dd, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    destination = _carrier_screen_destination(own_dd, force, gs, frozenset(), {3: threat})
+
+    assert destination is not None
+    assert distance(destination, threat.position) < distance(carrier.position, threat.position)
+
+
+def test_carrier_screen_ignores_a_submerged_enemy_submarine():
+    board = _sea_board(radius=12)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_dd = _ship(AxialCoord(0, 1), ShipKind.DESTROYER, PLAYER_A, 2)
+    submerged_threat = _ship(AxialCoord(2, 0), ShipKind.SUBMARINE, PLAYER_B, 3, surfaced=False)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_dd, submerged_threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2})
+
+    assert _carrier_screen_destination(own_dd, force, gs, frozenset(), {3: submerged_threat}) is None
+
+
+def test_task_force_destination_screen_takes_priority_over_the_goal():
+    board = _sea_board(radius=12)
+    port = AxialCoord(10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    own_bb = _ship(AxialCoord(0, 1), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(carrier_screen_enabled=True))
+    gs = _game_state(board, [carrier, own_bb, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=TaskForceGoal(GoalKind.CAPTURE_PORT, port))
+
+    destination = choose_task_force_destination(own_bb, force.goal, gs, {3: threat}, force)
+
+    assert destination is not None
+    assert distance(destination, threat.position) < distance(carrier.position, threat.position)
+
+
+def test_task_force_destination_max_separation_still_wins_over_screening():
+    board = _sea_board(radius=12)
+    port = AxialCoord(10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    # 6 hexes from its nearest force-mate (the carrier) -- over max_separation (4).
+    own_bb = _ship(AxialCoord(6, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(
+        fow=FowConfig(enabled=False),
+        ai=AiConfig(carrier_screen_enabled=True, task_force_max_separation=4),
+    )
+    gs = _game_state(board, [carrier, own_bb, threat], config=config)
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1, 2}, goal=TaskForceGoal(GoalKind.CAPTURE_PORT, port))
+
+    destination = choose_task_force_destination(own_bb, force.goal, gs, {3: threat}, force)
+
+    # Pulled back toward the carrier to close the separation gap, not
+    # toward the threat's block hex.
+    assert destination is not None
+    assert distance(destination, carrier.position) <= distance(own_bb.position, carrier.position)
 
 
 # -- carrier-bonus cohesion (see _carrier_bonus_cohesion_destination) --------
@@ -1336,6 +1928,167 @@ def test_plan_movement_carrier_defense_does_not_trigger_when_carrier_is_safe():
     assert directives == []
 
 
+def test_port_defense_fallback_does_not_force_an_unfavorable_attack():
+    # Real bug (found via game63 replay review): a counterattack directive
+    # is a *group*-power decision (compute_port_defense_directives), so a
+    # hopelessly outmatched individual responder -- like this patrol boat
+    # against a battleship -- can still be listed in `counterattack`.
+    # _favorable_attack correctly refuses that 1v1 (matchup_score deeply
+    # negative), but the old final fallback (`_step_toward(ship, ...,
+    # nearest_threat.position)`, no `avoid`) then walked the ship straight
+    # onto the threat's own hex anyway, converting "close the distance"
+    # into the very attack just rejected.
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    threat = _ship(AxialCoord(2, 0), ShipKind.BATTLESHIP, PLAYER_B, 2)
+    weak_responder = _ship(AxialCoord(0, 1), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    gs = _game_state(board, [weak_responder, threat], config=Config(fow=FowConfig(enabled=False)))
+    directive = PortDefenseDirective(port=port, threats=[threat], counterattack=[weak_responder])
+
+    destination = _port_defense_destination(weak_responder, directive, gs, {2: threat})
+
+    assert destination is not None
+    assert destination != threat.position
+    assert gs.ship_at(destination) is None  # never silently resolves into an attack
+
+
+def test_carrier_defense_fallback_does_not_force_an_unfavorable_attack():
+    # Same fix, same bug, for the carrier-defense counterpart.
+    carrier = _ship(AxialCoord(-3, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    threat = _ship(AxialCoord(2, 0), ShipKind.BATTLESHIP, PLAYER_B, 2)
+    weak_responder = _ship(AxialCoord(0, 1), ShipKind.PATROL_BOAT, PLAYER_A, 3)
+    gs = _game_state(_sea_board(radius=10), [carrier, weak_responder, threat], config=Config(fow=FowConfig(enabled=False)))
+    directive = CarrierDefenseDirective(carrier=carrier, threats=[threat], counterattack=[weak_responder])
+
+    destination = _carrier_defense_destination(weak_responder, directive, gs, {2: threat})
+
+    assert destination is not None
+    assert destination != threat.position
+    assert gs.ship_at(destination) is None
+
+
+def test_plan_movement_port_defense_does_not_sacrifice_an_outmatched_counterattacker():
+    # End-to-end: a strong enough group (battleship + patrol boat) is not
+    # outmatched overall, so both get a counterattack directive -- but the
+    # patrol boat's own 1v1 against the battleship threat is hopeless. It
+    # should approach without engaging, not walk into a battle it can't
+    # win as a side effect of "get closer."
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    strong = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    weak = _ship(AxialCoord(0, 1), ShipKind.PATROL_BOAT, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    gs = _game_state(board, [strong, weak, threat], config=Config(fow=FowConfig(enabled=False)))
+
+    _run(NaivePolicy(), gs, PLAYER_A)
+
+    assert 2 in gs.ships and gs.ships[2].current_hp == 2  # patrol boat untouched by combat
+    assert not any(entry.attacker_id == 2 or entry.defender_id == 2 for entry in gs.battle_log)
+
+
+# -- AiConfig.defense_stall_turns (see NaivePolicy._defense_stall_turns) -----
+# fleet=FleetConfig(counts={}) throughout: an empty starting-fleet belief
+# keeps EnemyModel.expected_strength() at (0, 0) until something is
+# actually sighted, which keeps posture NEUTRAL (margin 0) so these
+# scenarios' counterattack-vs-block group decision is exactly what the
+# plain (0, 0) inputs -- not a posture-shifted margin -- would predict.
+
+
+def test_defense_stall_turns_counts_up_then_excludes_the_ship():
+    # A counterattack-role ship whose own matchup is hopeless (see
+    # test_plan_movement_port_defense_does_not_sacrifice_an_outmatched_
+    # counterattacker) now keeps trying, and failing, every turn -- until
+    # AiConfig.defense_stall_turns is reached, after which it's skipped
+    # entirely (excluded from `resolved`, left to ordinary movement)
+    # rather than the count climbing forever.
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    strong = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    weak = _ship(AxialCoord(0, 1), ShipKind.PATROL_BOAT, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(defense_stall_turns=2), fleet=FleetConfig(counts={}))
+    gs = _game_state(board, [strong, weak, threat], config=config)
+    policy = NaivePolicy()
+
+    for _ in range(2):
+        start_movement_phase(gs, PLAYER_A)
+        list(policy.plan_movement(gs, PLAYER_A))
+    assert policy._defense_stall_turns[PLAYER_A] == {1: 2, 2: 2}
+
+    for _ in range(2):
+        start_movement_phase(gs, PLAYER_A)
+        list(policy.plan_movement(gs, PLAYER_A))
+        # Frozen at the limit, not climbing past it -- confirms exclusion,
+        # not just a slower-growing count.
+        assert policy._defense_stall_turns[PLAYER_A] == {1: 2, 2: 2}
+
+    # Never once resolved into the old, unconditional-attack bug either.
+    assert not gs.battle_log
+
+
+def test_defense_stall_turns_resets_the_moment_the_ship_actually_attacks():
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    defender = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    weak_threat = _ship(AxialCoord(3, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)  # clearly favorable
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(defense_stall_turns=2), fleet=FleetConfig(counts={}))
+    gs = _game_state(board, [defender, weak_threat], config=config)
+    policy = NaivePolicy()
+
+    start_movement_phase(gs, PLAYER_A)
+    list(policy.plan_movement(gs, PLAYER_A))
+
+    assert len(gs.battle_log) >= 1
+    # Landed a real attack -- never even entered the tracker.
+    assert 1 not in policy._defense_stall_turns.get(PLAYER_A, {})
+
+
+def test_defense_stall_turns_drops_a_ship_no_longer_a_candidate():
+    # A ship no longer considered for defense duty at all (its threat is
+    # gone) has its count dropped outright, not just held -- so it never
+    # unfairly starts pre-excluded against a later, unrelated threat.
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    strong = _ship(AxialCoord(1, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    weak = _ship(AxialCoord(0, 1), ShipKind.PATROL_BOAT, PLAYER_A, 2)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(defense_stall_turns=2), fleet=FleetConfig(counts={}))
+    gs = _game_state(board, [strong, weak, threat], config=config)
+    policy = NaivePolicy()
+
+    for _ in range(2):
+        start_movement_phase(gs, PLAYER_A)
+        list(policy.plan_movement(gs, PLAYER_A))
+    assert policy._defense_stall_turns[PLAYER_A] == {1: 2, 2: 2}
+
+    del gs.ships[3]  # threat gone (sunk/left) -- no longer a candidate at all
+    start_movement_phase(gs, PLAYER_A)
+    list(policy.plan_movement(gs, PLAYER_A))
+
+    assert policy._defense_stall_turns[PLAYER_A] == {}
+
+
+def test_defense_stall_turns_never_tracks_a_block_role_ship():
+    # A block-role responder (a deliberate, expected-loss sacrifice -- see
+    # test_plan_movement_blocks_with_a_submarine_when_outmatched) is never
+    # entered into the tracker at all, turn after turn -- it isn't
+    # "repeatedly declining a fight," it's doing exactly what it was
+    # assigned to do.
+    port = AxialCoord(0, 0)
+    board = _port_board(port)
+    weak = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_A, 1)
+    sub = _ship(AxialCoord(1, 1), ShipKind.SUBMARINE, PLAYER_A, 2)
+    strong_threat = _ship(AxialCoord(4, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    config = Config(fow=FowConfig(enabled=False), ai=AiConfig(defense_stall_turns=2))
+    gs = _game_state(board, [weak, sub, strong_threat], config=config)
+    policy = NaivePolicy()
+
+    for _ in range(4):
+        start_movement_phase(gs, PLAYER_A)
+        list(policy.plan_movement(gs, PLAYER_A))
+        assert policy._defense_stall_turns.get(PLAYER_A, {}) == {}
+
+
 # -- cross-model belief reconciliation (see NaivePolicy._reconcile_defender_belief) --
 # Regression tests for a real gap a replay review caught: EnemyModel could
 # only ever observe combat where it was the attacker (game_state.battle_log
@@ -1497,47 +2250,25 @@ def test_plan_movement_assigns_a_defend_port_goal_under_sustained_defensive_pres
 # -- tactical layer: kill-prioritization (see tla.ai.tactics) ---------------
 
 
-def test_plan_movement_finishes_a_joint_kill_regardless_of_ship_processing_order():
-    # Neither ship can solo-secure this destroyer target: ship1
-    # (battleship, already damaged to 5/12 hp) chips it but its own HP
-    # floor forces a retreat after one round; ship2 (destroyer) alone
-    # against the still-full-hp target is an exact tie, declined outright.
-    # ship2 is placed *closer* to the target than ship1, so the ordinary
-    # per-ship loop's own distance-based sort processes it *first* --
-    # against the old (pre-tactics-layer) matchup_score-only gate, that
-    # means ship2 declines while the target is still full HP and never
-    # gets a second look once ship1 later weakens it. The tactical layer
-    # (tla.ai.tactics.secure_kills_pass) finds and commits to this joint
-    # kill before the ordinary loop even runs, independent of that
-    # processing order.
+def test_plan_movement_prioritizes_the_higher_value_target_via_the_tactical_layer():
+    # A lone battleship can reach and secure either a weak patrol boat or
+    # a more valuable cruiser this turn -- it only gets to attack once, so
+    # the tactical layer (tla.ai.tactics.secure_kills_pass, run *before*
+    # the ordinary per-ship loop) should commit it to the higher future-
+    # damage-removed target (the cruiser) rather than whichever the
+    # ordinary loop's own per-ship pick happens to prefer. See tests/
+    # test_ai_tactics.py for the same behavior tested directly against
+    # secure_kills_pass; this is the same thing confirmed end-to-end.
     board = _sea_board(radius=10)
-    ship1 = _ship(AxialCoord(-1, 0), ShipKind.BATTLESHIP, PLAYER_A, 1, hp=5)
-    ship2 = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 2)
-    target = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 3)
-    gs = _game_state(board, [ship1, ship2, target])
+    attacker = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
+    weak = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2)
+    juicier = _ship(AxialCoord(0, 1), ShipKind.CRUISER, PLAYER_B, 3)
+    gs = _game_state(board, [attacker, weak, juicier])
 
     _run(NaivePolicy(), gs, PLAYER_A)
 
-    assert 3 not in gs.ships
-    attacker_ids = {e.attacker_id for e in gs.battle_log if e.defender_id == 3}
-    assert attacker_ids == {1, 2}
-
-
-def test_plan_movement_leaves_the_joint_kill_on_the_table_when_tactics_disabled():
-    # Same exact scenario as above, but with the escape hatch off -- the
-    # target is left alive, damaged but not finished, confirming this is
-    # a real behavior difference the tactical layer causes (not something
-    # that would have happened anyway) and that the config switch works.
-    board = _sea_board(radius=10)
-    ship1 = _ship(AxialCoord(-1, 0), ShipKind.BATTLESHIP, PLAYER_A, 1, hp=5)
-    ship2 = _ship(AxialCoord(2, 0), ShipKind.DESTROYER, PLAYER_A, 2)
-    target = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_B, 3)
-    gs = _game_state(board, [ship1, ship2, target], config=Config(ai=AiConfig(tactics_enabled=False)))
-
-    _run(NaivePolicy(), gs, PLAYER_A)
-
-    assert 3 in gs.ships
-    assert gs.ships[3].current_hp == 2
+    assert 2 in gs.ships  # the patrol boat was left alone
+    assert 3 not in gs.ships  # the cruiser was sunk instead
 
 
 # -- "don't advance into a losing battle" (see _project_engagement_value) ---
@@ -1656,10 +2387,39 @@ def test_favorable_attack_tie_tolerant_accepts_a_mutual_kill_trade():
     gs = _game_state(board, [ship, mirror])
 
     # Default (strict > 0) gate declines a tie -- it's a mutual kill, not a
-    # clean win.
+    # clean win, and an equal-cost mirror matchup isn't a worthwhile one
+    # either (see worth_a_tie -- needs the target to cost strictly more).
     assert _favorable_attack(ship, gs, {2: mirror}, [ship]) is None
-    # tie_tolerant=True (Strategy.AGGRESSIVE) accepts it.
+    # tie_tolerant=True (Strategy.AGGRESSIVE) accepts it regardless.
     assert _favorable_attack(ship, gs, {2: mirror}, [ship], tie_tolerant=True) == mirror.position
+
+
+def test_favorable_attack_declines_a_non_worthwhile_tie_even_without_aggressive():
+    # Destroyer (cost 4) vs a patrol boat (cost 1) at HP levels that tie
+    # the race -- not accepted even under the default (non-tie_tolerant)
+    # gate, since trading down in value isn't worth it.
+    board = _sea_board()
+    ship = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1, hp=2)
+    target = _ship(AxialCoord(1, 0), ShipKind.PATROL_BOAT, PLAYER_B, 2, hp=4)
+    gs = _game_state(board, [ship, target])
+    assert scoring.matchup_score(ship, target, gs) == 0  # confirm this really is a tie
+
+    assert _favorable_attack(ship, gs, {2: target}, [ship]) is None
+
+
+def test_favorable_attack_accepts_a_worthwhile_tie_without_aggressive():
+    # Cruiser (cost 7) vs a battleship (cost 10) at HP levels that tie the
+    # race -- accepted under the plain default gate (no tie_tolerant, no
+    # Strategy.AGGRESSIVE needed): trading up in value is worth it even at
+    # even odds. Real replay-found gap (game65): cruisers declining
+    # exactly this kind of trade against enemy carriers.
+    board = _sea_board()
+    ship = _ship(AxialCoord(0, 0), ShipKind.CRUISER, PLAYER_A, 1, hp=4)
+    target = _ship(AxialCoord(1, 0), ShipKind.BATTLESHIP, PLAYER_B, 2, hp=3)
+    gs = _game_state(board, [ship, target])
+    assert scoring.matchup_score(ship, target, gs) == 0  # confirm this really is a tie
+
+    assert _favorable_attack(ship, gs, {2: target}, [ship]) == target.position
 
 
 def test_strategy_hold_holds_a_ship_with_no_cohesion_issue_in_place():

@@ -57,12 +57,25 @@ def run_production(game_state: GameState, player: PlayerId) -> None:
     captured -- see `Board.controlled_ports_for`) that's unoccupied banks
     `ProductionConfig.points_per_turn` points independently -- controlling
     more ports means more total production, not a thinner split of a fixed
-    budget. A port occupied by either side's ship earns nothing this turn.
-    Once its banked points cover the cost of whatever `build_order` kind
-    its own progress is currently on, it spawns that ship -- one spawn per
-    port per turn (the hex becomes occupied) -- carries any leftover points
-    toward the next kind, and advances to the next position in the
-    sequence, wrapping back to the start once it runs off the end."""
+    budget. Once its banked points cover the cost of whatever `build_order`
+    kind its own progress is currently on, it spawns that ship -- one spawn
+    per port per turn (the hex becomes occupied) -- carries any leftover
+    points toward the next kind, and advances to the next position in the
+    sequence, wrapping back to the start once it runs off the end.
+
+    A port occupied by an enemy ship, or by a friendly ship already at full
+    HP, earns nothing this turn -- same as every occupied port always has.
+    The one exception: a port occupied by a *damaged* friendly ship still
+    earns `points_per_turn` (added to whatever's already banked there --
+    a ship arriving mid-build can eat into progress already saved toward
+    the port's next ship) and spends from that pooled total on repairing
+    it, 1 point per HP, before anything else; any leftover after a full
+    heal stays banked for next time. This can span multiple turns for a
+    badly damaged ship -- each turn this port is processed, whatever's
+    available goes to repair first, same as today, continuing where it
+    left off via the ship's own current_hp -- no separate progress state
+    needed. Never spawns a ship onto an occupied hex regardless of any of
+    this, same as always."""
     player_state = game_state.players[player]
     progress = player_state.port_production
     stats = game_state.config.ship_stats.stats
@@ -71,10 +84,19 @@ def run_production(game_state: GameState, player: PlayerId) -> None:
     if not build_order:
         return
 
-    active_ports = [
-        p for p in game_state.board.controlled_ports_for(player) if game_state.ship_at(p) is None
-    ]
-    for port in active_ports:
+    for port in game_state.board.controlled_ports_for(player):
+        occupant = game_state.ship_at(port)
+        if occupant is not None:
+            if occupant.owner == player:
+                missing = stats[occupant.kind].hp - occupant.current_hp
+                if missing > 0:
+                    state = progress.setdefault(port, PortProduction())
+                    state.points += points_per_turn
+                    repaired = min(missing, state.points)
+                    occupant.current_hp += repaired
+                    state.points -= repaired
+            continue
+
         state = progress.setdefault(port, PortProduction())
         state.points += points_per_turn
         kind = build_order[state.next_index % len(build_order)]

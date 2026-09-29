@@ -21,6 +21,8 @@
     "task_force_max_size": 6,
     "task_force_gather_radius": 8,
     "task_force_max_separation": 4,
-    "carrier_scouting_enabled": true
+    "carrier_scouting_enabled": true,
+    "carrier_formation_optimization_enabled": true,
+    "carrier_screen_enabled": true
   }
 }

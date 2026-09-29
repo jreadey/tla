@@ -7,12 +7,12 @@ from tla.ai.task_force import (
     GoalKind,
     TaskForce,
     TaskForceGoal,
-    _block_hex_toward,
     _choose_blocker,
     _gather,
     _pullback_waypoint,
     apply_defensive_port_priority,
     assign_goal,
+    block_hex_toward,
     compute_carrier_defense_directives,
     compute_port_defense_directives,
     find_chokepoint,
@@ -1590,7 +1590,7 @@ def test_block_hex_toward_is_the_threats_own_next_step():
     gs = _game_state(board, [threat])
     field = sea_distance_field(gs, port)
 
-    block_hex = _block_hex_toward([threat], port, field, gs)
+    block_hex = block_hex_toward([threat], port, field, gs)
 
     # A genuine next step on the threat's own shortest route in -- adjacent
     # to where it's actually standing. Not asserting it's strictly closer
@@ -1601,6 +1601,46 @@ def test_block_hex_toward_is_the_threats_own_next_step():
     # approach direction.
     assert block_hex is not None
     assert block_hex != threat.position
+    assert distance(block_hex, threat.position) == 1
+
+
+def test_block_hex_toward_prefers_a_radius_compliant_point_on_the_same_path():
+    # Same shape as game65 turn 2: a carrier at the origin, a threat four
+    # hexes out on a straight sea lane. The plain next-step choice would
+    # land one hex from the threat (three hexes from the carrier) --
+    # outside a radius-2 preference -- even though the path's own next
+    # two points, at distance 2 and 1 from the carrier, block the exact
+    # same route just as well.
+    carrier_pos = AxialCoord(0, 0)
+    board = _sea_board(radius=12)
+    threat = _ship(AxialCoord(4, 0), ShipKind.BATTLESHIP, PLAYER_B, 1)
+    gs = _game_state(board, [threat])
+    field = sea_distance_field(gs, carrier_pos)
+
+    unconstrained = block_hex_toward([threat], carrier_pos, field, gs)
+    assert distance(unconstrained, carrier_pos) == 3
+
+    block_hex = block_hex_toward([threat], carrier_pos, field, gs, prefer_radius=2)
+
+    assert block_hex is not None
+    assert distance(block_hex, carrier_pos) <= 2
+
+
+def test_block_hex_toward_falls_back_to_the_next_step_when_no_point_qualifies():
+    # The threat is already close enough that nothing on its route in is
+    # within the (small) preferred radius except the target itself --
+    # falls back to the ordinary next-step block rather than returning
+    # None (screening priority over coverage still applies when there's
+    # no compliant option at all).
+    carrier_pos = AxialCoord(0, 0)
+    board = _sea_board(radius=12)
+    threat = _ship(AxialCoord(3, 0), ShipKind.BATTLESHIP, PLAYER_B, 1)
+    gs = _game_state(board, [threat])
+    field = sea_distance_field(gs, carrier_pos)
+
+    block_hex = block_hex_toward([threat], carrier_pos, field, gs, prefer_radius=0)
+
+    assert block_hex is not None
     assert distance(block_hex, threat.position) == 1
 
 

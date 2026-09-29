@@ -12,7 +12,7 @@ import arcade
 from tla.ai.policy import NaivePolicy
 from tla.battle import RoundResult, apply_battle_outcome, resolve_round
 from tla.elevation import marching_squares_segments
-from tla.mapgen import filter_islet_contours
+from tla.mapgen import filter_islet_contours, prune_coastline_excursions
 from tla.fow import is_hidden, visible_hexes_for
 from tla.game_state import BattleLogEntry, GameState, TurnPhase
 from tla.hexgrid import AxialCoord, axial_to_pixel, pixel_to_axial
@@ -67,12 +67,16 @@ class ActiveBattle:
 
 @dataclass
 class Toast:
-    """A brief, non-blocking notification (a ship spotted, or first coming
-    under attack -- see `_update_spotted_ships`/`_advance_ai_turn`) --
-    unlike the sunk/battle/turn-report overlays, this never pauses input;
-    it just fades on its own after TOAST_SECONDS."""
+    """A brief, non-blocking notification (a ship spotted, first coming
+    under attack, or a port changing hands -- see `_update_spotted_ships`/
+    `_advance_ai_turn`/`_toast_port_captures`) -- unlike the sunk/battle/
+    turn-report overlays, this never pauses input; it just fades on its
+    own after TOAST_SECONDS. `segments` is colored text -- see
+    `_draw_text_line` -- rather than a plain string, so a ship callsign
+    ("BB17") can be colored by side while the rest of the message stays
+    plain white."""
 
-    text: str
+    segments: list[tuple[str, tuple]]
     remaining: float = 0.0
 
 
@@ -149,6 +153,25 @@ TOAST_BORDER_COLOR = (200, 170, 60)
 TOAST_WIDTH = 260.0
 TOAST_HEIGHT = 26.0
 TOAST_MARGIN = 10.0
+# Max colored segments any one message line needs -- the worst case is a
+# "<ship> and <ship> both sunk!" line: [label, " and ", label, " both
+# sunk!"], 4 segments. Every per-line Text-object pool below is sized to
+# this so the same _draw_text_line helper works for all of them.
+MESSAGE_MAX_SEGMENTS = 4
+MESSAGE_TEXT_COLOR = arcade.color.WHITE
+
+# User's own shorthand from play-testing sessions -- used in every message
+# this UI shows (toasts, sunk overlay, battle banner) instead of spelling
+# out "Player A Battleship"; which side a ship belongs to is conveyed by
+# color (_ship_color/PLAYER_COLORS) instead.
+SHIP_ABBREVIATIONS: dict[ShipKind, str] = {
+    ShipKind.BATTLESHIP: "BB",
+    ShipKind.CARRIER: "CV",
+    ShipKind.CRUISER: "CA",
+    ShipKind.DESTROYER: "DD",
+    ShipKind.SUBMARINE: "SS",
+    ShipKind.PATROL_BOAT: "PB",
+}
 
 TURN_REPORT_BG_COLOR = (18, 18, 18, 245)
 TURN_REPORT_BORDER_COLOR = (200, 170, 60)
@@ -180,7 +203,9 @@ class GameView(arcade.View):
         self.hex_size = hex_size if hex_size is not None else board.hex_pixel_size
 
         self.contour_segments = (
-            filter_islet_contours(marching_squares_segments(board.elevation), board)
+            prune_coastline_excursions(
+                filter_islet_contours(marching_squares_segments(board.elevation), board), board
+            )
             if board.elevation
             else []
         )
@@ -247,8 +272,9 @@ class GameView(arcade.View):
         # dealt, rather than seeing the outcome and the reveal at once.
         self.pending_sub_contact: bool = False
         # Set when a battle just concluded with a sink, dismissed by any
-        # key press or click.
-        self.sunk_message: str | None = None
+        # key press or click. Colored text segments (see _draw_text_line),
+        # not a plain string -- e.g. a red "BB17" callsign.
+        self.sunk_message: list[tuple[str, tuple]] | None = None
         # True once the second mover's (MOVE_B) movement phase is over and
         # the after-action report covering the whole turn is waiting to be
         # dismissed -- see _end_movement_phase. The actual phase transition
@@ -282,7 +308,7 @@ class GameView(arcade.View):
         # leaving it unclear which of your ships even got hit. See
         # _advance_ai_turn/_first_attack_on_display_player.
         self.pending_attack_hex: AxialCoord | None = None
-        self.pending_attack_message: str | None = None
+        self.pending_attack_message: list[tuple[str, tuple]] | None = None
         # Ship ids already paused-and-highlighted for coming under attack
         # during the current half-turn's AI draining -- companion to
         # _attack_toasted_ship_ids (a separate set: the toast fires for
@@ -321,6 +347,7 @@ class GameView(arcade.View):
         self._dragging = False
         self._mouse_screen_pos = (0.0, 0.0)
         self._hovered_ship: Ship | None = None
+        self._hovered_port: AxialCoord | None = None
 
         # arcade.Text objects are reused and repositioned every frame rather
         # than calling arcade.draw_text() fresh each time, which rebuilds a
@@ -330,7 +357,16 @@ class GameView(arcade.View):
             arcade.Text("", 0, 0, TOOLTIP_TEXT_COLOR, 12) for _ in range(TOOLTIP_MAX_LINES)
         ]
         self._battle_texts = [arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(4)]
-        self._sunk_text = arcade.Text("", 0, 0, SUNK_TEXT_COLOR, 16, anchor_x="center")
+        # The "BATTLE -- BB17 (.../.. HP)  vs  CA9 (.../.. HP)" line needs
+        # its two ship callsigns colored by side -- drawn separately from
+        # _battle_texts's other (plain, single-color) lines via
+        # _draw_text_line. See MESSAGE_MAX_SEGMENTS.
+        self._battle_line_texts = [
+            arcade.Text("", 0, 0, arcade.color.WHITE, 14) for _ in range(MESSAGE_MAX_SEGMENTS + 1)
+        ]
+        self._sunk_texts = [
+            arcade.Text("", 0, 0, SUNK_TEXT_COLOR, 16) for _ in range(MESSAGE_MAX_SEGMENTS + 1)
+        ]
         self._game_over_text = arcade.Text(
             "", 0, 0, GAME_OVER_TEXT_COLOR, 36, anchor_x="center", bold=True
         )
@@ -341,12 +377,17 @@ class GameView(arcade.View):
         self._sub_contact_text = arcade.Text(
             "", 0, 0, SUB_CONTACT_TEXT_COLOR, 16, anchor_x="center"
         )
-        self._attack_pause_text = arcade.Text("", 0, 0, ATTACK_TEXT_COLOR, 16, anchor_x="center")
-        # Reused for up to this many simultaneously-visible toasts (spotted
-        # or under-attack); any beyond that just don't get a slot until an
-        # older one expires.
+        self._attack_pause_texts = [
+            arcade.Text("", 0, 0, ATTACK_TEXT_COLOR, 16) for _ in range(MESSAGE_MAX_SEGMENTS + 1)
+        ]
+        # Reused for up to this many simultaneously-visible toasts (spotted,
+        # under-attack, or port captured/retaken); any beyond that just
+        # don't get a slot until an older one expires. One inner list of
+        # Text objects per toast slot, sized to MESSAGE_MAX_SEGMENTS, since
+        # a toast's text is now colored segments (_draw_text_line), not a
+        # single plain string.
         self._toast_texts = [
-            arcade.Text("", 0, 0, arcade.color.WHITE, 12) for _ in range(5)
+            [arcade.Text("", 0, 0, arcade.color.WHITE, 12) for _ in range(MESSAGE_MAX_SEGMENTS)] for _ in range(5)
         ]
         self._turn_report_title_text = arcade.Text(
             "", 0, 0, arcade.color.WHITE, 18, anchor_x="center", bold=True
@@ -424,6 +465,7 @@ class GameView(arcade.View):
         while self._ai_turn_iter is not None and self._ai_pace_timer >= pacing:
             self._ai_pace_timer -= pacing
             before = {sid: (s.owner, s.kind) for sid, s in self.game_state.ships.items()}
+            before_ports = self._port_controller_snapshot()
             try:
                 next(self._ai_turn_iter)
             except StopIteration:
@@ -433,7 +475,8 @@ class GameView(arcade.View):
             entries = self.game_state.battle_log[self._battle_log_watermark :]
             self._battle_log_watermark = len(self.game_state.battle_log)
             self._toast_new_attacks(entries)
-            sunk = [owner_kind for sid, owner_kind in before.items() if sid not in self.game_state.ships]
+            self._toast_port_captures(before_ports)
+            sunk = [(sid, owner, kind) for sid, (owner, kind) in before.items() if sid not in self.game_state.ships]
             if sunk:
                 self.sunk_message = self._sunk_message_for(sunk)
                 return
@@ -458,11 +501,85 @@ class GameView(arcade.View):
                 continue
             self._attack_toasted_ship_ids.add(entry.attacker_id)
             self._attack_toasted_ship_ids.add(entry.defender_id)
-            attacker_label = self._label_for(entry.attacker_owner, entry.attacker_kind)
-            defender_label = self._label_for(entry.defender_owner, entry.defender_kind)
-            self._toasts.append(Toast(text=f"{attacker_label} attacks {defender_label}!", remaining=TOAST_SECONDS))
+            attacker_label = self._label_for(entry.attacker_kind, entry.attacker_id)
+            defender_label = self._label_for(entry.defender_kind, entry.defender_id)
+            segments = [
+                (attacker_label, self._ship_color(entry.attacker_owner)),
+                (" attacks ", MESSAGE_TEXT_COLOR),
+                (defender_label, self._ship_color(entry.defender_owner)),
+                ("!", MESSAGE_TEXT_COLOR),
+            ]
+            self._toasts.append(Toast(segments=segments, remaining=TOAST_SECONDS))
 
-    def _first_attack_on_display_player(self, entries: list[BattleLogEntry]) -> tuple[AxialCoord, str] | None:
+    def _port_controller_snapshot(self) -> dict[AxialCoord, PlayerId | None]:
+        """Every port's current `Tile.port_display_owner`, keyed by coord --
+        paired with `_toast_port_captures` (called with the snapshot taken
+        just before whatever step might have changed it) to detect a
+        capture/retake the same way `_advance_ai_turn` already detects a
+        sinking: diff a before/after snapshot around the step, rather than
+        threading a callback through `tla.production.handle_port_capture`
+        (a pure game-logic function with no UI awareness)."""
+        board = self.game_state.board
+        coords = board.ports_for(PLAYER_A) + board.ports_for(PLAYER_B)
+        return {coord: board.get_tile(coord).port_display_owner for coord in coords}
+
+    def _toast_port_captures(self, before: dict[AxialCoord, PlayerId | None]) -> None:
+        """Fires a "<port name> captured by <ship>!" toast (or "retaken by",
+        if the port's original owner -- `Tile.port_owner`, fixed at map
+        generation -- just took it back) for every port whose
+        `port_display_owner` differs from `before`'s snapshot of it. The
+        ship credited is whoever now occupies that hex -- by the time
+        control changes at all (see `handle_port_capture`), that's always
+        the ship that triggered it."""
+        board = self.game_state.board
+        for coord, previous_owner in before.items():
+            tile = board.get_tile(coord)
+            if tile is None or tile.port_display_owner == previous_owner:
+                continue
+            name = tile.port_name or "Port"
+            verb = "retaken" if tile.port_display_owner == tile.port_owner else "captured"
+            occupant = self.game_state.ship_at(coord)
+            segments = [(f"{name} {verb}", MESSAGE_TEXT_COLOR)]
+            if occupant is not None:
+                segments.append((" by ", MESSAGE_TEXT_COLOR))
+                segments.append((self._ship_label(occupant), self._ship_color(occupant.owner)))
+            segments.append(("!", MESSAGE_TEXT_COLOR))
+            self._toasts.append(Toast(segments=segments, remaining=TOAST_SECONDS))
+
+    def _hp_snapshot(self) -> dict[int, tuple[int, int]]:
+        """Every living ship's (current_hp, max_hp), keyed by id -- paired
+        with `_toast_completed_repairs` around `run_production` (the only
+        place a ship's HP can increase -- see `tla.production.
+        run_production`'s in-port repair) to fire a toast exactly when a
+        ship crosses from damaged to fully healed, the same before/after
+        diff pattern already used for sinks (`_advance_ai_turn`) and port
+        captures (`_port_controller_snapshot`)."""
+        stats = self.game_state.config.ship_stats.stats
+        return {s.id: (s.current_hp, stats[s.kind].hp) for s in self.game_state.ships.values()}
+
+    def _toast_completed_repairs(self, before: dict[int, tuple[int, int]]) -> None:
+        """Fires a "<ship> fully repaired!" toast for every ship that was
+        damaged in `before`'s snapshot and is now at full HP -- not for a
+        ship still mid-repair (still damaged), and not on every turn it
+        sits in port, only the one turn repair actually finishes (user's
+        own framing: "so the user knows he can leave port"). A ship id
+        with no `before` entry (freshly spawned this same production
+        step) is skipped -- spawning at full HP is not a repair."""
+        for ship in self.game_state.ships.values():
+            prev = before.get(ship.id)
+            if prev is None:
+                continue
+            prev_hp, max_hp = prev
+            if prev_hp < max_hp and ship.current_hp >= max_hp:
+                segments = [
+                    (self._ship_label(ship), self._ship_color(ship.owner)),
+                    (" fully repaired!", MESSAGE_TEXT_COLOR),
+                ]
+                self._toasts.append(Toast(segments=segments, remaining=TOAST_SECONDS))
+
+    def _first_attack_on_display_player(
+        self, entries: list[BattleLogEntry]
+    ) -> tuple[AxialCoord, list[tuple[str, tuple]]] | None:
         """The (hex, message) for the first `entries` battle where the
         *watching human's own* ship (see `_display_player`) is the
         defender -- None if none qualify. Only the defender side, never
@@ -480,9 +597,13 @@ class GameView(arcade.View):
             if entry.defender_id in self._attack_paused_ship_ids:
                 continue
             self._attack_paused_ship_ids.add(entry.defender_id)
-            attacker_label = self._label_for(entry.attacker_owner, entry.attacker_kind)
+            attacker_label = self._label_for(entry.attacker_kind, entry.attacker_id)
             defender_kind_label = entry.defender_kind.value.replace("_", " ").title()
-            return entry.battle_hex, f"{attacker_label} attacks your {defender_kind_label}!"
+            segments = [
+                (attacker_label, self._ship_color(entry.attacker_owner)),
+                (f" attacks your {defender_kind_label}!", MESSAGE_TEXT_COLOR),
+            ]
+            return entry.battle_hex, segments
         return None
 
     def _posture_snapshot(self) -> dict[PlayerId, dict]:
@@ -563,7 +684,9 @@ class GameView(arcade.View):
         for hex_coord, owners in self._current_turn_sunk.items():
             self._sunk_marks[hex_coord] = SunkMark(owners=owners)
         self._current_turn_sunk = {}
-        self.turn_manager.end_movement_phase()
+        before_hp = self._hp_snapshot()
+        self.turn_manager.end_movement_phase()  # runs both players' production -- see tla.production.run_production
+        self._toast_completed_repairs(before_hp)
         self._maybe_start_ai_turn()
 
     def on_resize(self, width: int, height: int) -> None:
@@ -845,12 +968,14 @@ class GameView(arcade.View):
                 return
             self._start_battle(ship, defender)
         else:
+            before_ports = self._port_controller_snapshot()
             try:
                 # Captures a port and ends the game on the spot if that
                 # completes total port control -- see move_ship_along_path.
                 move_ship_along_path(ship, path, self.game_state)
             except ValueError:
                 return
+            self._toast_port_captures(before_ports)
 
     def _abort_drag(self) -> None:
         self.drag_ship = None
@@ -888,16 +1013,23 @@ class GameView(arcade.View):
         # Removes sunk ship(s), repositions a surviving attacker (which may
         # capture a port), and refreshes game_state.winner -- see
         # tla.battle.apply_battle_outcome. A pure retreat is a no-op here.
+        before_ports = self._port_controller_snapshot()
         apply_battle_outcome(self.game_state, attacker, defender)
+        self._toast_port_captures(before_ports)
         self.active_battle = None
 
-    def _sunk_message(self, attacker: Ship, defender: Ship) -> str | None:
+    def _sunk_message(self, attacker: Ship, defender: Ship) -> list[tuple[str, tuple]] | None:
         if attacker.is_sunk and defender.is_sunk:
-            return f"{self._ship_label(attacker)} and {self._ship_label(defender)} both sunk!"
+            return [
+                (self._ship_label(attacker), self._ship_color(attacker.owner)),
+                (" and ", MESSAGE_TEXT_COLOR),
+                (self._ship_label(defender), self._ship_color(defender.owner)),
+                (" both sunk!", MESSAGE_TEXT_COLOR),
+            ]
         if attacker.is_sunk:
-            return f"{self._ship_label(attacker)} sunk!"
+            return [(self._ship_label(attacker), self._ship_color(attacker.owner)), (" sunk!", MESSAGE_TEXT_COLOR)]
         if defender.is_sunk:
-            return f"{self._ship_label(defender)} sunk!"
+            return [(self._ship_label(defender), self._ship_color(defender.owner)), (" sunk!", MESSAGE_TEXT_COLOR)]
         return None
 
     def on_mouse_release(self, x: int, y: int, button: int, modifiers: int) -> None:
@@ -929,6 +1061,10 @@ class GameView(arcade.View):
             if visible is not None and not self._is_ship_visible(ship, visible):
                 ship = None  # hidden by fog of war -- no tooltip, no "T" toggle target
         self._hovered_ship = ship
+        # Ports are static map terrain, not fog-of-war-gated like ships --
+        # a port's name/owner is common knowledge to both players.
+        tile = gs.board.get_tile(hex_coord) if ship is None else None
+        self._hovered_port = hex_coord if tile is not None and tile.is_port else None
 
     def _is_ship_visible(self, ship: Ship, visible_hexes: set[AxialCoord]) -> bool:
         """Whether an enemy `ship` should currently be shown, given fog of
@@ -969,23 +1105,30 @@ class GameView(arcade.View):
         return visible_hexes_for(gs, self._display_player())
 
     def _ship_label(self, ship: Ship) -> str:
-        return self._label_for(ship.owner, ship.kind)
+        return self._label_for(ship.kind, ship.id)
 
-    def _label_for(self, owner: PlayerId, kind: ShipKind) -> str:
-        owner_label = "Player A" if owner == PLAYER_A else "Player B"
-        kind_label = kind.value.replace("_", " ").title()
-        return f"{owner_label} {kind_label}"
+    def _label_for(self, kind: ShipKind, ship_id: int) -> str:
+        """The short "<kind abbreviation><id>" callsign used in every
+        message this UI shows (toasts, sunk overlay, battle banner) --
+        e.g. "BB17" -- user's own shorthand from play-testing sessions.
+        Which side it belongs to is conveyed by color (`_ship_color`), not
+        by spelling out "Player A"/"Player B" in the text itself."""
+        return f"{SHIP_ABBREVIATIONS[kind]}{ship_id}"
 
-    def _sunk_message_for(self, sunk: list[tuple[PlayerId, ShipKind]]) -> str:
+    def _ship_color(self, owner: PlayerId) -> tuple:
+        return PLAYER_COLORS[owner]
+
+    def _sunk_message_for(self, sunk: list[tuple[int, PlayerId, ShipKind]]) -> list[tuple[str, tuple]]:
         """Same "<ship> sunk!" / "<ship> and <ship> both sunk!" phrasing as
-        `_sunk_message`, but built from bare (owner, kind) pairs rather
-        than live Ship objects -- used for a sink discovered during the
-        AI's own turn (see `_advance_ai_turn`), where the ships involved
-        are already gone from `game_state.ships` by the time it's noticed."""
-        labels = [self._label_for(owner, kind) for owner, kind in sunk]
+        `_sunk_message`, but built from bare (id, owner, kind) tuples
+        rather than live Ship objects -- used for a sink discovered during
+        the AI's own turn (see `_advance_ai_turn`), where the ships
+        involved are already gone from `game_state.ships` by the time it's
+        noticed. Returns colored text segments -- see `_draw_text_line`."""
+        labels = [(self._label_for(kind, ship_id), self._ship_color(owner)) for ship_id, owner, kind in sunk]
         if len(labels) == 2:
-            return f"{labels[0]} and {labels[1]} both sunk!"
-        return f"{labels[0]} sunk!"
+            return [labels[0], (" and ", MESSAGE_TEXT_COLOR), labels[1], (" both sunk!", MESSAGE_TEXT_COLOR)]
+        return [labels[0], (" sunk!", MESSAGE_TEXT_COLOR)]
 
     def _update_toasts(self, delta_time: float) -> None:
         """Age every current toast (spotted-ship or under-attack -- see
@@ -1016,9 +1159,8 @@ class GameView(arcade.View):
             if is_hidden(display_player, ship, visible):
                 continue
             known.add(ship.id)
-            self._toasts.append(
-                Toast(text=f"{self._ship_label(ship)} spotted!", remaining=TOAST_SECONDS)
-            )
+            segments = [(self._ship_label(ship), self._ship_color(ship.owner)), (" spotted!", MESSAGE_TEXT_COLOR)]
+            self._toasts.append(Toast(segments=segments, remaining=TOAST_SECONDS))
 
     def on_mouse_scroll(self, x: int, y: int, scroll_x: int, scroll_y: int) -> None:
         if scroll_y > 0:
@@ -1122,6 +1264,8 @@ class GameView(arcade.View):
             self._draw_battle_banner(self.active_battle)
         elif self._hovered_ship is not None:
             self._draw_hover_tooltip(self._hovered_ship)
+        elif self._hovered_port is not None:
+            self._draw_port_tooltip(self._hovered_port)
         self._draw_toasts()
 
     def _draw_drag_path_line(self) -> None:
@@ -1260,9 +1404,21 @@ class GameView(arcade.View):
         lines = []
         if is_sub_contact:
             lines.append("SUB CONTACT!")
+        # The "BATTLE -- ..." line's two ship callsigns are colored by
+        # side, so it's drawn separately via _draw_text_line rather than
+        # as a plain string like every other line here -- None marks its
+        # position in `lines` purely to keep the vertical spacing/height
+        # math below in one place.
+        battle_line_index = len(lines)
+        battle_line_segments = [
+            ("BATTLE -- ", arcade.color.WHITE),
+            (self._ship_label(attacker), self._ship_color(attacker.owner)),
+            (f" ({attacker.current_hp}/{stats[attacker.kind].hp} HP)  vs  ", arcade.color.WHITE),
+            (self._ship_label(defender), self._ship_color(defender.owner)),
+            (f" ({defender.current_hp}/{stats[defender.kind].hp} HP)", arcade.color.WHITE),
+        ]
         lines += [
-            f"BATTLE -- {self._ship_label(attacker)} ({attacker.current_hp}/{stats[attacker.kind].hp} HP)"
-            f"  vs  {self._ship_label(defender)} ({defender.current_hp}/{stats[defender.kind].hp} HP)",
+            None,
             f"Round {len(battle.rounds)}: dealt {last_round.damage_to_defender}, "
             f"took {last_round.damage_to_attacker} damage",
             "[Enter] Stay and Fight        [Esc] Retreat",
@@ -1279,16 +1435,21 @@ class GameView(arcade.View):
         arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, accent_color)
 
         for i, line in enumerate(lines):
+            y = top - 12 - (i + 1) * line_height + 6
+            if i == battle_line_index:
+                self._draw_text_line(battle_line_segments, self._battle_line_texts, left + 12, y)
+                continue
             text_obj = self._battle_texts[i]
             text_obj.text = line
             text_obj.color = accent_color if is_sub_contact and i == 0 else arcade.color.WHITE
             text_obj.x = left + 12
-            text_obj.y = top - 12 - (i + 1) * line_height + 6
+            text_obj.y = y
             text_obj.draw()
 
     def _draw_sunk_overlay(self) -> None:
-        display_text = f"{self.sunk_message}   (press any key to continue)"
-        width = min(self.window.width - 40, max(360, len(display_text) * 9 + 40))
+        segments = self.sunk_message + [("   (press any key to continue)", SUNK_TEXT_COLOR)]
+        char_count = sum(len(text) for text, _ in segments)
+        width = min(self.window.width - 40, max(360, char_count * 9 + 40))
         height = 60
         left = (self.window.width - width) / 2
         top = self.window.height - 40
@@ -1296,10 +1457,7 @@ class GameView(arcade.View):
         arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, SUNK_BG_COLOR)
         arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, SUNK_BORDER_COLOR)
 
-        self._sunk_text.text = display_text
-        self._sunk_text.x = self.window.width / 2
-        self._sunk_text.y = top - height / 2 - 6
-        self._sunk_text.draw()
+        self._draw_text_line(segments, self._sunk_texts, self.window.width / 2, top - height / 2 - 6, center=True)
 
     def _draw_sub_contact_overlay(self) -> None:
         display_text = "Submerged sub encountered!   (press any key to continue)"
@@ -1317,8 +1475,9 @@ class GameView(arcade.View):
         self._sub_contact_text.draw()
 
     def _draw_attack_pause_overlay(self) -> None:
-        display_text = f"{self.pending_attack_message}   (press any key to continue)"
-        width = min(self.window.width - 40, max(420, len(display_text) * 9 + 40))
+        segments = self.pending_attack_message + [("   (press any key to continue)", ATTACK_TEXT_COLOR)]
+        char_count = sum(len(text) for text, _ in segments)
+        width = min(self.window.width - 40, max(420, char_count * 9 + 40))
         height = 60
         left = (self.window.width - width) / 2
         top = self.window.height - 40
@@ -1326,10 +1485,9 @@ class GameView(arcade.View):
         arcade.draw_lbwh_rectangle_filled(left, top - height, width, height, ATTACK_BG_COLOR)
         arcade.draw_lbwh_rectangle_filled(left, top - 4, width, 4, ATTACK_BORDER_COLOR)
 
-        self._attack_pause_text.text = display_text
-        self._attack_pause_text.x = self.window.width / 2
-        self._attack_pause_text.y = top - height / 2 - 6
-        self._attack_pause_text.draw()
+        self._draw_text_line(
+            segments, self._attack_pause_texts, self.window.width / 2, top - height / 2 - 6, center=True
+        )
 
     def _draw_toasts(self) -> None:
         """Stacked, non-blocking notifications (spotted-ship or
@@ -1346,11 +1504,7 @@ class GameView(arcade.View):
             box_bottom = box_top - TOAST_HEIGHT
             arcade.draw_lbwh_rectangle_filled(left, box_bottom, TOAST_WIDTH, TOAST_HEIGHT, TOAST_BG_COLOR)
             arcade.draw_lbwh_rectangle_filled(left, box_top - 2, TOAST_WIDTH, 2, TOAST_BORDER_COLOR)
-            text_obj = self._toast_texts[i]
-            text_obj.text = toast.text
-            text_obj.x = left + 10
-            text_obj.y = box_bottom + TOAST_HEIGHT / 2 - 5
-            text_obj.draw()
+            self._draw_text_line(toast.segments, self._toast_texts[i], left + 10, box_bottom + TOAST_HEIGHT / 2 - 5)
 
     def _draw_turn_report(self) -> None:
         """The after-action report for the turn that just ended (both
@@ -1431,6 +1585,18 @@ class GameView(arcade.View):
         else:
             lines.append(f"ASW: {stats.asw}")
 
+        self._draw_tooltip(lines, PLAYER_COLORS[ship.owner])
+
+    def _draw_port_tooltip(self, coord: AxialCoord) -> None:
+        tile = self.game_state.board.get_tile(coord)
+        lines = [tile.port_name or "Port"]
+        self._draw_tooltip(lines, PLAYER_COLORS[tile.port_display_owner])
+
+    def _draw_tooltip(self, lines: list[str], bar_color) -> None:
+        """Shared box/edge-flip drawing behind both `_draw_hover_tooltip`
+        (a hovered ship) and `_draw_port_tooltip` (a hovered port) -- same
+        mouse-anchored, screen-edge-aware tooltip box, just different
+        content and owner-colored bar."""
         height = TOOLTIP_PADDING * 2 + TOOLTIP_LINE_HEIGHT * len(lines)
         mouse_x, mouse_y = self._mouse_screen_pos
 
@@ -1442,7 +1608,7 @@ class GameView(arcade.View):
             top = mouse_y - TOOLTIP_OFFSET
 
         arcade.draw_lbwh_rectangle_filled(left, top - height, TOOLTIP_WIDTH, height, TOOLTIP_BG_COLOR)
-        arcade.draw_lbwh_rectangle_filled(left, top - 4, TOOLTIP_WIDTH, 4, PLAYER_COLORS[ship.owner])
+        arcade.draw_lbwh_rectangle_filled(left, top - 4, TOOLTIP_WIDTH, 4, bar_color)
 
         for i, line in enumerate(lines):
             text_obj = self._tooltip_texts[i]
@@ -1450,3 +1616,35 @@ class GameView(arcade.View):
             text_obj.x = left + TOOLTIP_PADDING
             text_obj.y = top - TOOLTIP_PADDING - (i + 1) * TOOLTIP_LINE_HEIGHT + 4
             text_obj.draw()
+
+    def _draw_text_line(
+        self, segments: list[tuple[str, tuple]], texts: list[arcade.Text], x: float, y: float, *, center: bool = False
+    ) -> None:
+        """Draws `segments` (`(text, rgb color)` pairs -- see `_ship_label`/
+        `_ship_color`, e.g. a colored "BB17" callsign next to plain white
+        connective text) left-to-right on one line, one `arcade.Text` per
+        segment abutted against the previous segment's real measured
+        `content_width` (never guessed) -- `texts` must have at least
+        `len(segments)` objects; any beyond that are left untouched. With
+        `center=True`, `x` is the line's horizontal *center* rather than
+        its left edge (used by the sunk overlay) -- requires setting every
+        segment's `.text`/`.color` first to measure the total width before
+        any of them can be positioned, which is why every segment gets
+        `.text`/`.color` set again in the second loop even though that's
+        redundant in the `center=False` case; keeping one code path for
+        both is worth the trivial extra assignment."""
+        if center:
+            total_width = 0.0
+            for (text, color), obj in zip(segments, texts):
+                obj.text = text
+                obj.color = color
+                total_width += obj.content_width
+            x -= total_width / 2
+        cursor_x = x
+        for (text, color), obj in zip(segments, texts):
+            obj.text = text
+            obj.color = color
+            obj.x = cursor_x
+            obj.y = y
+            obj.draw()
+            cursor_x += obj.content_width

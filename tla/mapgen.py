@@ -10,6 +10,7 @@ deterministic and easy to unit test.
 
 from __future__ import annotations
 
+import math
 import random
 
 from tla.board import Board
@@ -191,6 +192,123 @@ def filter_islet_contours(segments: list[Segment], board: Board) -> list[Segment
     return kept
 
 
+def _pixel_distance(p1: Point, p2: Point) -> float:
+    return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
+
+
+def prune_coastline_excursions(
+    segments: list[Segment],
+    board: Board,
+    snap_radius: float | None = None,
+    min_excursion_points: int = 6,
+) -> list[Segment]:
+    """Straighten a small out-and-back excursion in an otherwise-real
+    coastline -- a stretch where the raw marching-squares trace (see
+    `filter_islet_contours`'s own docstring on why the raster is far
+    finer than a hex) wanders out over open sea and doubles back close
+    to where it left, rather than tracing a genuine peninsula. Distinct
+    from `filter_islet_contours`: that drops a fully isolated closed
+    ring touching no land at all, but a case like this (found via user
+    report, a real seed: hex (9,-4), open sea, several hexes from the
+    nearest LAND hex) is part of one long path that *does* legitimately
+    touch real land elsewhere along its length, so that filter correctly
+    leaves the whole thing alone -- the loop is still visual noise, just
+    not the kind that filter catches.
+
+    For each connected component, walks its points in path order (from
+    one endpoint to the other for an open coastline reaching the raster
+    boundary, or from an arbitrary point around and back for a closed
+    island loop) and finds the single largest excursion: two points at
+    least `min_excursion_points` apart along that walk that land within
+    `snap_radius` of each other in pixel space, with no LAND hex touched
+    by anything strictly between them (a real peninsula's tip touches
+    land as it narrows; a noise wiggle over open sea doesn't -- this is
+    what keeps a genuine thin peninsula from being cut off). When found,
+    the points between them are dropped and the path reconnects directly
+    from the first to the second -- only the largest one per component,
+    on the assumption this is elevation noise (rare) rather than a
+    systemic map feature; a second pass over the result would find
+    nothing left worth pruning anyway.
+
+    `snap_radius` defaults to `0.6 * board.hex_pixel_size` -- smaller
+    than a hex, so this only catches the path closing back on almost the
+    same spot, never two genuinely distant points that happen to be
+    hex-adjacent. `min_excursion_points` guards against pruning ordinary
+    fine-raster zigzag roughness that was never a real excursion at
+    all -- two *consecutive* points on a slowly curving coast are always
+    "close," which isn't what this is looking for."""
+    if not segments:
+        return segments
+    hex_size = board.hex_pixel_size
+    if snap_radius is None:
+        snap_radius = hex_size * 0.6
+
+    adjacency: dict[Point, list[Point]] = {}
+    for p1, p2 in segments:
+        adjacency.setdefault(p1, []).append(p2)
+        adjacency.setdefault(p2, []).append(p1)
+
+    def is_land(point: Point) -> bool:
+        tile = board.tiles.get(pixel_to_axial(point[0], point[1], hex_size))
+        return tile is not None and tile.terrain == TerrainType.LAND
+
+    visited_points: set[Point] = set()
+    result: list[Segment] = []
+
+    for seed_point in list(adjacency):
+        if seed_point in visited_points:
+            continue
+        component_points: set[Point] = set()
+        stack = [seed_point]
+        while stack:
+            point = stack.pop()
+            if point in component_points:
+                continue
+            component_points.add(point)
+            stack.extend(n for n in adjacency[point] if n not in component_points)
+        visited_points |= component_points
+
+        # Order the component into a walk: start at a degree-1 endpoint
+        # (an open path reaching the raster boundary) if one exists,
+        # otherwise an arbitrary point on a closed loop.
+        start = next((p for p in component_points if len(adjacency[p]) == 1), next(iter(component_points)))
+        is_open = len(adjacency[start]) == 1
+        ordered = [start]
+        prev: Point | None = None
+        current = start
+        while True:
+            candidates = [n for n in adjacency[current] if n != prev]
+            if not candidates:
+                break
+            nxt = candidates[0]
+            if nxt == start:
+                break  # closed the loop
+            ordered.append(nxt)
+            prev, current = current, nxt
+            if len(ordered) > len(component_points):
+                break  # safety valve against a malformed graph
+
+        best: tuple[int, int] | None = None
+        for i in range(len(ordered)):
+            for j in range(len(ordered) - 1, i + min_excursion_points - 1, -1):
+                if _pixel_distance(ordered[i], ordered[j]) > snap_radius:
+                    continue
+                if any(is_land(p) for p in ordered[i + 1 : j]):
+                    continue
+                if best is None or (j - i) > (best[1] - best[0]):
+                    best = (i, j)
+                break  # largest valid j for this i -- no need to check smaller ones
+        if best is not None:
+            i, j = best
+            ordered = ordered[: i + 1] + ordered[j:]
+
+        result.extend(zip(ordered, ordered[1:]))
+        if not is_open and ordered[-1] != ordered[0]:
+            result.append((ordered[-1], ordered[0]))
+
+    return result
+
+
 def largest_sea_component(board: Board) -> set[AxialCoord]:
     """The biggest connected body of SEA tiles (flood fill over sea-sea
     adjacency). Small enclosed ponds end up as separate, smaller components,
@@ -219,6 +337,60 @@ def largest_sea_component(board: Board) -> set[AxialCoord]:
         if len(component) > len(largest):
             largest = component
     return largest
+
+
+# Cosmetic only (tla.tile.Tile.port_name) -- historic/naval-flavored port
+# names, assigned in _place_ports below. Comfortably larger than any
+# config's total port count (default ports_per_player=4 -> 8 total) so
+# rng.sample never needs to repeat a name within one game.
+_PORT_NAMES: tuple[str, ...] = (
+    "Port Mahon",
+    "Port Royal",
+    "Port Said",
+    "Port Stanley",
+    "Port Arthur",
+    "Port Louis",
+    "Port Sudan",
+    "Port Elizabeth",
+    "Port Jackson",
+    "Port Adelaide",
+    "Portsmouth",
+    "Plymouth",
+    "Toulon",
+    "Brest",
+    "Cadiz",
+    "Cartagena",
+    "Gibraltar",
+    "Valletta",
+    "Taranto",
+    "Trieste",
+    "Kiel",
+    "Wilhelmshaven",
+    "Rotterdam",
+    "Antwerp",
+    "Bergen",
+    "Narvik",
+    "Murmansk",
+    "Sevastopol",
+    "Odessa",
+    "Piraeus",
+    "Rhodes",
+    "Alexandria",
+    "Tripoli",
+    "Tangier",
+    "Dakar",
+    "Mombasa",
+    "Colombo",
+    "Singapore",
+    "Yokosuka",
+    "Sasebo",
+    "Pearl Harbor",
+    "Norfolk",
+    "San Diego",
+    "Halifax",
+    "Valparaiso",
+    "Montevideo",
+)
 
 
 def _place_ports(board: Board, port_config: PortConfig, seed: int) -> None:
@@ -270,6 +442,11 @@ def _place_ports(board: Board, port_config: PortConfig, seed: int) -> None:
         tile = board.tiles[coord]
         tile.is_port = True
         tile.port_owner = PLAYER_B
+
+    all_ports = ports_a + ports_b
+    names = rng.sample(_PORT_NAMES, len(all_ports))
+    for coord, name in zip(all_ports, names):
+        board.tiles[coord].port_name = name
 
 
 def _cluster_near(

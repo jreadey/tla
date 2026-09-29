@@ -143,6 +143,80 @@ def test_run_production_gives_nothing_to_an_occupied_port():
     assert port1 not in gs.players[PLAYER_A].port_production
 
 
+def test_run_production_gives_nothing_to_a_full_hp_friendly_occupant():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=20, build_order=[ShipKind.CRUISER])
+    resident = Ship(id=1, kind=ShipKind.BATTLESHIP, owner=PLAYER_A, position=port, current_hp=12)  # full HP
+    gs.ships[1] = resident
+
+    run_production(gs, PLAYER_A)
+
+    assert resident.current_hp == 12
+    assert port not in gs.players[PLAYER_A].port_production  # nothing banked -- unchanged from today
+
+
+def test_run_production_repairs_a_damaged_friendly_occupant():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=5, build_order=[ShipKind.CRUISER])
+    resident = Ship(id=1, kind=ShipKind.BATTLESHIP, owner=PLAYER_A, position=port, current_hp=9)  # max 12, missing 3
+    gs.ships[1] = resident
+
+    run_production(gs, PLAYER_A)
+
+    assert resident.current_hp == 12  # fully healed -- 3 of the 5 points spent
+    assert gs.players[PLAYER_A].port_production[port].points == 2  # leftover banked
+    assert list(gs.ships.values()) == [resident]  # never spawned onto the occupied hex
+
+
+def test_run_production_repair_drains_pre_existing_banked_points():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=1, build_order=[ShipKind.CRUISER])
+    gs.players[PLAYER_A].port_production[port] = PortProduction(points=5, next_index=2)
+    resident = Ship(id=1, kind=ShipKind.BATTLESHIP, owner=PLAYER_A, position=port, current_hp=9)  # missing 3
+    gs.ships[1] = resident
+
+    run_production(gs, PLAYER_A)
+
+    # Pool was 5 banked + 1 new = 6; 3 spent on repair, 3 left banked.
+    assert resident.current_hp == 12
+    state = gs.players[PLAYER_A].port_production[port]
+    assert state.points == 3
+    assert state.next_index == 2  # build-order progress untouched by repair
+
+
+def test_run_production_repair_spans_multiple_turns():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=5, build_order=[ShipKind.CRUISER])
+    resident = Ship(id=1, kind=ShipKind.BATTLESHIP, owner=PLAYER_A, position=port, current_hp=4)  # missing 8
+
+    gs.ships[1] = resident
+    run_production(gs, PLAYER_A)
+    assert resident.current_hp == 9  # only 5 points available this turn
+    assert port not in gs.players[PLAYER_A].port_production or gs.players[PLAYER_A].port_production[port].points == 0
+
+    run_production(gs, PLAYER_A)
+    assert resident.current_hp == 12  # missing 3, 5 available -- fully healed with 2 left over
+    assert gs.players[PLAYER_A].port_production[port].points == 2
+
+
+def test_run_production_repair_leftover_later_funds_a_new_ship():
+    port = AxialCoord(0, 0)
+    gs = _game_state(_board_with_ports(port), points_per_turn=5, build_order=[ShipKind.PATROL_BOAT])  # cost 1
+    resident = Ship(id=1, kind=ShipKind.BATTLESHIP, owner=PLAYER_A, position=port, current_hp=11)  # missing 1
+    gs.ships[1] = resident
+
+    run_production(gs, PLAYER_A)
+    assert resident.current_hp == 12
+    assert gs.players[PLAYER_A].port_production[port].points == 4  # 1 spent healing, 4 banked
+
+    del gs.ships[1]  # ship sails out, freeing the hex
+    run_production(gs, PLAYER_A)  # 4 banked + 5 new = 9, well over patrol boat's cost of 1
+
+    spawned = [s for s in gs.ships.values() if s.kind == ShipKind.PATROL_BOAT]
+    assert len(spawned) == 1
+    assert spawned[0].position == port
+
+
 def test_run_production_assigns_ever_increasing_ids():
     port = AxialCoord(0, 0)
     gs = _game_state(_board_with_ports(port), points_per_turn=20, build_order=[ShipKind.PATROL_BOAT])

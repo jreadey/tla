@@ -17,6 +17,7 @@ from tla.mapgen import (
     has_sea_route_coverage,
     has_wide_enough_sea_passage,
     largest_sea_component,
+    prune_coastline_excursions,
 )
 from tla.tile import PLAYER_A, PLAYER_B, Tile, TerrainType
 
@@ -78,6 +79,18 @@ def test_ports_are_on_coastal_land_and_split_evenly():
         )
 
 
+def test_every_port_gets_a_unique_name():
+    map_config, port_config = _small_configs()
+    board = generate_map(map_config, port_config, seed=7)
+
+    ports = board.ports_for(PLAYER_A) + board.ports_for(PLAYER_B)
+    names = [board.tiles[coord].port_name for coord in ports]
+
+    assert all(isinstance(name, str) and name for name in names)
+    assert len(set(names)) == len(names)  # no duplicates
+
+
+@pytest.mark.slow
 def test_each_port_is_closer_to_friendly_ports_than_enemy_ports():
     # Use a bigger map so there's enough coastline for the clustering to have
     # real room to work with, across several seeds for robustness. Tests
@@ -103,6 +116,7 @@ def test_each_port_is_closer_to_friendly_ports_than_enemy_ports():
                 assert avg_friendly < avg_enemy, f"seed={seed} port={port}"
 
 
+@pytest.mark.slow
 def test_ports_border_the_main_sea_not_an_isolated_pond():
     # Regression: seed 533501 on the default config generated several tiny
     # landlocked ponds (disconnected from the main ocean), and a couple of
@@ -184,6 +198,94 @@ def test_filter_islet_contours_treats_independent_loops_separately():
     kept = filter_islet_contours(islet + real_island, board)
 
     assert sorted(kept) == sorted(real_island)
+
+
+def test_prune_coastline_excursions_straightens_a_sea_only_loop():
+    # An open coastline (reaches the raster boundary on both ends, like a
+    # real one always does) that wanders out over open sea partway along
+    # and loops back close to where it left -- exactly the shape
+    # filter_islet_contours correctly leaves alone (it's one path, still
+    # touching real land elsewhere -- not modeled here, since this test
+    # is only about the excursion itself), but still visual noise.
+    sea_coord = AxialCoord(0, 0)
+    board = _board_with({sea_coord: TerrainType.SEA})
+    cx, cy = axial_to_pixel(sea_coord, _HEX_SIZE)
+    far_left = (cx - 100, cy)
+    i_point = (cx - 1, cy)
+    detour = [
+        (cx - 1, cy + 5),
+        (cx + 4, cy + 5),
+        (cx + 4, cy + 10),
+        (cx - 4, cy + 10),
+        (cx - 4, cy + 5),
+    ]
+    j_point = (cx - 0.5, cy + 0.3)  # close to i_point -- within snap_radius
+    far_right = (cx + 100, cy)
+    points = [far_left, i_point, *detour, j_point, far_right]
+    segments = list(zip(points, points[1:]))
+
+    pruned = prune_coastline_excursions(segments, board)
+
+    pruned_points = {p for seg in pruned for p in seg}
+    assert far_left in pruned_points
+    assert far_right in pruned_points
+    for p in detour:
+        assert p not in pruned_points
+
+
+def test_prune_coastline_excursions_keeps_a_loop_that_touches_land():
+    # Same shape as above, but the detour's apex is a real LAND hex --
+    # a genuine thin peninsula, not noise, so this must survive intact.
+    sea_coord = AxialCoord(0, 0)
+    land_coord = AxialCoord(0, 1)
+    board = _board_with({sea_coord: TerrainType.SEA, land_coord: TerrainType.LAND})
+    cx, cy = axial_to_pixel(sea_coord, _HEX_SIZE)
+    lx, ly = axial_to_pixel(land_coord, _HEX_SIZE)
+    far_left = (cx - 100, cy)
+    i_point = (cx - 1, cy)
+    detour = [
+        (cx - 1, cy + 5),
+        (lx, ly),  # the peninsula's tip -- lands in the real LAND hex
+        (cx + 4, cy + 10),
+        (cx - 4, cy + 10),
+        (cx - 4, cy + 5),
+    ]
+    j_point = (cx - 0.5, cy + 0.3)
+    far_right = (cx + 100, cy)
+    points = [far_left, i_point, *detour, j_point, far_right]
+    segments = list(zip(points, points[1:]))
+
+    pruned = prune_coastline_excursions(segments, board)
+
+    assert sorted(pruned) == sorted(segments)
+
+
+def test_prune_coastline_excursions_ignores_a_short_zigzag():
+    # Two points close together but only 3 apart along the path -- below
+    # min_excursion_points, ordinary fine-raster roughness rather than a
+    # genuine out-and-back loop. Left untouched.
+    sea_coord = AxialCoord(0, 0)
+    board = _board_with({sea_coord: TerrainType.SEA})
+    cx, cy = axial_to_pixel(sea_coord, _HEX_SIZE)
+    points = [
+        (cx - 100, cy),
+        (cx - 1, cy),
+        (cx, cy + 1),
+        (cx + 1, cy),
+        (cx - 0.5, cy + 0.3),
+        (cx + 100, cy),
+    ]
+    segments = list(zip(points, points[1:]))
+
+    assert prune_coastline_excursions(segments, board) == segments
+
+
+def test_prune_coastline_excursions_leaves_a_normal_small_island_alone():
+    land_coord = AxialCoord(3, 3)
+    board = _board_with({land_coord: TerrainType.LAND})
+    segments = _small_square_loop(axial_to_pixel(land_coord, _HEX_SIZE))
+
+    assert sorted(prune_coastline_excursions(segments, board)) == sorted(segments)
 
 
 def test_port_tiles_are_occupiable_but_other_land_is_not():

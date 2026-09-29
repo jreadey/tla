@@ -30,7 +30,13 @@ class PortProduction:
     occupied by a friendly ship and can't spawn -- see
     tla.production.run_production -- but both are wiped the instant an
     enemy ship occupies the port, resetting the sequence to the start for
-    whoever controls it next; see tla.production.handle_port_capture."""
+    whoever controls it next; see tla.production.handle_port_capture.
+
+    If the occupying friendly ship is damaged, `points` gets spent on
+    repairing it (1 point per HP) before anything else, same pool as
+    everything above -- a damaged ship arriving can eat into points
+    already banked toward this port's next ship; see
+    tla.production.run_production."""
 
     next_index: int = 0
     points: int = 0
