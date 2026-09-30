@@ -376,10 +376,17 @@ def _plan_moves(
 
     If a ship's would-be best move is blocked by a `"passthrough"` (an
     unmoved, still-`plannable_ids` friendly ship occupying that neighbor),
-    that blocker's own full turn is resolved first, recursively -- tracked
-    on `pending` for cycle protection (A blocked by B blocked by A falls
-    back to just leaving both where their own best score already is,
-    rather than deadlocking). No separate fallback for a ship "boxed in"
+    that blocker is forced one step toward the force's own goal (see
+    `_step_aside`) rather than given its own full scoring-based turn --
+    a blocker already scoring well by staying put would otherwise have no
+    reason to ever move, indefinitely vetoing the ship behind it (see
+    `_step_aside`'s own docstring for the real self-play failure this
+    fixes). `_step_aside` only ever considers strictly-`"open"` neighbors
+    of its own, never another `"passthrough"`, so this never recurses --
+    no cycle-protection bookkeeping is needed for it (the `pending` set
+    below exists only for `resolve` itself, which is no longer called
+    recursively now that the blocker branch uses `_step_aside` instead).
+    No separate fallback for a ship "boxed in"
     by terrain alone: `sea_distance_field` is a pure terrain BFS (no
     occupancy awareness), and by construction every hex with distance d>0
     has at least one neighbor with distance d-1 -- a downhill-toward-goal
@@ -444,17 +451,59 @@ def _plan_moves(
 
     done: set[int] = set()
     pending: list[int] = []
-    # The order ships actually finished planning in -- *not* necessarily
-    # _round_robin_order, since a capital ship blocked by an unmoved
-    # escort resolves that escort first (see the blocker-resolution branch
-    # below), out of the normal sequence. Phase 2 (plan_force_movement_
-    # scored) must execute in *this* order, not the naive fixed one --
-    # a plan built assuming the escort has already stepped out of the way
-    # is only consistent if it really does move first for real too (found
-    # via real self-play: executing in fixed order instead left a later
+    # The order ships actually finished planning in. Now always equal to
+    # _round_robin_order (a blocked capital ship's escort is nudged aside
+    # via _step_aside, not given an out-of-order resolve() of its own --
+    # see that function's docstring), but Phase 2 (plan_force_movement_
+    # scored) still must execute in *this* order rather than assume that
+    # equivalence, since that's what it's actually for: a plan built
+    # assuming the escort has already stepped out of the way is only
+    # consistent if it really does move first for real too (found via
+    # real self-play: executing in fixed order instead left a later
     # ship's planned destination sitting on a hex an earlier-in-fixed-
     # order/later-in-actual-resolution ship hadn't vacated yet).
     resolution_order: list[int] = []
+
+    def _step_aside(sid: int) -> bool:
+        """Forces `sid` one step toward the force's own goal, bypassing
+        `score_move` entirely, when it's blocking a higher-priority
+        (earlier-round-robin) member that's already decided its own best
+        move runs through `sid`'s current hex. The previous behaviour
+        (`resolve(sid)` -- the blocker's own full scoring-based decision)
+        let a blocker that was already scoring well right where it stood
+        veto the ship behind it forever: if staying scored at least as
+        well as any open neighbor for `sid` itself, it would never budge,
+        and nothing forced it to -- found via self-play (seed 1,
+        configs/dev_scored.json vs itself never reaching a winner in 1000
+        turns; battle_log and ship counts both went flat around turn 200,
+        capital ships included). Escorts exist to serve the formation's
+        advance, not to independently veto it, so clearing the way takes
+        priority over `sid`'s own preference. Returns whether `sid`
+        actually moved (False if out of movement or boxed in itself --
+        the caller falls back to today's "genuinely stuck" handling)."""
+        ship = game_state.ships[sid]
+        if ship.movement_remaining <= 0 or goal_field is None:
+            return False
+        leaving_port = started_at_port[sid] and not first_step_taken[sid]
+        open_candidates = [
+            n
+            for n in neighbors(ship.position)
+            if _classify_step(game_state, ship.owner, n, leaving_port, ship.movement_remaining) == "open"
+        ]
+        if not open_candidates:
+            return False
+        best_n = min(open_candidates, key=lambda n: (sea_route_distance(goal_field, n), n))
+        ship.position = best_n
+        ship.movement_remaining -= 1
+        first_step_taken[sid] = True
+        best_position[sid] = best_n
+        # sid hasn't been through resolve() of its own yet (it's still
+        # unresolved -- that's exactly why it was available to block in
+        # the first place), so this also re-seeds its own running best
+        # score from its new hypothetical position, the same way the
+        # Phase 1 seed loop above originally did from its start position.
+        best_score[sid] = score_move(ship, best_n, game_state, force, visible_enemies, model, goal_field, ai_config)
+        return True
 
     def resolve(sid: int) -> None:
         if sid in done or sid in pending:
@@ -498,9 +547,8 @@ def _plan_moves(
                     claimed_by[new_target.id] = sid
                 continue
 
-            if blocker_id is not None and blocker_id not in pending:
-                resolve(blocker_id)
-                continue  # retry now that the blocker may have moved
+            if blocker_id is not None and blocker_id not in pending and _step_aside(blocker_id):
+                continue  # retry now that the blocker has stepped aside
 
             break  # genuinely stuck: nothing improves, no resolvable blocker
         pending.pop()

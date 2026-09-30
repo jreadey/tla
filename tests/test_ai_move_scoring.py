@@ -357,11 +357,11 @@ def _corridor_board(length: int = 10) -> Board:
 def test_plan_force_movement_scored_reorders_around_a_blocking_escort():
     # A capital ship's own best next step is occupied by a slower,
     # not-yet-moved escort -- rather than stalling there for the rest of
-    # the turn, the escort's own turn is resolved first (out of the
-    # normal round-robin order), which should clear the way. A one-hex-
-    # wide corridor (rather than open sea) rules out the battleship simply
-    # detouring around the destroyer diagonally without ever needing it to
-    # move -- the only way past is genuinely through where it's sitting.
+    # the turn, the escort is forced one step aside (see _step_aside),
+    # which should clear the way. A one-hex-wide corridor (rather than
+    # open sea) rules out the battleship simply detouring around the
+    # destroyer diagonally without ever needing it to move -- the only
+    # way past is genuinely through where it's sitting.
     board = _corridor_board()
     config = _config(ai=AiConfig())
     battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 1)
@@ -385,10 +385,58 @@ def test_plan_force_movement_scored_reorders_around_a_blocking_escort():
     assert gs.ships[1].position.q > 1
 
 
+def test_plan_force_movement_scored_steps_a_tied_escort_aside_anyway():
+    # Regression test for the real self-play deadlock _step_aside fixed
+    # (seed 1, configs/dev_scored.json vs itself never reached a winner
+    # in 1000 turns -- battle_log and ship counts both went flat around
+    # turn 200, capital ships included). Under real, un-zeroed default
+    # weights, a destroyer escorting a carrier can find that its own best
+    # move exactly *ties* staying put: one hex of goal-progress
+    # (move_score_goal_weight) precisely cancels the carrier-bonus-
+    # proximity credit (part of _cohesion_term, same weight) it would
+    # leave behind by crossing out of CombatConfig.ac_bonus_radius. The
+    # old mechanism (resolve(blocker_id) -- the blocker's own full
+    # scoring decision) required a *strict* improvement to move at all,
+    # so a tied escort blocking a capital ship's only path stalled it
+    # forever. _step_aside instead forces the blocker one step regardless
+    # of its own score -- this confirms both that the tie is genuine (not
+    # a mistaken setup) and that the escort moves anyway.
+    board = _corridor_board()
+    config = _config(ai=AiConfig())  # real default weights, not zeroed
+    carrier = _ship(AxialCoord(-1, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    battleship = _ship(AxialCoord(0, 0), ShipKind.BATTLESHIP, PLAYER_A, 2)
+    # Exactly ac_bonus_radius (2) from the carrier -- and directly in the
+    # battleship's only path forward, the corridor ruling out any detour.
+    destroyer = _ship(AxialCoord(1, 0), ShipKind.DESTROYER, PLAYER_A, 3)
+    carrier.movement_remaining = 0  # a pure stationary anchor this turn
+    gs = _game_state(board, [carrier, battleship, destroyer], config)
+    force = TaskForce(
+        id=1, owner=PLAYER_A, member_ids={1, 2, 3}, goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(9, 0))
+    )
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+
+    field = sea_distance_field(gs, force.goal.target)
+    stay_score = score_move(destroyer, AxialCoord(1, 0), gs, force, {}, model, field, config.ai)
+    forward_score = score_move(destroyer, AxialCoord(2, 0), gs, force, {}, model, field, config.ai)
+    assert forward_score == stay_score  # confirms the tie is real, at the ships' starting positions
+
+    def apply_move(ship: Ship, destination: AxialCoord) -> None:
+        ship.position = destination
+        ship.movement_remaining = 0
+
+    list(plan_force_movement_scored(gs, PLAYER_A, force, model, gs.config.ai, lambda: {}, apply_move))
+
+    assert gs.ships[3].position.q > 1  # destroyer actually stepped aside despite the tie
+    assert gs.ships[2].position.q > 0  # battleship actually got past its own starting hex
+
+
 def test_plan_force_movement_scored_breaks_a_reordering_cycle_without_hanging():
     # Two ships each want the other's current hex (a manufactured mutual
-    # block) -- must not deadlock or infinitely recurse; falls back to
-    # leaving both wherever their own best score already is.
+    # block) -- must not deadlock or hang. _step_aside never recurses (it
+    # only ever considers its own strictly-"open" neighbours, never chases
+    # a "passthrough" of its own), so this can no longer cycle the way the
+    # old resolve(blocker_id)-calls-resolve(blocker_id) version could --
+    # kept as a regression/safety check that this genuinely terminates.
     board = _sea_board(radius=6)
     config = _config(ai=AiConfig())
     ship_a = _ship(AxialCoord(0, 0), ShipKind.DESTROYER, PLAYER_A, 1)
