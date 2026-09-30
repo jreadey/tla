@@ -649,6 +649,54 @@ class AiConfig:
     # regression this session.
     reevaluate_strategy_on_new_sighting: bool = False
 
+    # tla.ai.move_scoring: a scoring-based replacement for the fixed
+    # procedural priority chain (port/carrier defense > carrier scouting >
+    # secure_kills_pass > cohesion > screening > carrier-bonus-cohesion >
+    # rearguard > goal-advance) that ordinarily decides a task force
+    # member's move. Whichever pass claims a ship first wins under that
+    # chain regardless of how much better a later-checked option might
+    # have been -- e.g. a cruiser ordered to screen a carrier never gets
+    # to compare that against a better available multi-kill elsewhere,
+    # since screening is simply checked first. This instead evaluates
+    # every reachable hex for every still-unresolved member of an
+    # ADVANCE/AGGRESSIVE, non-retreating force each iteration and executes
+    # only the single highest-scoring (ship, hex) pair across the whole
+    # force before re-evaluating everyone else fresh -- see
+    # plan_force_movement_scored's own docstring. Port/carrier defense,
+    # RETREAT, and HOLD are untouched either way -- see move_scoring's
+    # module docstring for the full scope boundary. Default off pending
+    # self-play/tournament comparison against the existing procedural
+    # path, same caution as every other optional AI capability this
+    # session.
+    scored_task_force_movement_enabled: bool = False
+    # Weight applied to each scoring term in tla.ai.move_scoring.score_move
+    # -- see that function's own docstring for exactly what each term
+    # measures. Starting values are a reasonable-guess baseline, not yet
+    # self-play-tuned; every other weighted AiConfig knob this session
+    # (tactics_kill_weight, carrier_assist_value, ...) started the same
+    # way and was tuned afterward once the mechanism itself was proven
+    # not to stall or misbehave.
+    move_score_goal_weight: float = 1.0
+    move_score_attack_weight: float = 1.0
+    move_score_screen_weight: float = 1.0
+    move_score_cohesion_weight: float = 1.0
+    move_score_exposure_weight: float = 1.0
+    move_score_vision_weight: float = 1.0
+    move_score_rearguard_weight: float = 0.5
+    # Radius (sea hexes) EnemyModel.mass_near/expected_strength_near use
+    # for both the exposure term (any enemy kind) and the vision term's
+    # submerged-submarine suppression check (submarines only).
+    move_score_sub_threat_radius: int = 3
+    # mass_near (0.0-1.0-ish believed-submarine-probability) above this,
+    # at a carrier's own candidate hex, suppresses that hex's vision bonus
+    # to ~0 -- the carrier's own move-scoring at that point already
+    # reflects the exposure risk; this specifically stops the *vision*
+    # term from independently pulling a carrier toward danger on top of
+    # that, addressing the "probe with a cheap ASW-capable ship first"
+    # case without a separate ordering rule (see move_scoring's own
+    # module docstring).
+    move_score_sub_threat_threshold: float = 0.15
+
 
 @dataclass
 class Config:

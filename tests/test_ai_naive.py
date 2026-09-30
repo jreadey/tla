@@ -1624,6 +1624,71 @@ def test_carrier_screen_ignores_a_submerged_enemy_submarine():
     assert _carrier_screen_destination(own_dd, force, gs, frozenset(), {3: submerged_threat}) is None
 
 
+# -- scored task-force movement (tla.ai.move_scoring), end-to-end --------
+
+
+def test_scored_task_force_movement_takes_a_securable_kill_over_screening():
+    # Integration-level version of tla/tests/test_ai_move_scoring.py's own
+    # unit-level scenario -- runs the real NaivePolicy.plan_movement, flag
+    # on, and confirms the whole pipeline (force auto-forms, strategy
+    # picked as ADVANCE, plan_force_movement_scored actually engages)
+    # lands on the same sensible outcome as the isolated scoring test.
+    board = _sea_board(radius=12)
+    port = AxialCoord(10, 0)
+    board.tiles[port] = Tile(coord=port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_B)
+    carrier = _ship(AxialCoord(0, 0), ShipKind.CARRIER, PLAYER_A, 1)
+    cruiser = _ship(AxialCoord(2, 0), ShipKind.CRUISER, PLAYER_A, 2)
+    threat = _ship(AxialCoord(4, 0), ShipKind.BATTLESHIP, PLAYER_B, 3)
+    weak_target = _ship(AxialCoord(2, -2), ShipKind.DESTROYER, PLAYER_B, 4, hp=2)
+    config = Config(
+        fow=FowConfig(enabled=False),
+        fleet=FleetConfig(counts={ShipKind.BATTLESHIP: 1, ShipKind.DESTROYER: 1}),
+        ai=AiConfig(carrier_screen_enabled=True, scored_task_force_movement_enabled=True),
+    )
+    gs = _game_state(board, [carrier, cruiser, threat, weak_target], config=config)
+
+    _run(NaivePolicy(), gs, PLAYER_A)
+
+    # Which specific ship claims the kill isn't load-bearing here (carriers
+    # are no longer hard-excluded from attacking -- risk is priced via the
+    # exposure term instead, see AiConfig.scored_task_force_movement_enabled)
+    # -- only that the securable kill actually gets taken over screening.
+    assert 4 not in gs.ships  # weak_target sunk
+
+
+def test_scored_task_force_movement_skips_a_retreating_force():
+    # AiConfig.scored_task_force_movement_enabled's own scope boundary:
+    # a retreating force must still flee via the existing dedicated path,
+    # not get scored -- confirmed directly rather than by guessing which
+    # natural scenario picks RETREAT, by forcing force.retreating True and
+    # spying on plan_force_movement_scored to confirm it's never called.
+    board = _sea_board(radius=12)
+    own_port = AxialCoord(0, 0)
+    board.tiles[own_port] = Tile(coord=own_port, terrain=TerrainType.LAND, is_port=True, port_owner=PLAYER_A)
+    ship = _ship(AxialCoord(3, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    config = Config(
+        fow=FowConfig(enabled=False),
+        fleet=FleetConfig(counts={}),
+        ai=AiConfig(scored_task_force_movement_enabled=True),
+    )
+    gs = _game_state(board, [ship], config=config)
+    policy = NaivePolicy()
+    force = TaskForce(id=1, owner=PLAYER_A, member_ids={1}, retreating=True)
+    policy._task_forces[PLAYER_A] = [force]
+
+    calls = []
+    import tla.ai.policy as policy_module
+
+    original = policy_module.plan_force_movement_scored
+    policy_module.plan_force_movement_scored = lambda *a, **kw: calls.append(1) or original(*a, **kw)
+    try:
+        _run(policy, gs, PLAYER_A)
+    finally:
+        policy_module.plan_force_movement_scored = original
+
+    assert calls == []
+
+
 def test_task_force_destination_screen_takes_priority_over_the_goal():
     board = _sea_board(radius=12)
     port = AxialCoord(10, 0)
