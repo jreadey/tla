@@ -216,3 +216,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# generated replay logs
+logs/
+
+# macOS
+.DS_Store
