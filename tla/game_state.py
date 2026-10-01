@@ -147,7 +147,11 @@ class GameState:
     players: dict[PlayerId, PlayerState] = field(
         default_factory=lambda: {PLAYER_A: PlayerState(), PLAYER_B: PlayerState()}
     )
-    next_ship_id: int = 1
+    # Per-player, each stepping by 2 -- Player A's ships are always odd
+    # ids, Player B's always even, so a ship's own id parity alone tells
+    # you its side at a glance (e.g. in a hex-grid printout or a replay
+    # log) without needing to cross-reference `owner`.
+    next_ship_id: dict[PlayerId, int] = field(default_factory=lambda: {PLAYER_A: 1, PLAYER_B: 2})
     winner: PlayerId | None = None
     turn_stats: dict[PlayerId, TurnStats] = field(
         default_factory=lambda: {PLAYER_A: TurnStats(), PLAYER_B: TurnStats()}
@@ -196,5 +200,9 @@ class GameState:
 def new_game(config: Config, seed: int) -> GameState:
     board = generate_map(config.map, config.ports, seed=seed)
     ships = place_initial_fleets(board, config, seed)
-    next_ship_id = max(ships.keys(), default=0) + 1
+    default_start = {PLAYER_A: 1, PLAYER_B: 2}  # matches GameState.next_ship_id's own default
+    next_ship_id = {
+        player: max((sid for sid, s in ships.items() if s.owner == player), default=default_start[player] - 2) + 2
+        for player in (PLAYER_A, PLAYER_B)
+    }
     return GameState(config=config, board=board, ships=ships, next_ship_id=next_ship_id)

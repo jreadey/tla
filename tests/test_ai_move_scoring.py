@@ -507,3 +507,47 @@ def test_plan_force_movement_scored_replans_on_a_new_sighting_mid_execution():
         move_scoring_module._plan_moves = original_plan_moves
 
     assert plan_calls >= 2  # the reveal after ship_a's move forced a fresh plan for ship_b
+
+
+def test_plan_force_movement_scored_refolds_the_revealing_ship_itself():
+    # Regression test for a real self-play review finding (game70, CV8,
+    # turn 2): a carrier stepped forward just far enough to spot an enemy
+    # for the first time, then sat there exposed with 3 movement unused
+    # for the rest of the turn, with no mechanism to even consider backing
+    # off -- because the above test's mechanism only ever replans the
+    # *other*, not-yet-moved members of the force. The ship whose own move
+    # did the revealing was already finalized (discarded from `unresolved`
+    # before `apply_move` ran) and never got folded back in, even with
+    # movement left. Single-member force: `apply_move` leaves real
+    # movement_remaining behind on the first call (unlike the test above,
+    # which zeroes it out to isolate the *other*-member mechanism) and
+    # "reveals" an enemy from then on, same thunk pattern as above.
+    board = _sea_board()
+    config = _config(ai=AiConfig())
+    ship_a = _ship(AxialCoord(0, 0), ShipKind.CRUISER, PLAYER_A, 1)
+    enemy = _ship(AxialCoord(5, 0), ShipKind.DESTROYER, PLAYER_B, 2)
+    gs = _game_state(board, [ship_a], config)
+    force = TaskForce(
+        id=1, owner=PLAYER_A, member_ids={1}, goal=TaskForceGoal(GoalKind.CAPTURE_PORT, AxialCoord(8, 0))
+    )
+    model = EnemyModel(gs, PLAYER_A, PLAYER_B)
+    revealed = False
+    moves_applied: list[int] = []
+
+    def visible_enemies_fn():
+        return {2: enemy} if revealed else {}
+
+    def apply_move(ship: Ship, destination: AxialCoord) -> None:
+        nonlocal revealed
+        moves_applied.append(ship.id)
+        ship.position = destination
+        if not revealed:
+            ship.movement_remaining -= 1  # real movement left over, same as any ordinary step
+        revealed = True  # this move "reveals" the enemy from here on
+
+    list(plan_force_movement_scored(gs, PLAYER_A, force, model, gs.config.ai, visible_enemies_fn, apply_move))
+
+    # Ship 1 must have been handed a second, fresh decision after its own
+    # move revealed the enemy -- not just finalized for the rest of the
+    # turn with movement still unspent.
+    assert moves_applied.count(1) >= 2

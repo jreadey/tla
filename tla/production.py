@@ -108,8 +108,8 @@ def run_production(game_state: GameState, player: PlayerId) -> None:
 
 def _spawn_ship(game_state: GameState, player: PlayerId, port: AxialCoord, kind: ShipKind) -> None:
     stats = game_state.config.ship_stats.stats[kind]
-    ship_id = game_state.next_ship_id
-    game_state.next_ship_id += 1
+    ship_id = game_state.next_ship_id[player]
+    game_state.next_ship_id[player] += 2
     game_state.ships[ship_id] = Ship(
         id=ship_id,
         kind=kind,

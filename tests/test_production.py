@@ -218,14 +218,16 @@ def test_run_production_repair_leftover_later_funds_a_new_ship():
 
 
 def test_run_production_assigns_ever_increasing_ids():
+    # Per-player counter, stepping by 2 -- see GameState.next_ship_id's own
+    # comment (Player A always odd, Player B always even).
     port = AxialCoord(0, 0)
     gs = _game_state(_board_with_ports(port), points_per_turn=20, build_order=[ShipKind.PATROL_BOAT])
-    gs.next_ship_id = 42
+    gs.next_ship_id[PLAYER_A] = 41
 
     run_production(gs, PLAYER_A)
 
-    assert 42 in gs.ships
-    assert gs.next_ship_id == 43
+    assert 41 in gs.ships
+    assert gs.next_ship_id[PLAYER_A] == 43
 
 
 def test_handle_port_capture_wipes_progress_and_banked_points():

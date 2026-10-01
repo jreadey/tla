@@ -67,6 +67,7 @@ def test_tile_dict_encodes_port_fields():
         is_port=True,
         port_owner=PLAYER_A,
         port_controller=PLAYER_B,
+        port_name="Port Royal",
     )
 
     data = _tile_dict(tile)
@@ -77,6 +78,7 @@ def test_tile_dict_encodes_port_fields():
         "is_port": True,
         "port_owner": PLAYER_A,
         "port_controller": PLAYER_B,
+        "port_name": "Port Royal",
     }
 
 

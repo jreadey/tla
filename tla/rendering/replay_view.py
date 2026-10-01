@@ -258,6 +258,7 @@ def _tile_from_dict(d: dict) -> Tile:
         is_port=d["is_port"],
         port_owner=d.get("port_owner"),
         port_controller=d.get("port_controller"),
+        port_name=d.get("port_name"),
     )
 
 
@@ -942,13 +943,18 @@ class ReplayView(arcade.View):
             text_obj.draw()
 
     def _draw_hex_coord_tooltip(self, hex_coord: AxialCoord) -> None:
-        """A small "(q, r)" label next to the cursor for whichever empty
-        board hex it's over -- see _update_hover. Same corner/flip-to-fit
-        placement as _draw_hover_tooltip, no player-color accent bar
-        (there's no owner to accent). A second line with the selected
-        ship's believed probability at this hex is added when applicable
-        -- see _belief_probability_at."""
-        lines = [f"({hex_coord.q}, {hex_coord.r})"]
+        """A port's own name (e.g. "Port Royal"), or else a small "(q, r)"
+        label, next to the cursor for whichever empty board hex it's over
+        -- see _update_hover. Same corner/flip-to-fit placement as
+        _draw_hover_tooltip, no player-color accent bar (there's no owner
+        to accent). A second line with the selected ship's believed
+        probability at this hex is added when applicable -- see
+        _belief_probability_at."""
+        tile = self.board.tiles.get(hex_coord)
+        if tile is not None and tile.is_port:
+            lines = [tile.port_name or "Port"]
+        else:
+            lines = [f"({hex_coord.q}, {hex_coord.r})"]
         probability = self._belief_probability_at(hex_coord)
         if probability is not None:
             lines.append(f"Belief P: {probability * 100:.1f}%")

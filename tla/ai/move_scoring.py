@@ -596,7 +596,15 @@ def plan_force_movement_scored(
     remaining, not-yet-executed members get a fresh Phase 1 plan built
     from their real current positions and the updated visibility, rather
     than blindly continuing the stale one -- the outer `while unresolved`
-    loop is what drives this replan-on-new-sighting behavior.
+    loop is what drives this replan-on-new-sighting behavior. The ship
+    whose own move did the revealing is folded back into that replan too,
+    if it still has movement left -- otherwise it would stay permanently
+    finalized for the turn despite unspent movement and despite the
+    reveal being a direct result of its own last step (real example from
+    self-play review: a carrier stepping forward just far enough to spot
+    an enemy for the first time, then sitting there exposed with 3
+    movement unused for the rest of the turn, with no mechanism to even
+    consider backing off).
 
     `apply_move` is the caller's own closure -- submarine-toggle,
     `_execute`, and `reevaluate_strategy_on_new_sighting` handling all
@@ -658,6 +666,18 @@ def plan_force_movement_scored(
                     continue  # sunk by return fire in its own attack -- nothing more to check
                 if set(visible_enemies_fn()) - before_visible:
                     replan = True  # a new sighting -- replan everyone left from scratch, real positions
+                    if ship.movement_remaining > 0:
+                        # sid's own move is what revealed this -- its plan
+                        # was built blind to it (same stale `visible_enemies`
+                        # every other member of this call saw), and without
+                        # this it would stay permanently finalized despite
+                        # unspent movement: a carrier that steps into its
+                        # own enemy-spotting range and then just stops dead
+                        # there for the rest of the turn, real example from
+                        # self-play review (game70, CV8, turn 2) -- it still
+                        # had 3 movement left and could have at least backed
+                        # off, but nothing gave it the chance to reconsider.
+                        unresolved.add(sid)
                     break
             if not progressed:
                 # A genuine, unresolvable conflict (shouldn't normally

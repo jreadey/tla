@@ -15,7 +15,11 @@ from tla.tile import PLAYER_A, PLAYER_B
 def place_initial_fleets(board: Board, config: Config, seed: int) -> dict[int, Ship]:
     rng = random.Random(seed)
     ships: dict[int, Ship] = {}
-    next_id = 1
+    # Per-player, each stepping by 2 -- matches GameState.next_ship_id's
+    # own scheme (Player A always odd, Player B always even) so parity
+    # alone identifies a ship's side everywhere, from the very first ship
+    # placed through anything production builds later.
+    next_id = {PLAYER_A: 1, PLAYER_B: 2}
     # Restrict candidates to the main navigable sea -- otherwise a small
     # enclosed pond within hex-distance of a port (hex distance ignores
     # land in between) could be picked, permanently stranding a ship with
@@ -30,15 +34,16 @@ def place_initial_fleets(board: Board, config: Config, seed: int) -> dict[int, S
             for _ in range(count):
                 coord = _pick_start_hex(board, ports, occupied, main_sea, rng)
                 occupied.add(coord)
-                ships[next_id] = Ship(
-                    id=next_id,
+                ship_id = next_id[player]
+                ships[ship_id] = Ship(
+                    id=ship_id,
                     kind=kind,
                     owner=player,
                     position=coord,
                     current_hp=stats.hp,
                     movement_remaining=stats.movement,
                 )
-                next_id += 1
+                next_id[player] += 2
 
     return ships
 

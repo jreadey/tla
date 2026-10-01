@@ -64,6 +64,10 @@ def _tile_dict(tile: Tile) -> dict:
         "is_port": tile.is_port,
         "port_owner": tile.port_owner,
         "port_controller": tile.port_controller,
+        # Fixed at map generation, never changes turn to turn -- so this
+        # only needs to be in the initial board dump, not _port_dict's own
+        # per-turn port-state updates below.
+        "port_name": tile.port_name,
     }
 
 

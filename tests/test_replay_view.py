@@ -20,13 +20,14 @@ from tla.ship import ShipKind
 from tla.tile import PLAYER_A, PLAYER_B, TerrainType
 
 
-def _tile(coord, terrain="sea", is_port=False, port_owner=None, port_controller=None):
+def _tile(coord, terrain="sea", is_port=False, port_owner=None, port_controller=None, port_name=None):
     return {
         "coord": list(coord),
         "terrain": terrain,
         "is_port": is_port,
         "port_owner": port_owner,
         "port_controller": port_controller,
+        "port_name": port_name,
     }
 
 
@@ -110,6 +111,21 @@ def test_board_from_initial_reconstructs_terrain_and_ports():
     assert tile.terrain == TerrainType.LAND
     assert tile.is_port
     assert tile.port_owner == PLAYER_A
+
+
+def test_board_from_initial_reconstructs_port_name():
+    # Regression test: the replay format previously never serialized
+    # Tile.port_name at all (neither _tile_dict in tla/replay.py nor this
+    # reconstruction read/wrote it), so the replay viewer's hex tooltip
+    # could only ever show a port's raw coordinate, never its real name,
+    # unlike GameView's own equivalent tooltip -- a real user-visible gap
+    # found reviewing a playtest (game70).
+    record = _initial_record()
+    record["board"]["tiles"][1] = _tile((1, 0), terrain="land", is_port=True, port_owner=PLAYER_A, port_name="Port Royal")
+
+    board = _board_from_initial(record)
+
+    assert board.get_tile(AxialCoord(1, 0)).port_name == "Port Royal"
 
 
 def test_apply_port_state_updates_controller_from_a_record():
